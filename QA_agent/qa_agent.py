@@ -50,6 +50,7 @@ import re
 import shutil
 import socket
 import subprocess
+import sys
 from datetime import datetime, timezone
 from typing import Any, Literal, Optional
 
@@ -93,31 +94,70 @@ def _load(path: str, discover_cidr: Optional[str] = None, ad_domain: Optional[st
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# 無 manifest 探索: 掃網段找 DC + 猜網域名,組出最小可用的 in-memory manifest
+# 無 manifest 探索: 掃整個網段找出所有存活主機 (不是只找 DC —— 真實環境的攻擊面
+# 通常不會直通 DC,workstation/server/對外 web app 都可能是切入點),猜網域名,
+# 組出最小可用的 in-memory manifest。
 # ═══════════════════════════════════════════════════════════════════════════
-def _discover_dc(cidr: str) -> Optional[str]:
-    """nmap 掃 cidr,找出同時開 88(kerberos)/389(ldap)/445(smb) 的主機,視為 DC。"""
-    rc, out, err = _run(["nmap", "-p", "88,389,445", "--open", "-Pn", cidr])
+_DISCOVERY_PORTS = "21,22,23,25,53,80,88,110,135,139,389,443,445,636," \
+                   "1433,3268,3269,3306,3389,5985,5986,8000,8080,8443,9200"
+
+
+def _discover_hosts(cidr: str) -> list[dict]:
+    """nmap 掃整個 cidr,列出所有存活主機與其開放的常見 port
+    (AD/SMB/RDP/WinRM/web/DB...),不只找 DC。"""
+    rc, out, err = _run(["nmap", "-p", _DISCOVERY_PORTS, "--open", "-Pn", cidr])
     if not out:
-        return None
+        return []
+    hosts: list[dict] = []
     current_ip, open_ports = None, set()
 
     def _flush():
-        if current_ip and {"88", "389", "445"} <= open_ports:
-            return current_ip
-        return None
+        if current_ip:
+            hosts.append({"ip": current_ip, "ports": sorted(open_ports, key=int)})
 
     for line in out.splitlines():
         m = re.match(r"Nmap scan report for (?:\S+ )?\(?([\d.]+)\)?", line)
         if m:
-            hit = _flush()
-            if hit:
-                return hit
+            _flush()
             current_ip, open_ports = m.group(1), set()
         pm = re.match(r"(\d+)/tcp\s+open", line)
         if pm:
             open_ports.add(pm.group(1))
-    return _flush()
+    _flush()
+    return hosts
+
+
+def _classify_host(ports: set[str]) -> tuple[str, list[str]]:
+    """依開放 port 猜角色/服務標籤,純粹是初步猜測 —— agent 應該自己再用 run_tool
+    (nmap -sV / whatweb 等) 驗證實際服務版本,不要只信這個分類。"""
+    if {"88", "389", "445"} <= ports:
+        role = "dc"
+    elif ports & {"3389", "5985", "5986"}:
+        role = "workstation"
+    elif ports & {"445", "139"}:
+        role = "server"
+    else:
+        role = "unknown"
+    svc = []
+    if ports & {"80", "443", "8000", "8080", "8443"}:
+        svc.append("http")
+    if "445" in ports or "139" in ports:
+        svc.append("smb")
+    if "389" in ports or "636" in ports:
+        svc.append("ldap")
+    if "88" in ports:
+        svc.append("kerberos")
+    if "3389" in ports:
+        svc.append("rdp")
+    if "5985" in ports or "5986" in ports:
+        svc.append("winrm")
+    if "3306" in ports:
+        svc.append("mysql")
+    if "1433" in ports:
+        svc.append("mssql")
+    if "9200" in ports:
+        svc.append("elasticsearch")
+    return role, svc
 
 
 def _discover_domain(dc_ip: str) -> Optional[str]:
@@ -137,21 +177,47 @@ def _discover_manifest(cidr: Optional[str], ad_domain: Optional[str], dc_ip: Opt
         raise SystemExit(
             "[QA] 找不到 range_manifest.json,且未給 --network-cidr / --dc-ip,"
             "無法探索目標,中止。")
+    machines: list[dict] = []
+    if cidr:
+        print(f"[QA] 無 manifest,對 {cidr} 做 nmap 掃描找出所有存活主機 (不只找 DC) ...")
+        for h in _discover_hosts(cidr):
+            ports = set(h["ports"])
+            role, svc = _classify_host(ports)
+            machines.append({
+                "hostname": f"HOST-{h['ip'].split('.')[-1]}", "role": role, "template": "",
+                "ip": h["ip"], "vlan": 10, "os_version": "", "fqdn": "",
+                "services": svc, "credentials": [], "open_ports": h["ports"],
+            })
+        print(f"[QA] 探索到 {len(machines)} 台存活主機: " +
+              ", ".join(f"{m['ip']}({m['role']}:{','.join(m['services']) or '?'})"
+                       for m in machines))
+
     if not dc_ip:
-        print(f"[QA] 無 manifest,對 {cidr} 做 nmap 探索找 DC ...")
-        dc_ip = _discover_dc(cidr)
-        if not dc_ip:
+        dc_m = next((m for m in machines if m["role"] == "dc"), None)
+        if not dc_m:
             raise SystemExit(
                 f"[QA] 在 {cidr} 內找不到同時開 88/389/445 的主機 (DC)。"
-                "改用 --dc-ip 明確指定目標。")
+                "改用 --dc-ip 明確指定目標,或確認網段/防火牆設定是否正確。")
+        dc_ip = dc_m["ip"]
         print(f"[QA] 探索到疑似 DC: {dc_ip}")
+    elif not any(m["ip"] == dc_ip for m in machines):
+        machines.append({"hostname": "DC-DISCOVERED", "role": "dc", "template": "", "ip": dc_ip,
+                         "vlan": 10, "os_version": "", "fqdn": "",
+                         "services": ["ldap", "kerberos", "smb", "dns"], "credentials": [],
+                         "open_ports": []})
+    else:
+        for m in machines:
+            if m["ip"] == dc_ip:
+                m["role"] = "dc"
+
     if not ad_domain:
         ad_domain = _discover_domain(dc_ip) or "unknown.local"
         print(f"[QA] 探索到網域: {ad_domain}")
+    for m in machines:
+        if not m.get("fqdn"):
+            m["fqdn"] = f"{m['hostname'].lower()}.{ad_domain}"
+
     net = cidr or f"{'.'.join(dc_ip.split('.')[:3])}.0/24"
-    machine = {"hostname": "DC-DISCOVERED", "role": "dc", "template": "", "ip": dc_ip,
-               "vlan": 10, "os_version": "", "fqdn": f"dc.{ad_domain}",
-               "services": ["ldap", "kerberos", "smb", "dns"], "credentials": []}
     qa_cred = None
     if qa_user and qa_pass:
         qa_cred = {"username": qa_user, "password": qa_pass, "domain": ad_domain,
@@ -159,10 +225,11 @@ def _discover_manifest(cidr: Optional[str], ad_domain: Optional[str], dc_ip: Opt
                    "note": "供自 CLI (--qa-user/--qa-pass),非來自 manifest"}
     return {
         "schema_version": "1.0", "range_id": "discovered-no-manifest", "ad_domain": ad_domain,
-        "ad_version": "", "network_cidr": net, "machines": [machine],
+        "ad_version": "", "network_cidr": net, "machines": machines,
         "planted_vulns": [], "endpoints": [], "qa_credential": qa_cred,
-        "notes": "無 range_manifest.json,由 QA agent 自行探索組出。無種植弱點清單,"
-                 "用 generic_ad_audit 對已知檢測項目跑基線稽核。",
+        "notes": "無 range_manifest.json,由 QA agent 自行探索組出。machines 涵蓋整個網段內"
+                 "所有存活主機 (不只 DC),role/services 只是依開放 port 的初步猜測。"
+                 "無種植弱點清單,用 generic_ad_audit 對已知檢測項目跑基線稽核。",
     }
 
 
@@ -228,17 +295,39 @@ _COMMON_PASSWORDS = [
 
 
 def _enum_users_anon(dc_ip: str, domain: str) -> list[str]:
-    """不需憑證的使用者列舉: 先試匿名 LDAP bind,不行再試 SMB null-session RID cycling。"""
+    """不需憑證的使用者列舉,依序試好幾種手法,不是只有一種:
+    1. 匿名 LDAP bind 直接列 sAMAccountName。
+    2. SMB null-session RID cycling (nxc --rid-brute)。
+    3. rpcclient null-session enumdomusers。
+    4. impacket-lookupsid 空密碼 SID 爆破。
+    任一種有結果就用,全部串起來 (不是找到第一批就停),盡量把使用者名單湊齊。"""
     users: list[str] = []
     parts = [p for p in domain.split(".") if p]
     base = ",".join(f"DC={p}" for p in parts)
+
     rc, out, err = _run(["ldapsearch", "-x", "-H", f"ldap://{dc_ip}", "-b", base,
                          "(objectClass=user)", "sAMAccountName"])
     users += re.findall(r"sAMAccountName:\s*(\S+)", out)
-    if not users:
-        rc, out, err = _run(["nxc", "smb", dc_ip, "-u", "", "-p", "", "--rid-brute"])
-        for m in re.finditer(r"\)\s+\S+\\(\S+)\s+\(SidTypeUser\)", out):
+
+    rc, out, err = _run(["nxc", "smb", dc_ip, "-u", "", "-p", "", "--rid-brute"])
+    for line in out.splitlines():
+        if "SidTypeUser" not in line:
+            continue
+        m = re.search(r"\\([^\\\s]+)\s+\(SidTypeUser\)", line)
+        if m:
             users.append(m.group(1))
+
+    if shutil.which("rpcclient"):
+        rc, out, err = _run(["rpcclient", "-U", "", "-N", dc_ip, "-c", "enumdomusers"])
+        users += re.findall(r"user:\[([^\]]+)\]", out)
+
+    if shutil.which("impacket-lookupsid"):
+        rc, out, err = _run(["impacket-lookupsid", f"{domain}/@{dc_ip}", "-no-pass"])
+        for line in out.splitlines():
+            m = re.search(r"\\([^\\\s]+)\s*\(SidTypeUser\)", line)
+            if m:
+                users.append(m.group(1))
+
     return sorted(set(users))
 
 
@@ -271,9 +360,13 @@ def _crack_asrep_builtin(hashes: list[str]) -> Optional[dict]:
 
 @tool
 def enum_users() -> str:
-    """[初始存取偵察 — 第一步,不需任何憑證] 對已知 DC 做匿名 LDAP bind 或 SMB null-session
-    RID cycling,嘗試列舉網域使用者帳號。沒有 --qa-user/--qa-pass 時,遇到需要憑證的檢測項目
-    前應先呼叫這個,而不是直接判定 skip。回傳找到的使用者清單。"""
+    """[初始存取偵察 — 第一步,不需任何憑證] 對已知 DC 依序嘗試匿名 LDAP bind、SMB
+    null-session RID cycling、rpcclient enumdomusers、impacket-lookupsid SID 爆破,
+    四種手法串起來盡量湊出使用者清單 (不是有一種有結果就停)。沒有 --qa-user/--qa-pass
+    時,遇到需要憑證的檢測項目前應先呼叫這個,而不是直接判定 skip。
+    如果四種都槓龜,不代表沒有使用者可列——可以用 run_tool 自己嘗試別的手法 (例如
+    先用 web_fetch_range/run_tool 找到員工姓名後,自己組 firstname.lastname 之類的
+    命名慣例猜使用者名,再拿去 crack_hash/asrep_roast_open 驗證)。回傳找到的使用者清單。"""
     dc = next((m for m in _MF["machines"] if m["role"] == "dc"), None)
     if not dc:
         return json.dumps({"status": "error", "evidence": "manifest 無 DC"}, ensure_ascii=False)
@@ -382,6 +475,7 @@ ALLOWED_BINARIES = {
     "impacket-findDelegation", "impacket-lookupsid", "impacket-getTGT",
     "hashcat", "john",
     "find", "locate", "which",  # 自我診斷用: 內建候選路徑找不到東西時,自己找 kali 上實際在哪
+    "whatweb", "nikto", "gobuster", "ffuf", "wpscan",  # web 滲透: 指紋/漏掃/目錄爆破
 }
 
 
@@ -509,6 +603,51 @@ def web_fetch_range(url: str, extra_curl_args: Optional[list[str]] = None) -> st
                        "response": out[-4000:], "stderr": err[-500:]}, ensure_ascii=False)
 
 
+_DIRB_WORDLIST_CANDIDATES = [
+    "/usr/share/wordlists/dirb/common.txt",
+    "/usr/share/seclists/Discovery/Web-Content/common.txt",
+    "/usr/share/wordlists/dirbuster/directory-list-2.3-medium.txt",
+]
+
+
+@tool
+def web_dirbust_range(url: str, wordlist: str = "") -> str:
+    """[網頁滲透 — 目錄/端點爆破,僅限 range 內目標] 對 range 內某個 web 服務跑目錄/檔案
+    爆破 (gobuster dir),找隱藏的管理頁、API 端點、備份檔、.git 等。這是網頁滲透的起手式,
+    有 http 服務的主機 (見 get_range_info 的 web_hosts) 應該先跑這個、再用 web_fetch_range
+    人工深入看有意義的路徑,不要只對根目錄發一次 curl 就結案。
+    url 的 host 必須解析到 range 網段內,否則拒絕。
+    wordlist 留空會自動找 kali 上常見字典 (dirb/common.txt、seclists common.txt、
+    dirbuster medium list);都找不到的話,不要放棄,改用 run_tool 呼叫
+    find/locate 去 /usr/share/wordlists/、/usr/share/seclists/ 底下自己找,找到路徑後
+    重新帶入 wordlist 參數。"""
+    m = re.search(r"://([^/:]+)", url)
+    host = m.group(1) if m else url
+    try:
+        ip = host if re.match(r"^\d+\.\d+\.\d+\.\d+$", host) else socket.gethostbyname(host)
+    except socket.gaierror:
+        return json.dumps({"status": "error", "evidence": f"無法解析主機 {host}"},
+                          ensure_ascii=False)
+    blocked = _assert_in_range(["gobuster", ip])
+    if blocked:
+        return json.dumps({"status": "error", "evidence": blocked}, ensure_ascii=False)
+    if not shutil.which("gobuster"):
+        return json.dumps({"status": "error", "evidence": "gobuster not found on attack host"},
+                          ensure_ascii=False)
+    wl = wordlist or next((w for w in _DIRB_WORDLIST_CANDIDATES if os.path.exists(w)), None)
+    if not wl:
+        return json.dumps({"status": "no_wordlist",
+                           "evidence": "內建候選字典都找不到,改用 run_tool 呼叫 find/locate "
+                                       "在 /usr/share/wordlists 或 /usr/share/seclists 底下找,"
+                                       "找到路徑後帶進 wordlist 參數重跑"}, ensure_ascii=False)
+    argv = ["gobuster", "dir", "-u", url, "-w", wl, "-q", "-t", "20", "-k"]
+    rc, out, err = _run(argv)
+    hits = re.findall(r"^(/\S+)\s+\(Status:\s*(\d+)\)", out, re.MULTILINE)
+    return json.dumps({"status": "ok" if hits else "no_hits", "wordlist_used": wl,
+                       "found": [{"path": p, "status": s} for p, s in hits][:50],
+                       "raw_tail": out[-1000:]}, ensure_ascii=False)
+
+
 @tool
 def generic_ad_audit() -> str:
     """[無 manifest 模式專用] 沒有 range_manifest.json、不知道種了哪些弱點時,
@@ -545,15 +684,20 @@ def generic_ad_audit() -> str:
 
 @tool
 def get_range_info() -> str:
-    """取得 range 基本資訊: 網域、DC IP、機器清單、服務端點。回傳 JSON。
+    """取得 range 基本資訊: 網域、DC IP、**全部**機器清單 (含每台的角色猜測/服務標籤/
+    開放 port)、服務端點。回傳 JSON。攻擊面不等於 DC —— 這裡列的每一台都可能是切入點,
+    尤其 services 含 "http" 的主機,值得用 web_fetch_range/run_tool(whatweb/nikto/
+    gobuster)/web_dirbust_range 另外做網頁滲透,不要只盯著 DC。
     白箱模式含更多細節。"""
     dc = next((m for m in _MF["machines"] if m["role"] == "dc"), None)
     info = {
         "ad_domain": _MF["ad_domain"],
         "dc_ip": dc["ip"] if dc else None,
         "network_cidr": _MF["network_cidr"],
-        "machines": [{"hostname": m["hostname"], "role": m["role"], "ip": m["ip"]}
+        "machines": [{"hostname": m["hostname"], "role": m["role"], "ip": m["ip"],
+                      "services": m.get("services", []), "open_ports": m.get("open_ports", [])}
                      for m in _MF["machines"]],
+        "web_hosts": [m["ip"] for m in _MF["machines"] if "http" in m.get("services", [])],
         "mode": _MODE,
         "no_manifest": _NO_MANIFEST,
     }
@@ -776,11 +920,52 @@ def psexec_run(target_ip: str, command: str = "") -> str:
                        "output": out[-2000:], "stderr": err_out[-500:]}, ensure_ascii=False)
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# 最後手段: 真的走投無路才問人。這是「LLM-driven」的安全閥,不是預設互動點 ——
+# 只有在你已經窮盡所有自主手段、卡在一個非你能決定的問題上 (例如需要 range 以外的
+# 資訊、需要人給某個環境細節、或需要授權做超出目前工具範圍的動作) 時才呼叫。
+# 不允許拿它來當「不確定下一步」的偷懶出口。
+# ═══════════════════════════════════════════════════════════════════════════
+def _blocking_ask(question: str, tried: str) -> str:
+    """在 CLI 上直接問人並等回覆 (阻塞)。非互動環境 (stdin 不是 tty) 回制式訊息,
+    讓 agent 知道現在沒人可問,要嘛換手法要嘛把它寫進報告的 open question。"""
+    print("\n" + "─" * 60)
+    print("[ASK-HUMAN] agent 判斷自己卡住了,需要你的協助:")
+    print(f"  問題: {question}")
+    if tried:
+        print(f"  已嘗試: {tried}")
+    print("─" * 60)
+    try:
+        if not sys.stdin or not sys.stdin.isatty():
+            return ("[NO_HUMAN_AVAILABLE] 目前非互動環境,沒有人可回答。請改用其他自主手段"
+                    "繼續嘗試;若真的無法,把這個問題當成報告裡的 open question 記下,不要"
+                    "反覆呼叫 ask_human。")
+        ans = input("你的回覆 (直接 Enter = 沒有補充,請自行想辦法)> ").strip()
+    except (EOFError, KeyboardInterrupt):
+        return "[NO_HUMAN_AVAILABLE] 讀取回覆失敗,請自行想辦法或記入報告。"
+    return ans or ("[NO_EXTRA_INFO] 人類沒有補充資訊,請用你手上的工具自己繼續想辦法,"
+                   "不要再問同一件事。")
+
+
+@tool
+def ask_human(question: str, what_i_tried: str = "") -> str:
+    """[最後手段 — 只在真的卡死時用] 當你已經**窮盡所有能自主嘗試的手段**、且卡在一個
+    不是你有辦法靠現有工具解決的問題上 (例如: 需要 range 以外才知道的資訊、需要人提供
+    某個環境前提、或想做的事超出目前所有工具能涵蓋的範圍) 時,呼叫這個問人。
+    這是 LLM-driven 流程的安全閥,不是給你「不確定下一步」時偷懶用的 —— 呼叫前你必須
+    已經真的試過多種方法。
+    question: 你要問人的具體問題 (講清楚你卡在哪、需要什麼)。
+    what_i_tried: 你已經試過哪些手段 (讓人知道你不是還沒努力就先問)。
+    回傳人的回覆;若當下沒人可回答 (非互動環境或對方沒補充),你要用回覆裡的指示繼續
+    自己想辦法,不要反覆問同一件事。"""
+    return _blocking_ask(question, what_i_tried)
+
+
 QA_TOOLS = [list_planted_vulns, get_range_info, run_validation, test_vuln,
             bloodhound_verify, whitebox_check_setting, suggest_fix, generic_ad_audit,
             enum_users, asrep_roast_open, password_spray,
-            run_tool, crack_hash, web_fetch_range,
-            secretsdump_dc, wmiexec_run, psexec_run]
+            run_tool, crack_hash, web_fetch_range, web_dirbust_range,
+            secretsdump_dc, wmiexec_run, psexec_run, ask_human]
 
 # 需要 HITL 確認的工具 (破壞性、鎖帳風險、或真的登入/執行於機器上)
 HITL_TOOLS = {"suggest_fix", "password_spray", "secretsdump_dc", "wmiexec_run", "psexec_run"}
@@ -816,15 +1001,25 @@ QA_SYSTEM = """你是靶場 QA 工程師,對一個 Windows AD 訓練靶場做滲
 你有一組工具,怎麼組合、跑幾輪、要不要繞路都由你自己判斷,不是死板的固定順序:
 
 - list_planted_vulns / test_vuln / bloodhound_verify: 對 manifest 中種下的弱點做既定驗證。
+- get_range_info: manifest 內**全部**機器清單 (不是只有 DC),含每台的角色猜測/服務標籤
+  (services 含 "http" 就是有 web 服務) /開放 port。**攻擊面不等於 DC** —— 真實環境很少
+  直接打穿 DC,通常是先從別的主機 (workstation、對外 web app、有漏洞的內部服務) 找到切入
+  點,再橫向移動。看到 web_hosts 有東西,務必花時間用 web_fetch_range/web_dirbust_range/
+  run_tool(whatweb/nikto) 認真查,不要看一眼沒東西就跳過。
 - run_validation: 基礎設施健檢 (DNS/LDAP/SMB/Kerberos)。
-- enum_users / asrep_roast_open / password_spray (需 HITL 核准): 找初始存取。
-- run_tool: 現成工具不夠用時,自己組 nmap/nxc/ldapsearch/impacket-*/hashcat/john 等指令
-  (允許清單見工具說明),不必受限於 id→testcase 對照表。
+- enum_users / asrep_roast_open / password_spray (需 HITL 核准): 找初始存取,enum_users
+  內建串了 4 種列舉手法,還是槓龜的話可以自己想辦法 (猜命名慣例、從 web 服務挖出的員工
+  名單反推帳號等)。
+- run_tool: 現成工具不夠用時,自己組 nmap/nxc/ldapsearch/impacket-*/hashcat/john/
+  whatweb/nikto/gobuster/ffuf 等指令 (允許清單見工具說明),不必受限於 id→testcase 對照表。
 - crack_hash: 對拿到的 hash 在本機用真正的字典 (rockyou.txt 等) 做離線破解,不是只核對
   幾個常見密碼。
-- web_fetch_range: 瀏覽 range 內主機的 web 服務做偵察。
+- web_fetch_range / web_dirbust_range: 對 range 內任何有 http 服務的主機 (不限 DC) 做網頁
+  偵察 —— 先 web_dirbust_range 掃目錄/端點,再用 web_fetch_range 深入看有意義的路徑。
+  Web app 常常是比 AD 弱點更直接的切入點,不要略過。
 - secretsdump_dc / wmiexec_run / psexec_run (需 HITL 核准): 真的登入機器、傾印憑證、
-  執行指令 —— 用來對最終「憑證真的能拿到程式碼執行/拿到全網域憑證」做最後一步證明。
+  執行指令 —— 用來對最終「憑證真的能拿到程式碼執行/拿到全網域憑證」做最後一步證明,
+  target_ip 不必只打 DC,拿到任何主機的憑證都可以驗證。
 - suggest_fix: 對 fail 的弱點提出診斷建議 (需人工核准才算數,不會自己動手修)。
 
 怎麼跑由你自己決定,不是死板的固定順序,也不需要每一步都停下來問。原則是:
@@ -837,6 +1032,13 @@ fail 但你覺得可能只是測試手法不夠) 就自己用 run_tool/crack_has
 下一步該做什麼」就提早結束並丟回一個籠統的報告 —— 先窮盡你手上所有工具能做的。
 最後輸出結構化 QA 報告。
 
+這是 **LLM-driven** 的流程: 主導權在你,不要動不動就停下來問人。但如果你真的**已經
+窮盡所有能自主嘗試的手段**、卡在一個靠現有工具無論如何都解決不了的問題上 (例如需要
+range 以外才知道的資訊、需要人提供某個環境前提、或想做的事超出所有工具能涵蓋的範圍),
+可以呼叫 ask_human 問我 —— 這是最後手段,不是「不確定下一步」時的偷懶出口。呼叫 ask_human
+前,你必須已經真的試過多種方法;呼叫時要講清楚你卡在哪、試過什麼。如果當下沒人可回答
+(非互動環境),就照回覆的指示自己繼續,或把它當報告裡的 open question,不要反覆問同一件事。
+
 重要:
 - 工具做確定性的 pass/fail 判定 (regex verdict) 時,你直接採信,不要自己竄改。
 - status=pass 代表弱點可利用;fail 代表種了但打不通 (可以自己用 run_tool 等再深入 debug
@@ -845,13 +1047,20 @@ fail 但你覺得可能只是測試手法不夠) 就自己用 run_tool/crack_has
   這個範圍內,想怎麼查、怎麼組指令都可以自己決定。
 - password_spray / secretsdump_dc / wmiexec_run / psexec_run 一定會被要求 HITL 核准,
   不能想辦法繞過;呼叫前先清楚說明你為什麼需要這一步 (例如已經有哪些跡象顯示可能有效)。
+- 卡死才用 ask_human,而且要先真的試過多種手段;不要把它當成逃避繼續嘗試的藉口。
 - 每一步工具呼叫都會被自動記錄 (逐步 log),不需要你自己額外做記錄動作,只要正常呼叫工具。
 """
 
 QA_SYSTEM_NO_MANIFEST = """你是靶場 QA 工程師。這次**沒有 range_manifest.json**
-(可能是對外部/未知環境做稽核,或 manifest 遺失),已由前置步驟對目標網段做 nmap 探索,
-找出 DC 並猜出網域名 (見 get_range_info)。你不知道這個環境「種了哪些弱點」,
-所以整個流程更接近真實黑箱滲透: 沒有現成清單告訴你答案,自己摸索、自己決定下一步。
+(可能是對外部/未知環境做稽核,或 manifest 遺失),已由前置步驟對**整個目標網段**做 nmap
+掃描,列出所有存活主機 (不是只找 DC) 並猜出網域名 (見 get_range_info)。你不知道這個環境
+「種了哪些弱點」,所以整個流程更接近真實黑箱滲透: 沒有現成清單告訴你答案,自己摸索、
+自己決定下一步。
+
+**攻擊面不等於 DC。** get_range_info 回傳的 machines 裡,每台都有 services/open_ports,
+services 含 "http" 的主機 (也列在 web_hosts) 代表有網頁服務,現實中這種主機常常比直接打
+AD 弱點更容易切入 (弱密碼後台、過時 CMS、暴露的管理介面、上傳漏洞...)。**先看一遍
+get_range_info 的完整主機清單再決定要往哪個方向查,不要預設「就是打 DC」。**
 
 你所有工具都是在 **kali attack host** 上執行的。工具說明裡列的預設路徑/候選清單 (例如
 crack_hash 找 rockyou.txt) 只是常見猜測,如果都找不到,不要就此放棄或回報「找不到」——
@@ -859,20 +1068,25 @@ crack_hash 找 rockyou.txt) 只是常見猜測,如果都找不到,不要就此�
 /usr/share/seclists/、/usr/share/john/),自己判斷該去哪找、找到就用。
 
 你手上的工具 (怎麼組合、跳過哪些、多跑幾輪都自己判斷,不是固定管線):
-- get_range_info / run_validation: 先搞清楚環境、確認基礎設施正常。
-- enum_users: 匿名列舉網域帳號 (不需憑證)。
+- get_range_info / run_validation: 先搞清楚環境、確認基礎設施正常、看清楚有哪些主機。
+- enum_users: 對 DC 串了 4 種匿名列舉手法 (LDAP anon / SMB RID cycle / rpcclient /
+  lookupsid) 一次湊帳號清單 (不需憑證)。全槓龜也別放棄,可以從 web 服務挖出的員工名單、
+  常見命名慣例自己組帳號猜測,拿去 asrep_roast_open/password_spray 驗證。
 - asrep_roast_open: 對列舉到的帳號跑 AS-REP roast (不需憑證);拿到 hash 本身就是可回報
   的發現,工具也會嘗試用內建常見密碼核對明文。
 - crack_hash: 想用比內建清單更完整的字典破解 (rockyou.txt 等) 就用這個,不必等
   asrep_roast_open 破不出來才想到。
 - run_tool: 想自己嘗試別的列舉/偵察手法 (例如換一種 LDAP 查詢、跑 nmap 服務版本掃描、
-  查 SMB 共享...) 就用這個自己組指令,不必等被告知。
+  查 SMB 共享、跑 whatweb/nikto...) 就用這個自己組指令,不必等被告知。
+- web_fetch_range / web_dirbust_range: get_range_info 的 web_hosts 有任何 IP,都值得花
+  時間認真掃 —— 先 web_dirbust_range 找隱藏路徑/管理介面,再 web_fetch_range 深入看。
+  這不是選配步驟,是跟打 AD 弱點平行的另一條攻擊路線,常常更好打。
 - password_spray (需 HITL 核准): enum_users/asrep_roast_open/crack_hash 都拿不到有效憑證、
   但確實需要驗證身分才能繼續深入時才用,每帳號每密碼只試一次降低鎖帳風險。
-- web_fetch_range: range 內有 web 服務 (dashboard、內部工具、ADFS...) 時可以直接瀏覽偵察。
 - generic_ad_audit: 對已知 AD 弱點清單跑一輪基線掃描,可以早點跑打底,也可以晚點跑補漏。
 - secretsdump_dc / wmiexec_run / psexec_run (需 HITL 核准): 有可用憑證後,想證明「真的能
-  拿到全網域憑證 / 真的能執行程式碼」時用這幾個,是整條攻擊鏈的最後一步驗證。
+  拿到全網域憑證 / 真的能執行程式碼」時用這幾個,target_ip 可以是 DC 也可以是任何拿到
+  憑證/存取權的其他主機,不要預設只打 DC。
 
 沒有固定的第 1234 步 —— 你自己決定探索順序、要不要回頭重試、要不要繞道用 run_tool
 補一個沒有現成工具的檢測。**核心原則是自己不斷推理、不斷往下試,一路做到你真的沒有
@@ -882,6 +1096,12 @@ crack_hash 找 rockyou.txt) 只是常見猜測,如果都找不到,不要就此�
 (AS-REP roastable 帳號、弱密碼帳號、破出來的 hash...) 或任何有意義的發現,隨時記下來,
 最後整理進報告。
 
+這是 **LLM-driven** 的黑箱滲透: 主導權在你,不要動不動就停下來問人。但如果你真的已經
+窮盡所有能自主嘗試的手段、卡在一個靠現有工具解不了的問題上 (需要 range 以外的資訊、
+需要人給某個環境前提、或想做的事超出所有工具範圍),可以呼叫 ask_human 問我 —— 這是
+最後手段,不是「不確定下一步」的偷懶出口,呼叫前必須真的試過多種方法,呼叫時講清楚你
+卡在哪、試過什麼。若當下沒人可回答,照回覆指示自己繼續或記成報告的 open question。
+
 重要:
 - 工具做確定性判定時你直接採信,不要自己竄改。
 - 唯一的硬限制是目標鎖定探索到的 range 網段 (nmap/curl/impacket 等所有工具共用這道檢查),
@@ -889,6 +1109,7 @@ crack_hash 找 rockyou.txt) 只是常見猜測,如果都找不到,不要就此�
 - password_spray / secretsdump_dc / wmiexec_run / psexec_run 有鎖帳/登入機器風險,一定要
   走 HITL 核准,不能因為想省事就跳過或用 run_tool 繞過 (run_tool 的允許清單本來就不含
   這幾類工具)。呼叫前先說明你為什麼判斷值得做這一步。
+- 卡死才用 ask_human,而且要先真的試過多種手段;不要把它當成逃避繼續嘗試的藉口。
 - 每一步工具呼叫都會被自動記錄 (逐步 log),不需要你自己額外做記錄動作。
 - 最後要輸出結構化 QA 報告,status 用 exploitable(可利用)/not_tested(沒測到或缺條件)/
   error 表示;沒有 planted_but_broken 這個狀態的意義 (沒有「種植」動作),不要用它。
