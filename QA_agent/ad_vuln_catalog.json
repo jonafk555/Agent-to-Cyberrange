@@ -1,0 +1,1738 @@
+[
+ {
+  "id": 1,
+  "category": "A",
+  "category_name": "Kerberos Protocol Attacks",
+  "name": "AS-REP Roasting",
+  "weakness": "DoesNotRequirePreAuth enabled on user account"
+ },
+ {
+  "id": 2,
+  "category": "A",
+  "category_name": "Kerberos Protocol Attacks",
+  "name": "Kerberoasting (RC4)",
+  "weakness": "Service account with SPN + weak password + RC4 allowed"
+ },
+ {
+  "id": 3,
+  "category": "A",
+  "category_name": "Kerberos Protocol Attacks",
+  "name": "Kerberoasting (AES)",
+  "weakness": "Service account with SPN + weak password, AES only"
+ },
+ {
+  "id": 4,
+  "category": "A",
+  "category_name": "Kerberos Protocol Attacks",
+  "name": "Golden Ticket",
+  "weakness": "krbtgt NTLM hash / AES key compromised"
+ },
+ {
+  "id": 5,
+  "category": "A",
+  "category_name": "Kerberos Protocol Attacks",
+  "name": "Silver Ticket",
+  "weakness": "Service account NTLM hash / AES key compromised"
+ },
+ {
+  "id": 6,
+  "category": "A",
+  "category_name": "Kerberos Protocol Attacks",
+  "name": "Diamond Ticket",
+  "weakness": "krbtgt AES key + valid TGT modification"
+ },
+ {
+  "id": 7,
+  "category": "A",
+  "category_name": "Kerberos Protocol Attacks",
+  "name": "Sapphire Ticket",
+  "weakness": "krbtgt AES key + PAC field forging"
+ },
+ {
+  "id": 8,
+  "category": "A",
+  "category_name": "Kerberos Protocol Attacks",
+  "name": "Pass-the-Ticket (PtT)",
+  "weakness": "Kerberos ticket harvested from memory"
+ },
+ {
+  "id": 9,
+  "category": "A",
+  "category_name": "Kerberos Protocol Attacks",
+  "name": "Overpass-the-Hash (OPtH)",
+  "weakness": "NTLM hash used to request valid TGT"
+ },
+ {
+  "id": 10,
+  "category": "A",
+  "category_name": "Kerberos Protocol Attacks",
+  "name": "Ticket Harvest",
+  "weakness": "Kerberos tickets extractable from LSASS memory"
+ },
+ {
+  "id": 11,
+  "category": "A",
+  "category_name": "Kerberos Protocol Attacks",
+  "name": "Kerberos Pre-authentication Bruteforce",
+  "weakness": "No pre-auth lockout mechanism"
+ },
+ {
+  "id": 12,
+  "category": "A",
+  "category_name": "Kerberos Protocol Attacks",
+  "name": "Inter-Realm TGT Abuse",
+  "weakness": "Cross-domain Kerberos trust exploitation"
+ },
+ {
+  "id": 13,
+  "category": "A",
+  "category_name": "Kerberos Protocol Attacks",
+  "name": "FAST Armoring Bypass",
+  "weakness": "Kerberos Flexible Authentication Secure Tunneling not enforced"
+ },
+ {
+  "id": 14,
+  "category": "A",
+  "category_name": "Kerberos Protocol Attacks",
+  "name": "RC4 Downgrade",
+  "weakness": "KDC allows RC4 encryption when AES is preferred"
+ },
+ {
+  "id": 15,
+  "category": "B",
+  "category_name": "Delegation Attacks",
+  "name": "Unconstrained Delegation",
+  "weakness": "TrustedForDelegation set on non-DC computer"
+ },
+ {
+  "id": 16,
+  "category": "B",
+  "category_name": "Delegation Attacks",
+  "name": "PrinterBug + Unconstrained Delegation",
+  "weakness": "MS-RPRN forces DC to authenticate to unconstrained host"
+ },
+ {
+  "id": 17,
+  "category": "B",
+  "category_name": "Delegation Attacks",
+  "name": "PetitPotam + Unconstrained Delegation",
+  "weakness": "MS-EFSR forces authentication to unconstrained host"
+ },
+ {
+  "id": 18,
+  "category": "B",
+  "category_name": "Delegation Attacks",
+  "name": "Constrained Delegation Protocol Transition (Any Auth)",
+  "weakness": "TrustedToAuthForDelegation allows S4U2Self forgery"
+ },
+ {
+  "id": 19,
+  "category": "B",
+  "category_name": "Delegation Attacks",
+  "name": "Constrained Delegation Kerberos Only Bypass",
+  "weakness": "Non-forwardable ticket workaround"
+ },
+ {
+  "id": 20,
+  "category": "B",
+  "category_name": "Delegation Attacks",
+  "name": "Resource-Based Constrained Delegation (RBCD)",
+  "weakness": "msDS-AllowedToActOnBehalfOfOtherIdentity writable"
+ },
+ {
+  "id": 21,
+  "category": "B",
+  "category_name": "Delegation Attacks",
+  "name": "S4U2Self Abuse",
+  "weakness": "Service impersonates any user without their credentials"
+ },
+ {
+  "id": 22,
+  "category": "B",
+  "category_name": "Delegation Attacks",
+  "name": "S4U2Proxy Abuse",
+  "weakness": "Service forwards impersonated ticket to target service"
+ },
+ {
+  "id": 23,
+  "category": "B",
+  "category_name": "Delegation Attacks",
+  "name": "RBCD via GenericWrite",
+  "weakness": "GenericWrite on computer object leads to RBCD"
+ },
+ {
+  "id": 24,
+  "category": "B",
+  "category_name": "Delegation Attacks",
+  "name": "RBCD via Shadow Credentials",
+  "weakness": "GenericAll enables msDS-KeyCredentialLink write → RBCD chain"
+ },
+ {
+  "id": 25,
+  "category": "C",
+  "category_name": "ACL / ACE Misconfigurations",
+  "name": "GenericAll on User",
+  "weakness": "Full control over target user object"
+ },
+ {
+  "id": 26,
+  "category": "C",
+  "category_name": "ACL / ACE Misconfigurations",
+  "name": "GenericAll on Group",
+  "weakness": "Full control over target group"
+ },
+ {
+  "id": 27,
+  "category": "C",
+  "category_name": "ACL / ACE Misconfigurations",
+  "name": "GenericAll on Computer",
+  "weakness": "Full control over target computer object"
+ },
+ {
+  "id": 28,
+  "category": "C",
+  "category_name": "ACL / ACE Misconfigurations",
+  "name": "GenericAll on OU",
+  "weakness": "Full control over organizational unit"
+ },
+ {
+  "id": 29,
+  "category": "C",
+  "category_name": "ACL / ACE Misconfigurations",
+  "name": "GenericAll on Domain",
+  "weakness": "Full control over domain object"
+ },
+ {
+  "id": 30,
+  "category": "C",
+  "category_name": "ACL / ACE Misconfigurations",
+  "name": "GenericWrite on User",
+  "weakness": "Write any attribute on user object"
+ },
+ {
+  "id": 31,
+  "category": "C",
+  "category_name": "ACL / ACE Misconfigurations",
+  "name": "GenericWrite on Computer",
+  "weakness": "Write msDS-AllowedToActOnBehalfOfOtherIdentity"
+ },
+ {
+  "id": 32,
+  "category": "C",
+  "category_name": "ACL / ACE Misconfigurations",
+  "name": "WriteOwner",
+  "weakness": "Change object owner → implicit GenericAll"
+ },
+ {
+  "id": 33,
+  "category": "C",
+  "category_name": "ACL / ACE Misconfigurations",
+  "name": "WriteDACL",
+  "weakness": "Modify object DACL → grant self DCSync or other rights"
+ },
+ {
+  "id": 34,
+  "category": "C",
+  "category_name": "ACL / ACE Misconfigurations",
+  "name": "WriteProperty on msDS-KeyCredentialLink",
+  "weakness": "Shadow Credentials entry point"
+ },
+ {
+  "id": 35,
+  "category": "C",
+  "category_name": "ACL / ACE Misconfigurations",
+  "name": "WriteProperty on msDS-AllowedToActOnBehalfOfOtherIdentity",
+  "weakness": "RBCD entry point"
+ },
+ {
+  "id": 36,
+  "category": "C",
+  "category_name": "ACL / ACE Misconfigurations",
+  "name": "Self (Self-membership write)",
+  "weakness": "Add self to group without GenericWrite"
+ },
+ {
+  "id": 37,
+  "category": "C",
+  "category_name": "ACL / ACE Misconfigurations",
+  "name": "ForceChangePassword",
+  "weakness": "Reset target password without knowing current"
+ },
+ {
+  "id": 38,
+  "category": "C",
+  "category_name": "ACL / ACE Misconfigurations",
+  "name": "AddMember",
+  "weakness": "Add arbitrary users to group"
+ },
+ {
+  "id": 39,
+  "category": "C",
+  "category_name": "ACL / ACE Misconfigurations",
+  "name": "WriteDACL on Domain Root",
+  "weakness": "Self-grant DCSync Extended Rights"
+ },
+ {
+  "id": 40,
+  "category": "C",
+  "category_name": "ACL / ACE Misconfigurations",
+  "name": "Multi-Hop ACL Chain",
+  "weakness": "A → GenericAll → B → GenericAll → C → WriteDACL → Domain Admins"
+ },
+ {
+  "id": 41,
+  "category": "C",
+  "category_name": "ACL / ACE Misconfigurations",
+  "name": "AdminSDHolder ACL Backdoor",
+  "weakness": "Malicious ACE on AdminSDHolder propagated to all protected objects via SDProp"
+ },
+ {
+  "id": 42,
+  "category": "C",
+  "category_name": "ACL / ACE Misconfigurations",
+  "name": "Nested Group ACL Abuse",
+  "weakness": "Indirect permission inheritance through group nesting"
+ },
+ {
+  "id": 43,
+  "category": "D",
+  "category_name": "Privilege Escalation via AD Roles / Groups",
+  "name": "DnsAdmins Abuse",
+  "weakness": "DnsAdmins member loads arbitrary DLL into DNS service (SYSTEM on DC)"
+ },
+ {
+  "id": 44,
+  "category": "D",
+  "category_name": "Privilege Escalation via AD Roles / Groups",
+  "name": "DnsAdmins Nested Group Abuse",
+  "weakness": "Group nested into DnsAdmins grants indirect membership"
+ },
+ {
+  "id": 45,
+  "category": "D",
+  "category_name": "Privilege Escalation via AD Roles / Groups",
+  "name": "Backup Operators Abuse",
+  "weakness": "SeBackupPrivilege allows ntds.dit extraction"
+ },
+ {
+  "id": 46,
+  "category": "D",
+  "category_name": "Privilege Escalation via AD Roles / Groups",
+  "name": "Account Operators Abuse",
+  "weakness": "Can create/modify accounts in most OUs"
+ },
+ {
+  "id": 47,
+  "category": "D",
+  "category_name": "Privilege Escalation via AD Roles / Groups",
+  "name": "Server Operators Abuse",
+  "weakness": "Can start/stop services and log on locally to DCs"
+ },
+ {
+  "id": 48,
+  "category": "D",
+  "category_name": "Privilege Escalation via AD Roles / Groups",
+  "name": "Print Operators Abuse",
+  "weakness": "SeLoadDriverPrivilege → kernel driver load"
+ },
+ {
+  "id": 49,
+  "category": "D",
+  "category_name": "Privilege Escalation via AD Roles / Groups",
+  "name": "Exchange Windows Permissions Abuse",
+  "weakness": "WriteDACL on domain object (PrivExchange)"
+ },
+ {
+  "id": 50,
+  "category": "D",
+  "category_name": "Privilege Escalation via AD Roles / Groups",
+  "name": "Schema Admins Abuse",
+  "weakness": "Irreversible schema modification for persistence"
+ },
+ {
+  "id": 51,
+  "category": "E",
+  "category_name": "Credential Theft & Authentication Attacks",
+  "name": "Pass-the-Hash (PtH)",
+  "weakness": "NTLM hash reused for authentication"
+ },
+ {
+  "id": 52,
+  "category": "E",
+  "category_name": "Credential Theft & Authentication Attacks",
+  "name": "NTLM Relay to SMB",
+  "weakness": "SMB Signing disabled, relay intercepted authentication"
+ },
+ {
+  "id": 53,
+  "category": "E",
+  "category_name": "Credential Theft & Authentication Attacks",
+  "name": "NTLM Relay to LDAP",
+  "weakness": "LDAP Signing not enforced, relay to LDAP"
+ },
+ {
+  "id": 54,
+  "category": "E",
+  "category_name": "Credential Theft & Authentication Attacks",
+  "name": "NTLM Relay to LDAPS",
+  "weakness": "LDAP Channel Binding not enforced"
+ },
+ {
+  "id": 55,
+  "category": "E",
+  "category_name": "Credential Theft & Authentication Attacks",
+  "name": "NTLM Relay to AD CS (ESC8)",
+  "weakness": "HTTP enrollment endpoint accepts NTLM"
+ },
+ {
+  "id": 56,
+  "category": "E",
+  "category_name": "Credential Theft & Authentication Attacks",
+  "name": "NTLM Relay to AD CS (ESC11)",
+  "weakness": "RPC ICPR endpoint accepts NTLM without encryption"
+ },
+ {
+  "id": 57,
+  "category": "E",
+  "category_name": "Credential Theft & Authentication Attacks",
+  "name": "NTLM Relay to MSSQL",
+  "weakness": "SQL Server accepts NTLM relay"
+ },
+ {
+  "id": 58,
+  "category": "E",
+  "category_name": "Credential Theft & Authentication Attacks",
+  "name": "Kerberos Relay (krbrelayx)",
+  "weakness": "Kerberos authentication relayed to LDAP"
+ },
+ {
+  "id": 59,
+  "category": "E",
+  "category_name": "Credential Theft & Authentication Attacks",
+  "name": "NTLMv1 Downgrade",
+  "weakness": "NTLMv1 allowed → crackable with rainbow tables"
+ },
+ {
+  "id": 60,
+  "category": "E",
+  "category_name": "Credential Theft & Authentication Attacks",
+  "name": "Password Spraying",
+  "weakness": "Low-and-slow password guessing across many accounts"
+ },
+ {
+  "id": 61,
+  "category": "E",
+  "category_name": "Credential Theft & Authentication Attacks",
+  "name": "Credential Stuffing",
+  "weakness": "Known breached credentials tested against AD"
+ },
+ {
+  "id": 62,
+  "category": "E",
+  "category_name": "Credential Theft & Authentication Attacks",
+  "name": "LLMNR Poisoning",
+  "weakness": "Multicast name resolution answered by attacker"
+ },
+ {
+  "id": 63,
+  "category": "E",
+  "category_name": "Credential Theft & Authentication Attacks",
+  "name": "NBT-NS Poisoning",
+  "weakness": "NetBIOS name resolution spoofed"
+ },
+ {
+  "id": 64,
+  "category": "E",
+  "category_name": "Credential Theft & Authentication Attacks",
+  "name": "mDNS Poisoning",
+  "weakness": "Multicast DNS spoofed"
+ },
+ {
+  "id": 65,
+  "category": "E",
+  "category_name": "Credential Theft & Authentication Attacks",
+  "name": "WPAD Abuse",
+  "weakness": "Web Proxy Auto-Discovery poisoned to intercept HTTP auth"
+ },
+ {
+  "id": 66,
+  "category": "E",
+  "category_name": "Credential Theft & Authentication Attacks",
+  "name": "DCSync",
+  "weakness": "Replication rights granted to non-DC account"
+ },
+ {
+  "id": 67,
+  "category": "E",
+  "category_name": "Credential Theft & Authentication Attacks",
+  "name": "NTDS.dit Extraction",
+  "weakness": "Domain database copied offline for hash extraction"
+ },
+ {
+  "id": 68,
+  "category": "E",
+  "category_name": "Credential Theft & Authentication Attacks",
+  "name": "VSS Shadow Copy Abuse",
+  "weakness": "Volume Shadow Service used to copy locked files"
+ },
+ {
+  "id": 69,
+  "category": "E",
+  "category_name": "Credential Theft & Authentication Attacks",
+  "name": "SAM Database Extraction",
+  "weakness": "Local SAM hashed dumped via registry or VSS"
+ },
+ {
+  "id": 70,
+  "category": "E",
+  "category_name": "Credential Theft & Authentication Attacks",
+  "name": "LSA Secrets Extraction",
+  "weakness": "Service account passwords from LSA secrets"
+ },
+ {
+  "id": 71,
+  "category": "E",
+  "category_name": "Credential Theft & Authentication Attacks",
+  "name": "DPAPI Master Key Theft",
+  "weakness": "User data decryption keys stolen"
+ },
+ {
+  "id": 72,
+  "category": "E",
+  "category_name": "Credential Theft & Authentication Attacks",
+  "name": "DPAPI Domain Backup Key Theft",
+  "weakness": "Single key decrypts all user DPAPI data"
+ },
+ {
+  "id": 73,
+  "category": "E",
+  "category_name": "Credential Theft & Authentication Attacks",
+  "name": "Credential Manager Extraction",
+  "weakness": "Windows Vault credentials decrypted"
+ },
+ {
+  "id": 74,
+  "category": "E",
+  "category_name": "Credential Theft & Authentication Attacks",
+  "name": "WDigest Cleartext Credentials",
+  "weakness": "WDigest enabled, credentials stored in LSASS plaintext"
+ },
+ {
+  "id": 75,
+  "category": "E",
+  "category_name": "Credential Theft & Authentication Attacks",
+  "name": "LSASS Memory Dump",
+  "weakness": "Process memory dumped for credential extraction"
+ },
+ {
+  "id": 76,
+  "category": "E",
+  "category_name": "Credential Theft & Authentication Attacks",
+  "name": "Reversible Encryption",
+  "weakness": "Accounts store cleartext-recoverable passwords in AD"
+ },
+ {
+  "id": 77,
+  "category": "E",
+  "category_name": "Credential Theft & Authentication Attacks",
+  "name": "Password in Object Description",
+  "weakness": "Admin stored password in user description/info/comment field"
+ },
+ {
+  "id": 78,
+  "category": "E",
+  "category_name": "Credential Theft & Authentication Attacks",
+  "name": "Default Password on Account",
+  "weakness": "Account never changed from provisioning password"
+ },
+ {
+  "id": 79,
+  "category": "E",
+  "category_name": "Credential Theft & Authentication Attacks",
+  "name": "Shared Password (Password Spraying)",
+  "weakness": "Multiple accounts share identical password"
+ },
+ {
+  "id": 80,
+  "category": "E",
+  "category_name": "Credential Theft & Authentication Attacks",
+  "name": "GPP cpassword",
+  "weakness": "Group Policy Preferences stored encrypted password (AES key is public)"
+ },
+ {
+  "id": 81,
+  "category": "E",
+  "category_name": "Credential Theft & Authentication Attacks",
+  "name": "Pre-Windows 2000 Computer Account",
+  "weakness": "Machine password equals lowercase computer name, never rotated"
+ },
+ {
+  "id": 82,
+  "category": "F",
+  "category_name": "Forced Authentication (Coercion)",
+  "name": "MS-RPRN SpoolSample (PrinterBug)",
+  "weakness": "Print Spooler forces arbitrary server authentication"
+ },
+ {
+  "id": 83,
+  "category": "F",
+  "category_name": "Forced Authentication (Coercion)",
+  "name": "MS-EFSR PetitPotam",
+  "weakness": "EFS forces arbitrary server authentication (CVE-2021-36942 anon variant)"
+ },
+ {
+  "id": 84,
+  "category": "F",
+  "category_name": "Forced Authentication (Coercion)",
+  "name": "MS-DFSNM DFSCoerce",
+  "weakness": "DFS Namespace forces authentication"
+ },
+ {
+  "id": 85,
+  "category": "F",
+  "category_name": "Forced Authentication (Coercion)",
+  "name": "MS-FSRVP ShadowCoerce",
+  "weakness": "File Server VSS Agent forces authentication"
+ },
+ {
+  "id": 86,
+  "category": "F",
+  "category_name": "Forced Authentication (Coercion)",
+  "name": "PrivExchange",
+  "weakness": "Exchange EWS push subscription forces authentication"
+ },
+ {
+  "id": 87,
+  "category": "F",
+  "category_name": "Forced Authentication (Coercion)",
+  "name": "WebDAV Coercion",
+  "weakness": "WebClient service forces HTTP authentication"
+ },
+ {
+  "id": 88,
+  "category": "F",
+  "category_name": "Forced Authentication (Coercion)",
+  "name": "MS-EFSRPC EfsRpcOpenFileRaw",
+  "weakness": "Alternative EFSR method for coercion"
+ },
+ {
+  "id": 89,
+  "category": "G",
+  "category_name": "AD Certificate Services (AD CS)",
+  "name": "ESC1",
+  "weakness": "Template: Client Auth EKU + Supply in Request + low-priv Enroll"
+ },
+ {
+  "id": 90,
+  "category": "G",
+  "category_name": "AD Certificate Services (AD CS)",
+  "name": "ESC2",
+  "weakness": "Template: Any Purpose EKU or no EKU (SubCA)"
+ },
+ {
+  "id": 91,
+  "category": "G",
+  "category_name": "AD Certificate Services (AD CS)",
+  "name": "ESC3",
+  "weakness": "Enrollment Agent: any user can enroll as another user"
+ },
+ {
+  "id": 92,
+  "category": "G",
+  "category_name": "AD Certificate Services (AD CS)",
+  "name": "ESC4",
+  "weakness": "Template ACL: low-priv has GenericAll/Write on certificate template"
+ },
+ {
+  "id": 93,
+  "category": "G",
+  "category_name": "AD Certificate Services (AD CS)",
+  "name": "ESC5",
+  "weakness": "PKI Object ACL: low-priv has GenericAll on CA or PKI objects"
+ },
+ {
+  "id": 94,
+  "category": "G",
+  "category_name": "AD Certificate Services (AD CS)",
+  "name": "ESC6",
+  "weakness": "CA Flag: EDITF_ATTRIBUTESUBJECTALTNAME2 enabled on CA"
+ },
+ {
+  "id": 95,
+  "category": "G",
+  "category_name": "AD Certificate Services (AD CS)",
+  "name": "ESC7",
+  "weakness": "CA ACL: low-priv has ManageCA or ManageCertificates rights"
+ },
+ {
+  "id": 96,
+  "category": "G",
+  "category_name": "AD Certificate Services (AD CS)",
+  "name": "ESC8",
+  "weakness": "Web Enrollment: HTTP (not HTTPS) + no EPA → NTLM relay"
+ },
+ {
+  "id": 97,
+  "category": "G",
+  "category_name": "AD Certificate Services (AD CS)",
+  "name": "ESC9",
+  "weakness": "No Security Extension: CT_FLAG_NO_SECURITY_EXTENSION, no SID in cert"
+ },
+ {
+  "id": 98,
+  "category": "G",
+  "category_name": "AD Certificate Services (AD CS)",
+  "name": "ESC10",
+  "weakness": "Weak Certificate Mapping: UPN mapping without SID enforcement"
+ },
+ {
+  "id": 99,
+  "category": "G",
+  "category_name": "AD Certificate Services (AD CS)",
+  "name": "ESC11",
+  "weakness": "RPC ICPR: CA RPC interface accepts NTLM without encryption enforcement"
+ },
+ {
+  "id": 100,
+  "category": "G",
+  "category_name": "AD Certificate Services (AD CS)",
+  "name": "ESC13",
+  "weakness": "OID Group Link: Issuance Policy OID linked to privileged AD group"
+ },
+ {
+  "id": 101,
+  "category": "G",
+  "category_name": "AD Certificate Services (AD CS)",
+  "name": "ESC15",
+  "weakness": "EKU Inheritance: Application policy EKU inherited improperly"
+ },
+ {
+  "id": 102,
+  "category": "G",
+  "category_name": "AD Certificate Services (AD CS)",
+  "name": "Golden Certificate",
+  "weakness": "CA private key stolen → forge any certificate indefinitely"
+ },
+ {
+  "id": 103,
+  "category": "G",
+  "category_name": "AD Certificate Services (AD CS)",
+  "name": "NTLM Relay to ADCS ESC8",
+  "weakness": "Relay machine account auth to HTTP enrollment"
+ },
+ {
+  "id": 104,
+  "category": "G",
+  "category_name": "AD Certificate Services (AD CS)",
+  "name": "Certificate Theft",
+  "weakness": "PFX/certificate exported from compromised machine"
+ },
+ {
+  "id": 105,
+  "category": "G",
+  "category_name": "AD Certificate Services (AD CS)",
+  "name": "PKINIT Abuse",
+  "weakness": "Certificate used for Kerberos pre-authentication to obtain TGT + NT hash"
+ },
+ {
+  "id": 106,
+  "category": "H",
+  "category_name": "Managed Service Accounts",
+  "name": "gMSA Over-Privileged Readers",
+  "weakness": "Domain Computers or Domain Users in PrincipalsAllowedToRetrieveManagedPassword"
+ },
+ {
+  "id": 107,
+  "category": "H",
+  "category_name": "Managed Service Accounts",
+  "name": "gMSA Password Read via Machine Hash",
+  "weakness": "Compromised machine account reads gMSA secret"
+ },
+ {
+  "id": 108,
+  "category": "H",
+  "category_name": "Managed Service Accounts",
+  "name": "gMSA Pass-the-Hash",
+  "weakness": "gMSA NT hash used for lateral movement"
+ },
+ {
+  "id": 109,
+  "category": "H",
+  "category_name": "Managed Service Accounts",
+  "name": "gMSA Silver Ticket",
+  "weakness": "gMSA NT hash used to forge service ticket"
+ },
+ {
+  "id": 110,
+  "category": "H",
+  "category_name": "Managed Service Accounts",
+  "name": "dMSA Privilege Escalation (BadSuccessor)",
+  "weakness": "msDS-ManagedAccountPrecededByLink set to Domain Admin; KDC embeds target SIDs in PAC without validation"
+ },
+ {
+  "id": 111,
+  "category": "H",
+  "category_name": "Managed Service Accounts",
+  "name": "dMSA CreateChild Over-Delegated",
+  "weakness": "Non-admin has CreateChild rights for msDS-DelegatedManagedServiceAccount class on OU"
+ },
+ {
+  "id": 112,
+  "category": "I",
+  "category_name": "LAPS Misconfigurations",
+  "name": "Legacy LAPS Password Read",
+  "weakness": "ms-Mcs-AdmPwd readable by non-admin"
+ },
+ {
+  "id": 113,
+  "category": "I",
+  "category_name": "LAPS Misconfigurations",
+  "name": "Windows LAPS Password Read",
+  "weakness": "msLAPS-Password readable by non-admin"
+ },
+ {
+  "id": 114,
+  "category": "I",
+  "category_name": "LAPS Misconfigurations",
+  "name": "Windows LAPS Encrypted Password Bypass",
+  "weakness": "msLAPS-EncryptedPassword key accessible to attacker"
+ },
+ {
+  "id": 115,
+  "category": "I",
+  "category_name": "LAPS Misconfigurations",
+  "name": "LAPS Not Deployed",
+  "weakness": "Local admin passwords unmanaged, likely reused across machines"
+ },
+ {
+  "id": 116,
+  "category": "I",
+  "category_name": "LAPS Misconfigurations",
+  "name": "LAPS Over-Privileged Reader Group",
+  "weakness": "Mid-tier group granted ExtendedRight on Computers OU"
+ },
+ {
+  "id": 117,
+  "category": "J",
+  "category_name": "Persistence Techniques (AD-level)",
+  "name": "AdminSDHolder Modification",
+  "weakness": "ACE added to AdminSDHolder propagates to all protected objects"
+ },
+ {
+  "id": 118,
+  "category": "J",
+  "category_name": "Persistence Techniques (AD-level)",
+  "name": "DCShadow",
+  "weakness": "Rogue DC registered to inject arbitrary AD changes without normal replication logs"
+ },
+ {
+  "id": 119,
+  "category": "J",
+  "category_name": "Persistence Techniques (AD-level)",
+  "name": "Skeleton Key",
+  "weakness": "LSASS patched to accept master password for all accounts (memory-resident)"
+ },
+ {
+  "id": 120,
+  "category": "J",
+  "category_name": "Persistence Techniques (AD-level)",
+  "name": "DSRM Account Backdoor",
+  "weakness": "DsrmAdminLogonBehavior set to 2; DSRM password enables network auth"
+ },
+ {
+  "id": 121,
+  "category": "J",
+  "category_name": "Persistence Techniques (AD-level)",
+  "name": "SID History Injection",
+  "weakness": "Extra SID injected into account's SID history to grant elevated access"
+ },
+ {
+  "id": 122,
+  "category": "J",
+  "category_name": "Persistence Techniques (AD-level)",
+  "name": "Schema Backdoor",
+  "weakness": "Custom schema attribute added for covert data storage or persistent access"
+ },
+ {
+  "id": 123,
+  "category": "J",
+  "category_name": "Persistence Techniques (AD-level)",
+  "name": "ACL Backdoor (Nested)",
+  "weakness": "Multi-hop ACL chain grants indirect privileged access"
+ },
+ {
+  "id": 124,
+  "category": "J",
+  "category_name": "Persistence Techniques (AD-level)",
+  "name": "GPO Backdoor",
+  "weakness": "Malicious scheduled task or startup script added to existing GPO"
+ },
+ {
+  "id": 125,
+  "category": "J",
+  "category_name": "Persistence Techniques (AD-level)",
+  "name": "WMI Event Subscription Persistence",
+  "weakness": "__EventFilter + CommandLineEventConsumer bound for trigger-based execution"
+ },
+ {
+  "id": 126,
+  "category": "J",
+  "category_name": "Persistence Techniques (AD-level)",
+  "name": "COM Object Hijacking",
+  "weakness": "HKCU InProcServer32 overrides HKLM registration without admin rights"
+ },
+ {
+  "id": 127,
+  "category": "J",
+  "category_name": "Persistence Techniques (AD-level)",
+  "name": "Security Support Provider (SSP) Injection",
+  "weakness": "Custom SSP DLL loaded into LSASS to intercept credentials"
+ },
+ {
+  "id": 128,
+  "category": "J",
+  "category_name": "Persistence Techniques (AD-level)",
+  "name": "Scheduled Task Persistence",
+  "weakness": "Scheduled task created under trusted system path"
+ },
+ {
+  "id": 129,
+  "category": "J",
+  "category_name": "Persistence Techniques (AD-level)",
+  "name": "Registry Run Key Persistence",
+  "weakness": "HKLM/HKCU Run keys modified for autostart"
+ },
+ {
+  "id": 130,
+  "category": "J",
+  "category_name": "Persistence Techniques (AD-level)",
+  "name": "Service-based Persistence",
+  "weakness": "New service registered with auto-start"
+ },
+ {
+  "id": 131,
+  "category": "J",
+  "category_name": "Persistence Techniques (AD-level)",
+  "name": "BITS Job Persistence",
+  "weakness": "Background Intelligent Transfer Service job persists across reboots"
+ },
+ {
+  "id": 132,
+  "category": "J",
+  "category_name": "Persistence Techniques (AD-level)",
+  "name": "Silver Ticket Persistence",
+  "weakness": "Service account hash enables ticket forgery until password changed"
+ },
+ {
+  "id": 133,
+  "category": "J",
+  "category_name": "Persistence Techniques (AD-level)",
+  "name": "Golden Ticket Persistence",
+  "weakness": "krbtgt hash enables TGT forgery until double krbtgt reset"
+ },
+ {
+  "id": 134,
+  "category": "J",
+  "category_name": "Persistence Techniques (AD-level)",
+  "name": "Diamond Ticket Persistence",
+  "weakness": "krbtgt AES key used for stealthier ticket modification"
+ },
+ {
+  "id": 135,
+  "category": "J",
+  "category_name": "Persistence Techniques (AD-level)",
+  "name": "Golden Certificate Persistence",
+  "weakness": "Compromised CA key enables certificate forgery indefinitely"
+ },
+ {
+  "id": 136,
+  "category": "K",
+  "category_name": "Lateral Movement Weaknesses",
+  "name": "SMB Signing Disabled",
+  "weakness": "NTLM relay possible on SMB connections"
+ },
+ {
+  "id": 137,
+  "category": "K",
+  "category_name": "Lateral Movement Weaknesses",
+  "name": "LDAP Signing Not Enforced",
+  "weakness": "NTLM relay to LDAP possible"
+ },
+ {
+  "id": 138,
+  "category": "K",
+  "category_name": "Lateral Movement Weaknesses",
+  "name": "LDAP Channel Binding Not Enforced",
+  "weakness": "Relay to LDAPS possible"
+ },
+ {
+  "id": 139,
+  "category": "K",
+  "category_name": "Lateral Movement Weaknesses",
+  "name": "WinRM / PSRemoting Enabled Without Restriction",
+  "weakness": "Lateral movement via WS-Management"
+ },
+ {
+  "id": 140,
+  "category": "K",
+  "category_name": "Lateral Movement Weaknesses",
+  "name": "WMI Remote Execution Enabled",
+  "weakness": "Remote process creation via WMI"
+ },
+ {
+  "id": 141,
+  "category": "K",
+  "category_name": "Lateral Movement Weaknesses",
+  "name": "DCOM Remote Activation Allowed",
+  "weakness": "MMC20 / ShellWindows / ShellBrowserWindow lateral movement"
+ },
+ {
+  "id": 142,
+  "category": "K",
+  "category_name": "Lateral Movement Weaknesses",
+  "name": "DCOM RunAs Interactive User + DLL Hijacking",
+  "weakness": "COM object loads attacker DLL in target user session"
+ },
+ {
+  "id": 143,
+  "category": "K",
+  "category_name": "Lateral Movement Weaknesses",
+  "name": "PsExec Service Creation",
+  "weakness": "ADMIN$ share + service creation allowed"
+ },
+ {
+  "id": 144,
+  "category": "K",
+  "category_name": "Lateral Movement Weaknesses",
+  "name": "Remote Registry Service Enabled",
+  "weakness": "Remote registry modification for persistence"
+ },
+ {
+  "id": 145,
+  "category": "K",
+  "category_name": "Lateral Movement Weaknesses",
+  "name": "Pass-the-Certificate",
+  "weakness": "Certificate used for cross-protocol authentication relay"
+ },
+ {
+  "id": 146,
+  "category": "K",
+  "category_name": "Lateral Movement Weaknesses",
+  "name": "Pass-the-Ccache",
+  "weakness": "Linux ccache ticket file reused for Kerberos authentication"
+ },
+ {
+  "id": 147,
+  "category": "K",
+  "category_name": "Lateral Movement Weaknesses",
+  "name": "Double-Hop Problem (WinRM CredSSP)",
+  "weakness": "Credentials transmitted to intermediate host in plaintext"
+ },
+ {
+  "id": 148,
+  "category": "K",
+  "category_name": "Lateral Movement Weaknesses",
+  "name": "JEA Endpoint Misconfiguration",
+  "weakness": "Just Enough Administration endpoint allows command injection"
+ },
+ {
+  "id": 149,
+  "category": "K",
+  "category_name": "Lateral Movement Weaknesses",
+  "name": "SQL Server Linked Server Lateral Movement",
+  "weakness": "EXECUTE AT [linked_server] pivots execution"
+ },
+ {
+  "id": 150,
+  "category": "K",
+  "category_name": "Lateral Movement Weaknesses",
+  "name": "SQL Server xp_cmdshell Enabled",
+  "weakness": "Command execution via SQL extended procedure"
+ },
+ {
+  "id": 151,
+  "category": "K",
+  "category_name": "Lateral Movement Weaknesses",
+  "name": "SQL Server UNC Path Injection",
+  "weakness": "xp_dirtree forces NTLM authentication to attacker"
+ },
+ {
+  "id": 152,
+  "category": "K",
+  "category_name": "Lateral Movement Weaknesses",
+  "name": "SQL ADSI Queries",
+  "weakness": "SQL Server used to query Active Directory via ADSI OLE DB"
+ },
+ {
+  "id": 153,
+  "category": "L",
+  "category_name": "Reconnaissance / Information Disclosure",
+  "name": "Excessive LDAP Query Permissions",
+  "weakness": "Unauthenticated or low-priv LDAP enumeration of sensitive attributes"
+ },
+ {
+  "id": 154,
+  "category": "L",
+  "category_name": "Reconnaissance / Information Disclosure",
+  "name": "SPN Enumeration Without Authentication",
+  "weakness": "Kerberoasting targets identifiable without auth"
+ },
+ {
+  "id": 155,
+  "category": "L",
+  "category_name": "Reconnaissance / Information Disclosure",
+  "name": "User Enumeration via Kerberos Error Codes",
+  "weakness": "KDC_ERR_C_PRINCIPAL_UNKNOWN vs KDC_ERR_PREAUTH_REQUIRED reveals valid accounts"
+ },
+ {
+  "id": 156,
+  "category": "L",
+  "category_name": "Reconnaissance / Information Disclosure",
+  "name": "RID Brute Force",
+  "weakness": "Guest/null session allows SID enumeration"
+ },
+ {
+  "id": 157,
+  "category": "L",
+  "category_name": "Reconnaissance / Information Disclosure",
+  "name": "BloodHound Collection Permitted",
+  "weakness": "AD relationship data collectible by any domain user"
+ },
+ {
+  "id": 158,
+  "category": "L",
+  "category_name": "Reconnaissance / Information Disclosure",
+  "name": "Domain Trust Enumeration",
+  "weakness": "Trust relationships discoverable by authenticated users"
+ },
+ {
+  "id": 159,
+  "category": "L",
+  "category_name": "Reconnaissance / Information Disclosure",
+  "name": "AD Sites and Subnets Disclosure",
+  "weakness": "Physical network topology exposed via LDAP"
+ },
+ {
+  "id": 160,
+  "category": "L",
+  "category_name": "Reconnaissance / Information Disclosure",
+  "name": "MachineAccountQuota Not Zero",
+  "weakness": "Any domain user can create up to 10 computer accounts"
+ },
+ {
+  "id": 161,
+  "category": "L",
+  "category_name": "Reconnaissance / Information Disclosure",
+  "name": "Password Policy Weak (No Complexity)",
+  "weakness": "Minimum password complexity not enforced"
+ },
+ {
+  "id": 162,
+  "category": "L",
+  "category_name": "Reconnaissance / Information Disclosure",
+  "name": "Password Policy Short (< 8 chars)",
+  "weakness": "Minimum password length below baseline"
+ },
+ {
+  "id": 163,
+  "category": "L",
+  "category_name": "Reconnaissance / Information Disclosure",
+  "name": "Lockout Threshold Too High or Disabled",
+  "weakness": "Unlimited or high-threshold brute force possible"
+ },
+ {
+  "id": 164,
+  "category": "L",
+  "category_name": "Reconnaissance / Information Disclosure",
+  "name": "Fine-Grained Password Policy Not Applied",
+  "weakness": "Privileged accounts use weak default domain policy"
+ },
+ {
+  "id": 165,
+  "category": "L",
+  "category_name": "Reconnaissance / Information Disclosure",
+  "name": "Description Field Password Leakage",
+  "weakness": "Credentials stored in user/computer description attributes"
+ },
+ {
+  "id": 166,
+  "category": "L",
+  "category_name": "Reconnaissance / Information Disclosure",
+  "name": "Group Policy Preferences Password (cpassword)",
+  "weakness": "Encrypted but publicly decryptable GPP credentials"
+ },
+ {
+  "id": 167,
+  "category": "L",
+  "category_name": "Reconnaissance / Information Disclosure",
+  "name": "SYSVOL World-Readable Sensitive Data",
+  "weakness": "Scripts or config files with credentials in SYSVOL"
+ },
+ {
+  "id": 168,
+  "category": "M",
+  "category_name": "Windows Credential Protection Weaknesses",
+  "name": "Credential Guard Not Enabled",
+  "weakness": "LSASS credentials accessible to SYSTEM-level attacker"
+ },
+ {
+  "id": 169,
+  "category": "M",
+  "category_name": "Windows Credential Protection Weaknesses",
+  "name": "Protected Users Group Not Used",
+  "weakness": "Privileged accounts lack NTLM prohibition and delegation restrictions"
+ },
+ {
+  "id": 170,
+  "category": "M",
+  "category_name": "Windows Credential Protection Weaknesses",
+  "name": "Cached Domain Credentials",
+  "weakness": "Domain credentials cached locally, extractable offline"
+ },
+ {
+  "id": 171,
+  "category": "M",
+  "category_name": "Windows Credential Protection Weaknesses",
+  "name": "WDigest Enabled",
+  "weakness": "Cleartext credentials stored in LSASS"
+ },
+ {
+  "id": 172,
+  "category": "M",
+  "category_name": "Windows Credential Protection Weaknesses",
+  "name": "LSA Protection (PPL) Not Enabled",
+  "weakness": "LSASS not protected as Protected Process Light"
+ },
+ {
+  "id": 173,
+  "category": "M",
+  "category_name": "Windows Credential Protection Weaknesses",
+  "name": "NTLM Not Restricted",
+  "weakness": "NTLM authentication allowed domain-wide"
+ },
+ {
+  "id": 174,
+  "category": "M",
+  "category_name": "Windows Credential Protection Weaknesses",
+  "name": "NTLMv1 Allowed",
+  "weakness": "Weak NTLM version with known cryptographic weaknesses"
+ },
+ {
+  "id": 175,
+  "category": "M",
+  "category_name": "Windows Credential Protection Weaknesses",
+  "name": "SeDebugPrivilege on Non-Admin",
+  "weakness": "Allows LSASS memory access"
+ },
+ {
+  "id": 176,
+  "category": "M",
+  "category_name": "Windows Credential Protection Weaknesses",
+  "name": "SeImpersonatePrivilege on Service Account",
+  "weakness": "Potato-family privilege escalation to SYSTEM"
+ },
+ {
+  "id": 177,
+  "category": "N",
+  "category_name": "SCCM / MECM Attack Surface",
+  "name": "Network Access Account (NAA) Password Extractable",
+  "weakness": "NAA credentials stored in WMI, decryptable by local admin"
+ },
+ {
+  "id": 178,
+  "category": "N",
+  "category_name": "SCCM / MECM Attack Surface",
+  "name": "SCCM PXE Boot Password Brute Force",
+  "weakness": "PXE boot image password crackable"
+ },
+ {
+  "id": 179,
+  "category": "N",
+  "category_name": "SCCM / MECM Attack Surface",
+  "name": "Task Sequence Cleartext Credentials",
+  "weakness": "Passwords embedded in SCCM task sequences"
+ },
+ {
+  "id": 180,
+  "category": "N",
+  "category_name": "SCCM / MECM Attack Surface",
+  "name": "CMPivot Remote Query Abuse",
+  "weakness": "SCCM admin executes real-time queries on all managed endpoints"
+ },
+ {
+  "id": 181,
+  "category": "N",
+  "category_name": "SCCM / MECM Attack Surface",
+  "name": "SCCM Script Deployment Abuse",
+  "weakness": "SCCM admin deploys PowerShell to all managed endpoints"
+ },
+ {
+  "id": 182,
+  "category": "N",
+  "category_name": "SCCM / MECM Attack Surface",
+  "name": "SCCM Site Database Direct Access",
+  "weakness": "SQL access to CM DB exposes all managed endpoint data"
+ },
+ {
+  "id": 183,
+  "category": "N",
+  "category_name": "SCCM / MECM Attack Surface",
+  "name": "SCCM Hierarchy Takeover",
+  "weakness": "SQL write access enables self-elevation to Full Administrator"
+ },
+ {
+  "id": 184,
+  "category": "N",
+  "category_name": "SCCM / MECM Attack Surface",
+  "name": "SCCM Client Push Installation Account Relay",
+  "weakness": "Client push account credentials relayable"
+ },
+ {
+  "id": 185,
+  "category": "N",
+  "category_name": "SCCM / MECM Attack Surface",
+  "name": "SCCM Collection Variable Password",
+  "weakness": "Sensitive data stored in collection variables"
+ },
+ {
+  "id": 186,
+  "category": "O",
+  "category_name": "Domain Trust Attacks",
+  "name": "Cross-Forest SID History Injection",
+  "weakness": "Extra SID added to cross-forest requests bypasses SID filtering"
+ },
+ {
+  "id": 187,
+  "category": "O",
+  "category_name": "Domain Trust Attacks",
+  "name": "Cross-Forest AD CS Enrollment",
+  "weakness": "Foreign forest user enrolls via vulnerable template in trusting forest"
+ },
+ {
+  "id": 188,
+  "category": "O",
+  "category_name": "Domain Trust Attacks",
+  "name": "Selective Authentication Bypass",
+  "weakness": "Trusting domain improperly grants access to all authenticated users"
+ },
+ {
+  "id": 189,
+  "category": "O",
+  "category_name": "Domain Trust Attacks",
+  "name": "PAM Trust Abuse",
+  "weakness": "Privileged Access Management trust allows cross-forest privilege escalation"
+ },
+ {
+  "id": 190,
+  "category": "O",
+  "category_name": "Domain Trust Attacks",
+  "name": "Inter-Realm TGT Forging",
+  "weakness": "Cross-domain referral ticket forged with inter-realm key"
+ },
+ {
+  "id": 191,
+  "category": "O",
+  "category_name": "Domain Trust Attacks",
+  "name": "External Trust SID Filtering Bypass",
+  "weakness": "SID filtering not enforced on external trust"
+ },
+ {
+  "id": 192,
+  "category": "O",
+  "category_name": "Domain Trust Attacks",
+  "name": "DNS Wildcard Injection in Trusted Domain",
+  "weakness": "Cross-domain DNS poisoning via ADIDNS write access"
+ },
+ {
+  "id": 193,
+  "category": "P",
+  "category_name": "ADIDNS / Name Resolution Attacks",
+  "name": "ADIDNS Record Injection",
+  "weakness": "Authenticated users can add DNS records in AD-integrated DNS"
+ },
+ {
+  "id": 194,
+  "category": "P",
+  "category_name": "ADIDNS / Name Resolution Attacks",
+  "name": "WPAD DNS Injection",
+  "weakness": "WPAD hostname registered in ADIDNS for NTLM relay"
+ },
+ {
+  "id": 195,
+  "category": "P",
+  "category_name": "ADIDNS / Name Resolution Attacks",
+  "name": "LLMNR Not Disabled",
+  "weakness": "Link-Local Multicast Name Resolution exploitable for poisoning"
+ },
+ {
+  "id": 196,
+  "category": "P",
+  "category_name": "ADIDNS / Name Resolution Attacks",
+  "name": "NBT-NS Not Disabled",
+  "weakness": "NetBIOS Name Service exploitable for poisoning"
+ },
+ {
+  "id": 197,
+  "category": "P",
+  "category_name": "ADIDNS / Name Resolution Attacks",
+  "name": "mDNS Not Disabled",
+  "weakness": "Multicast DNS exploitable for poisoning"
+ },
+ {
+  "id": 198,
+  "category": "Q",
+  "category_name": "Modern / 2025-2026 Attack Surface",
+  "name": "BadSuccessor (dMSA)",
+  "weakness": "Windows Server 2025: dMSA migration mechanism abused for DA impersonation"
+ },
+ {
+  "id": 199,
+  "category": "Q",
+  "category_name": "Modern / 2025-2026 Attack Surface",
+  "name": "IAKerb Interception",
+  "weakness": "Kerberos proxy mechanism potentially interceptable"
+ },
+ {
+  "id": 200,
+  "category": "Q",
+  "category_name": "Modern / 2025-2026 Attack Surface",
+  "name": "Local KDC Attack Surface",
+  "weakness": "New local KDC introduces new Kerberos attack surface"
+ },
+ {
+  "id": 201,
+  "category": "Q",
+  "category_name": "Modern / 2025-2026 Attack Surface",
+  "name": "RC4 Retirement Incomplete",
+  "weakness": "Mixed environment with RC4-capable and AES-only accounts"
+ },
+ {
+  "id": 202,
+  "category": "Q",
+  "category_name": "Modern / 2025-2026 Attack Surface",
+  "name": "WSMan-WinRM Lateral Movement",
+  "weakness": "Evades MDE/MDI default detections (as of early 2026)"
+ },
+ {
+  "id": 203,
+  "category": "Q",
+  "category_name": "Modern / 2025-2026 Attack Surface",
+  "name": "DCOMRunAs DLL Hijacking",
+  "weakness": "COM RunAs Interactive User + DLL search order abuse evades MDE/MDI"
+ },
+ {
+  "id": 204,
+  "category": "Q",
+  "category_name": "Modern / 2025-2026 Attack Surface",
+  "name": "Hybrid Identity MSOL_ Account Abuse",
+  "weakness": "Azure AD Connect sync account has DCSync rights on-premises"
+ },
+ {
+  "id": 205,
+  "category": "Q",
+  "category_name": "Modern / 2025-2026 Attack Surface",
+  "name": "Azure AD Connect Password Hash Sync Reverse",
+  "weakness": "PHS service account credentials dump"
+ },
+ {
+  "id": 206,
+  "category": "Q",
+  "category_name": "Modern / 2025-2026 Attack Surface",
+  "name": "Entra ID Application Secret Theft",
+  "weakness": "App registration client secret used for persistent cloud access"
+ },
+ {
+  "id": 207,
+  "category": "R",
+  "category_name": "LOLBin / Living-Off-the-Land Weaknesses",
+  "name": "wmic.exe Process Creation",
+  "weakness": "Remote WMI process creation without additional tools"
+ },
+ {
+  "id": 208,
+  "category": "R",
+  "category_name": "LOLBin / Living-Off-the-Land Weaknesses",
+  "name": "wmic.exe XSL Script Execution",
+  "weakness": "XSLT loaded from remote URL bypasses AppLocker"
+ },
+ {
+  "id": 209,
+  "category": "R",
+  "category_name": "LOLBin / Living-Off-the-Land Weaknesses",
+  "name": "cmstp.exe INF Execution",
+  "weakness": "Connection Manager profile installer executes arbitrary commands"
+ },
+ {
+  "id": 210,
+  "category": "R",
+  "category_name": "LOLBin / Living-Off-the-Land Weaknesses",
+  "name": "cmstp.exe UAC Bypass",
+  "weakness": "INF file execution in user context without elevation prompt"
+ },
+ {
+  "id": 211,
+  "category": "R",
+  "category_name": "LOLBin / Living-Off-the-Land Weaknesses",
+  "name": "msiexec.exe Remote MSI",
+  "weakness": "Windows Installer loads remote package without SmartScreen"
+ },
+ {
+  "id": 212,
+  "category": "R",
+  "category_name": "LOLBin / Living-Off-the-Land Weaknesses",
+  "name": "mshta.exe HTA Execution",
+  "weakness": "HTML Application Host executes VBScript/JScript"
+ },
+ {
+  "id": 213,
+  "category": "R",
+  "category_name": "LOLBin / Living-Off-the-Land Weaknesses",
+  "name": "mshta.exe AMSI Bypass",
+  "weakness": "HTA context does not pass through AMSI"
+ },
+ {
+  "id": 214,
+  "category": "R",
+  "category_name": "LOLBin / Living-Off-the-Land Weaknesses",
+  "name": "rundll32.exe DLL Proxy",
+  "weakness": "Arbitrary DLL execution through registered export"
+ },
+ {
+  "id": 215,
+  "category": "R",
+  "category_name": "LOLBin / Living-Off-the-Land Weaknesses",
+  "name": "rundll32.exe JavaScript",
+  "weakness": "Inline JavaScript execution bypasses script policies"
+ },
+ {
+  "id": 216,
+  "category": "R",
+  "category_name": "LOLBin / Living-Off-the-Land Weaknesses",
+  "name": "rundll32.exe comsvcs.dll MiniDump",
+  "weakness": "LSASS dump without Mimikatz"
+ },
+ {
+  "id": 217,
+  "category": "R",
+  "category_name": "LOLBin / Living-Off-the-Land Weaknesses",
+  "name": "regsvr32.exe Squiblydoo",
+  "weakness": "SCT loaded from URL bypasses AppLocker via scrobj.dll"
+ },
+ {
+  "id": 218,
+  "category": "R",
+  "category_name": "LOLBin / Living-Off-the-Land Weaknesses",
+  "name": "certutil.exe Download Cradle",
+  "weakness": "File download and Base64 decode built into Windows"
+ },
+ {
+  "id": 219,
+  "category": "R",
+  "category_name": "LOLBin / Living-Off-the-Land Weaknesses",
+  "name": "certutil.exe URL Cache Persistence",
+  "weakness": "Downloaded content cached and re-executable"
+ },
+ {
+  "id": 220,
+  "category": "R",
+  "category_name": "LOLBin / Living-Off-the-Land Weaknesses",
+  "name": "bitsadmin.exe Transfer",
+  "weakness": "BITS downloads bypass application-layer controls"
+ },
+ {
+  "id": 221,
+  "category": "R",
+  "category_name": "LOLBin / Living-Off-the-Land Weaknesses",
+  "name": "bitsadmin.exe Job Persistence",
+  "weakness": "BITS job survives reboot for delayed payload delivery"
+ },
+ {
+  "id": 222,
+  "category": "R",
+  "category_name": "LOLBin / Living-Off-the-Land Weaknesses",
+  "name": "MSBuild.exe Inline Task",
+  "weakness": ".NET code compiled and executed inline, bypasses AppLocker and CLM"
+ },
+ {
+  "id": 223,
+  "category": "R",
+  "category_name": "LOLBin / Living-Off-the-Land Weaknesses",
+  "name": "InstallUtil.exe /U Bypass",
+  "weakness": ".NET assembly loaded via uninstall path, not monitored by default"
+ },
+ {
+  "id": 224,
+  "category": "R",
+  "category_name": "LOLBin / Living-Off-the-Land Weaknesses",
+  "name": "schtasks.exe Remote Creation",
+  "weakness": "Remote scheduled task creation without PsExec"
+ },
+ {
+  "id": 225,
+  "category": "R",
+  "category_name": "LOLBin / Living-Off-the-Land Weaknesses",
+  "name": "sc.exe Remote Service",
+  "weakness": "Remote service creation for execution and persistence"
+ },
+ {
+  "id": 226,
+  "category": "R",
+  "category_name": "LOLBin / Living-Off-the-Land Weaknesses",
+  "name": "reg.exe Remote Registry",
+  "weakness": "Remote registry modification for persistence and lateral movement"
+ },
+ {
+  "id": 227,
+  "category": "R",
+  "category_name": "LOLBin / Living-Off-the-Land Weaknesses",
+  "name": "forfiles.exe Proxy Execution",
+  "weakness": "cmd parameter substitution for indirect execution"
+ },
+ {
+  "id": 228,
+  "category": "R",
+  "category_name": "LOLBin / Living-Off-the-Land Weaknesses",
+  "name": "pcalua.exe Proxy Execution",
+  "weakness": "Program Compatibility Assistant spawns commands"
+ },
+ {
+  "id": 229,
+  "category": "S",
+  "category_name": "DNS-Based Exfiltration & Tunneling",
+  "name": "DNS Data Exfiltration via QNAME",
+  "weakness": "Sensitive data encoded in DNS query subdomain labels"
+ },
+ {
+  "id": 230,
+  "category": "S",
+  "category_name": "DNS-Based Exfiltration & Tunneling",
+  "name": "DNS Tunneling via TXT Record",
+  "weakness": "Bidirectional C2 channel using TXT query/response"
+ },
+ {
+  "id": 231,
+  "category": "S",
+  "category_name": "DNS-Based Exfiltration & Tunneling",
+  "name": "DNS Tunneling via NULL Record (Type 10)",
+  "weakness": "Raw binary tunnel, iodine primary channel"
+ },
+ {
+  "id": 232,
+  "category": "S",
+  "category_name": "DNS-Based Exfiltration & Tunneling",
+  "name": "DNS Tunneling via CNAME Record",
+  "weakness": "C2 commands encoded in CNAME response target"
+ },
+ {
+  "id": 233,
+  "category": "S",
+  "category_name": "DNS-Based Exfiltration & Tunneling",
+  "name": "DNS Tunneling via MX Record",
+  "weakness": "Data exfiltration via mail exchange record target"
+ },
+ {
+  "id": 234,
+  "category": "S",
+  "category_name": "DNS-Based Exfiltration & Tunneling",
+  "name": "DNS Tunneling via A/AAAA Response Sequence",
+  "weakness": "Low-bandwidth data channel via sequential IP responses"
+ },
+ {
+  "id": 235,
+  "category": "S",
+  "category_name": "DNS-Based Exfiltration & Tunneling",
+  "name": "DNS over HTTPS (DoH) Exfiltration",
+  "weakness": "DNS queries encrypted in HTTPS to avoid inspection"
+ },
+ {
+  "id": 236,
+  "category": "S",
+  "category_name": "DNS-Based Exfiltration & Tunneling",
+  "name": "dnscat2 Protocol Tunneling",
+  "weakness": "Full bidirectional C2 channel over DNS"
+ },
+ {
+  "id": 237,
+  "category": "S",
+  "category_name": "DNS-Based Exfiltration & Tunneling",
+  "name": "iodine IP-over-DNS Tunnel",
+  "weakness": "Full IP tunnel enabling any TCP/UDP traffic over DNS"
+ },
+ {
+  "id": 238,
+  "category": "S",
+  "category_name": "DNS-Based Exfiltration & Tunneling",
+  "name": "dns2tcp TCP-over-DNS",
+  "weakness": "TCP sessions forwarded through DNS queries"
+ },
+ {
+  "id": 239,
+  "category": "S",
+  "category_name": "DNS-Based Exfiltration & Tunneling",
+  "name": "DNS Beacon Jitter Evasion",
+  "weakness": "Randomized DNS query intervals evade frequency-based detection"
+ },
+ {
+  "id": 240,
+  "category": "S",
+  "category_name": "DNS-Based Exfiltration & Tunneling",
+  "name": "DNS TTL Manipulation",
+  "weakness": "Short TTL prevents caching, forces repeated resolver queries to attacker NS"
+ },
+ {
+  "id": 241,
+  "category": "S",
+  "category_name": "DNS-Based Exfiltration & Tunneling",
+  "name": "ADIDNS Wildcard Record",
+  "weakness": "Wildcard DNS record captures all subdomain queries for poisoning"
+ },
+ {
+  "id": 242,
+  "category": "T",
+  "category_name": "Physical / Environmental (Referenced)",
+  "name": "Pre-Windows 2000 Compatible Access Group",
+  "weakness": "Allows anonymous RID enumeration via SAMR"
+ },
+ {
+  "id": 243,
+  "category": "T",
+  "category_name": "Physical / Environmental (Referenced)",
+  "name": "Anonymous LDAP Bind Allowed",
+  "weakness": "Unauthenticated LDAP queries reveal directory structure"
+ },
+ {
+  "id": 244,
+  "category": "T",
+  "category_name": "Physical / Environmental (Referenced)",
+  "name": "Default Administrator Account Enabled",
+  "weakness": "Built-in Administrator is an attack target"
+ },
+ {
+  "id": 245,
+  "category": "T",
+  "category_name": "Physical / Environmental (Referenced)",
+  "name": "Guest Account Enabled",
+  "weakness": "Unauthenticated access to domain resources"
+ },
+ {
+  "id": 246,
+  "category": "T",
+  "category_name": "Physical / Environmental (Referenced)",
+  "name": "Stale / Orphaned Computer Accounts",
+  "weakness": "Old machine accounts with known or predictable passwords"
+ },
+ {
+  "id": 247,
+  "category": "T",
+  "category_name": "Physical / Environmental (Referenced)",
+  "name": "Service Account with Domain Admin Rights",
+  "weakness": "Over-privileged service account expands blast radius"
+ },
+ {
+  "id": 248,
+  "category": "T",
+  "category_name": "Physical / Environmental (Referenced)",
+  "name": "Interactive Logon of Service Accounts",
+  "weakness": "Service accounts logging on interactively leave credentials in LSASS"
+ }
+]
