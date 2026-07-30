@@ -401,7 +401,10 @@ QA 模式: {context.get('mode', 'unknown')}
         包裹 QA_TOOLS,在每次工具呼叫前後自動記錄觀察。
         回傳新的工具列表,保持原始工具的 name/description 不變。
         """
-        from langchain.tools import tool as tool_decorator, StructuredTool
+        try:
+            from langchain_core.tools import StructuredTool
+        except ImportError:
+            from langchain.tools import StructuredTool
 
         wrapped = []
         for t in tools:

@@ -963,7 +963,10 @@ def _log_step(tool_name: str, tool_input: dict, result: str) -> None:
 def _wrap_with_step_log(tools: list) -> list:
     """幫每個工具包一層無條件 log,不改變工具的 name/description/schema。"""
     from functools import wraps
-    from langchain.tools import StructuredTool
+    try:
+        from langchain_core.tools import StructuredTool
+    except ImportError:
+        from langchain.tools import StructuredTool
 
     wrapped = []
     for t in tools:
