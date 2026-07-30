@@ -1241,6 +1241,64 @@ def build_qa_agent(observer=None):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# 續跑閘門: 判斷 agent 是否「還沒做完就停」(結構性防提早收工,不靠 prompt 自律)
+# ═══════════════════════════════════════════════════════════════════════════
+def _tool_calls_used(result: dict) -> set:
+    """從訊息歷史抓出實際呼叫過的工具名稱集合。"""
+    used = set()
+    for msg in result.get("messages", []):
+        for tc in (getattr(msg, "tool_calls", None) or []):
+            name = tc.get("name") if isinstance(tc, dict) else getattr(tc, "name", None)
+            if name:
+                used.add(name)
+    return used
+
+
+def _asked_human(result: dict) -> bool:
+    return "ask_human" in _tool_calls_used(result)
+
+
+def _coverage_gaps(result: dict) -> list:
+    """回傳「明顯該做卻還沒做」的動作清單 (人看得懂的字串)。空清單=覆蓋足夠,可收工。
+    這是最低標,不是要它照表操課 —— 只擋「才跑兩三步就停」這種明顯提早收工。"""
+    used = _tool_calls_used(result)
+    gaps = []
+
+    # 共同最低標: 一定要先看過環境
+    if "get_range_info" not in used and "list_planted_vulns" not in used:
+        gaps.append("還沒呼叫 get_range_info/list_planted_vulns 搞清楚有哪些目標")
+    if "run_validation" not in used:
+        gaps.append("還沒跑 run_validation 確認基礎設施")
+
+    have_cred = bool((_MF.get("qa_credential") or {}).get("password"))
+    web_hosts = [m for m in _MF.get("machines", []) if "http" in m.get("services", [])]
+
+    if _NO_MANIFEST:
+        # 黑箱: 沒憑證就一定要試過初始存取那一串
+        if not have_cred and "asrep_roast_open" not in used and "password_spray" not in used:
+            if "enum_users" not in used:
+                gaps.append("還沒用 enum_users 列舉帳號找初始存取")
+            else:
+                gaps.append("列舉了帳號卻還沒試 asrep_roast_open 找初始存取")
+        if "generic_ad_audit" not in used:
+            gaps.append("還沒跑 generic_ad_audit 對已知 AD 弱點做基線掃描")
+        # 有 web 主機卻完全沒碰網頁滲透
+        if web_hosts and not ({"web_dirbust_range", "web_fetch_range"} & used):
+            ips = ", ".join(m["ip"] for m in web_hosts)
+            gaps.append(f"有 web 主機 ({ips}) 卻還沒做網頁滲透 (web_dirbust_range/web_fetch_range)")
+    else:
+        # 有 manifest: 每個種下的弱點都該被測過 (test_vuln 或 bloodhound_verify)
+        planted = _MF.get("planted_vulns", [])
+        if planted and not ({"test_vuln", "bloodhound_verify"} & used):
+            gaps.append(f"有 {len(planted)} 個種下的弱點卻還沒呼叫 test_vuln/bloodhound_verify 驗證")
+        if web_hosts and not ({"web_dirbust_range", "web_fetch_range"} & used):
+            ips = ", ".join(m["ip"] for m in web_hosts)
+            gaps.append(f"有 web 主機 ({ips}) 卻還沒做網頁滲透")
+
+    return gaps
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # CLI
 # ═══════════════════════════════════════════════════════════════════════════
 def run(a) -> None:
@@ -1251,6 +1309,10 @@ def run(a) -> None:
         os.environ["LLM_MODEL"] = a.model
     if a.ollama_base_url:
         os.environ["OLLAMA_BASE_URL"] = a.ollama_base_url
+    if a.max_nudges is not None:
+        os.environ["QA_MAX_NUDGES"] = str(a.max_nudges)
+    if a.recursion_limit is not None:
+        os.environ["QA_RECURSION_LIMIT"] = str(a.recursion_limit)
 
     try:
         _load(a.manifest, discover_cidr=a.network_cidr, ad_domain=a.ad_domain,
@@ -1291,7 +1353,9 @@ def run(a) -> None:
         print(f"[Observer] 觀察員已啟動 (backend={observer.backend}, model={observer.model_name})")
 
     agent = build_qa_agent(observer=observer)
-    config = {"configurable": {"thread_id": a.thread_id}}
+    # recursion_limit 拉高: 預設 (25) 常常還沒做完就被 langgraph 截斷,看起來像「隨意停下」。
+    config = {"configurable": {"thread_id": a.thread_id},
+              "recursion_limit": int(os.environ.get("QA_RECURSION_LIMIT", "150"))}
     if _NO_MANIFEST:
         task = (f"對探索到的 range (網域 {_MF['ad_domain']}, DC {_MF['machines'][0]['ip']}) "
                 f"做黑箱滲透式稽核。沒有種植弱點清單,自己判斷探索順序、要不要嘗試找初始存取、"
@@ -1304,16 +1368,40 @@ def run(a) -> None:
                 f"最後給我一份 QA 報告。")
 
     from langgraph.types import Command
-    result = agent.invoke({"messages": [{"role": "user", "content": task}]}, config)
 
-    # 處理 HITL 中斷 (suggest_fix)
-    while "__interrupt__" in result:
-        intr = result["__interrupt__"][0].value
-        print("\n[HITL] agent 想執行需確認的動作:")
-        print(json.dumps(intr, ensure_ascii=False, indent=2)[:800])
-        ans = input("approve / reject> ").strip().lower()
-        decision = {"type": "approve"} if ans == "approve" else {"type": "reject"}
-        result = agent.invoke(Command(resume={"decisions": [decision]}), config)
+    def _settle(payload):
+        """跑 agent 並處理所有 HITL 中斷,回傳最終 (無中斷) 的 result。"""
+        res = agent.invoke(payload, config)
+        while "__interrupt__" in res:
+            intr = res["__interrupt__"][0].value
+            print("\n[HITL] agent 想執行需確認的動作:")
+            print(json.dumps(intr, ensure_ascii=False, indent=2)[:800])
+            ans = input("approve / reject> ").strip().lower()
+            decision = {"type": "approve"} if ans == "approve" else {"type": "reject"}
+            res = agent.invoke(Command(resume={"decisions": [decision]}), config)
+        return res
+
+    result = _settle({"messages": [{"role": "user", "content": task}]})
+
+    # ── 續跑閘門: agent 停下時,檢查它是不是「還沒做完就停」。是的話,把具體缺漏
+    #    塞回去逼它繼續,而不是就這樣收工。上限 QA_MAX_NUDGES 次,避免無限迴圈。────
+    max_nudges = int(os.environ.get("QA_MAX_NUDGES", "5"))
+    for _ in range(max_nudges):
+        gaps = _coverage_gaps(result)
+        if not gaps:
+            break
+        if _asked_human(result):
+            # 它有正當地問過人 (卡死安全閥),尊重它的判斷,不再逼
+            print("[QA] agent 已呼叫 ask_human,視為正當停下,不再催促。")
+            break
+        print(f"[QA] agent 疑似提早停下,還沒做: {gaps} — 自動要求它繼續。")
+        nudge = (
+            "你停得太早了。你還沒做這些明顯該做的事: "
+            + "; ".join(gaps)
+            + "。除非你真的已經窮盡所有自主手段 (那就呼叫 ask_human 說明你卡在哪),"
+              "否則現在繼續往下做,不要停,也不要只回一句「好的我繼續」——直接呼叫工具。"
+        )
+        result = _settle({"messages": [{"role": "user", "content": nudge}]})
 
     # 輸出最終訊息
     print("\n" + "=" * 72)
@@ -1355,6 +1443,12 @@ def build_parser():
     p.add_argument("--ollama-base-url", default=None)
     p.add_argument("--thread-id", default="qa-run-001")
     p.add_argument("--yes", action="store_true", help="跳過測試前的範圍確認")
+    p.add_argument("--max-nudges", type=int, default=None,
+                   help="agent 提早停下時,自動要求它繼續的最多次數 (預設 5;也可用環境變數 "
+                        "QA_MAX_NUDGES)。設 0 關閉續跑閘門")
+    p.add_argument("--recursion-limit", type=int, default=None,
+                   help="langgraph 單次執行的最大步數 (預設 150;也可用環境變數 "
+                        "QA_RECURSION_LIMIT)。太低會讓 agent 沒做完就被截斷")
     # Observer Agent
     p.add_argument("--observe", action="store_true",
                    help="啟用觀察員 Agent,詳細記錄每步檢測的指令、結果、排查方式、因果推理")
