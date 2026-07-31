@@ -26,6 +26,7 @@ until the objective is complete. Never invent facts, credentials, vulnerabilitie
 class ReactState(TypedDict, total=False):
     """Small private state contract used by each specialist ReAct subgraph."""
     messages: Annotated[list[Any], add_messages]
+    failed_tool_signatures: list[str]
 
 
 class Agents:
@@ -39,6 +40,38 @@ class Agents:
         if self.on_progress:
             self.on_progress(event, data)
 
+    @staticmethod
+    def _conversation_context(messages: list[Any]) -> list[Any]:
+        """Keep only messages valid as outer conversational context.
+
+        Tool messages belong to the ReAct subgraph that created them. Passing
+        an orphan ToolMessage into a new OpenAI request causes a 400 error.
+        Tool results remain available to the current inner loop and are also
+        projected into the durable evidence list.
+        """
+        return [
+            message for message in messages[-20:]
+            if not isinstance(message, ToolMessage)
+            and not getattr(message, "tool_calls", None)
+        ]
+
+    @staticmethod
+    def _react_context(messages: list[Any]) -> list[Any]:
+        """Keep only a valid AI tool-call -> ToolMessage sequence."""
+        valid: list[Any] = []
+        pending_calls: set[str] = set()
+        for message in messages[-30:]:
+            if isinstance(message, ToolMessage):
+                if message.tool_call_id in pending_calls:
+                    valid.append(message)
+                continue
+            valid.append(message)
+            if isinstance(message, AIMessage):
+                pending_calls = {call.get("id") for call in (message.tool_calls or []) if call.get("id")}
+            elif not isinstance(message, SystemMessage):
+                pending_calls = set()
+        return valid
+
     async def _reason(self, role: Role, state: QAState, instruction: str) -> dict[str, Any]:
         if not self.llm:
             return {"action": "observe", "target": "environment", "justification": "Collect missing facts before changing state."}
@@ -47,13 +80,39 @@ class Agents:
                              "evidence": [e.model_dump() for e in state.get("evidence", [])[-20:]],
                              "instruction": instruction})
         self.progress("reasoning_start", agent=role.value)
-        conversation = state.get("messages", [])[-20:]
+        conversation = self._conversation_context(state.get("messages", []))
         response = await self.llm.ainvoke([
             SystemMessage(content=SYSTEM + "\nYou are the workflow supervisor. Return only a valid decision JSON."),
             *conversation,
             HumanMessage(content=prompt),
         ])
         return json.loads(response.content)
+
+    async def _structured_supervisor(self, state: QAState) -> Decision:
+        """Ask the model for a typed routing decision, never free-form JSON."""
+        if not self.llm:
+            return Decision(next_agent=Role.VALIDATION, objective=state.get("objective", "QA"),
+                            action="observe", target=state.get("target", "environment"),
+                            justification="Collect missing facts before changing state.")
+        model = self.llm.with_structured_output(Decision)
+        prompt = json.dumps({
+            "objective": state.get("objective"),
+            "target": state.get("target", "environment"),
+            "phase": state.get("phase"),
+            "evidence": [e.model_dump(mode="json") for e in state.get("evidence", [])[-20:]],
+            "instruction": "Choose the highest-value next specialist or end. Do not assume a fixed phase order.",
+        })
+        self.progress("reasoning_start", agent=Role.SUPERVISOR.value)
+        response = await model.ainvoke([
+            SystemMessage(content=(
+                "You are the workflow supervisor for an authorized cyber-range QA agent. "
+                "Choose dynamically based on the conversation and evidence. "
+                "Do not execute tools. Return a Decision object."
+            )),
+            *self._conversation_context(state.get("messages", [])),
+            HumanMessage(content=prompt),
+        ])
+        return response if isinstance(response, Decision) else Decision.model_validate(response)
 
     def _react_graph(self, role: Role, state: QAState):
         """Build one specialist's reason -> tools -> reason loop."""
@@ -68,7 +127,11 @@ class Agents:
                              "correct_route", "sync_time"),
         }.get(role)
         available = [name for name in (role_tool_names or ()) if name in self.tools.tools]
-        allowed = self.tools.langchain_tools(available or None)
+        # The registry is the security boundary. Specialists may use any
+        # registered fact tool when evidence shows that the original role
+        # assumption was wrong; routing remains dynamically controlled by the
+        # Supervisor instead of a fixed phase sequence.
+        allowed = self.tools.langchain_tools()
         model = self.llm.bind_tools(allowed) if self.llm and allowed else None
         inner = StateGraph(ReactState)
 
@@ -85,7 +148,7 @@ class Agents:
                     "evidence": [e.model_dump(mode="json") for e in state.get("evidence", [])[-20:]],
                     "instruction": state.get("last_decision").justification if state.get("last_decision") else "Collect useful facts",
                 })),
-                *s.get("messages", [])[-20:],
+                *self._react_context(s.get("messages", [])),
             ])
             self.progress("reasoned", agent=role.value,
                           tool_calls=[call.get("name") for call in getattr(response, "tool_calls", [])],
@@ -96,16 +159,34 @@ class Agents:
             last = s.get("messages", [])[-1] if s.get("messages") else None
             return "tools" if getattr(last, "tool_calls", None) else "done"
 
-        def after_tools(s: dict[str, Any]) -> str:
+        def after_inspect(s: dict[str, Any]) -> str:
             last = s.get("messages", [])[-1] if s.get("messages") else None
             if isinstance(last, ToolMessage):
                 try:
                     result = json.loads(last.content) if isinstance(last.content, str) else last.content
                     if isinstance(result, dict) and result.get("needs_human"):
-                        return "human"
+                        signature = s.get("failed_tool_signatures", [])
+                        tool_name = result.get("tool", last.name or "unknown")
+                        error = result.get("error", "unknown tool failure")
+                        current = f"{tool_name}:{error}"
+                        repeats = sum(item == current for item in signature)
+                        return "human" if repeats >= 2 else "reason"
                 except (TypeError, json.JSONDecodeError):
-                    return "human"
+                    return "reason"
             return "reason"
+
+        def inspect_tools(s: dict[str, Any]) -> dict[str, Any]:
+            last = s.get("messages", [])[-1] if s.get("messages") else None
+            if not isinstance(last, ToolMessage):
+                return {}
+            try:
+                payload = json.loads(last.content) if isinstance(last.content, str) else last.content
+            except (TypeError, json.JSONDecodeError):
+                payload = {"needs_human": True, "tool": last.name or "unknown", "error": str(last.content)}
+            if isinstance(payload, dict) and payload.get("needs_human"):
+                signature = f"{payload.get('tool', last.name or 'unknown')}:{payload.get('error', 'unknown tool failure')}"
+                return {"failed_tool_signatures": s.get("failed_tool_signatures", []) + [signature]}
+            return {}
 
         async def human(s: dict[str, Any]) -> dict[str, Any]:
             request = {
@@ -120,10 +201,12 @@ class Agents:
 
         inner.add_node("reason", reason)
         inner.add_node("tools", ToolNode(allowed))
+        inner.add_node("inspect_tools", inspect_tools)
         inner.add_node("human", human)
         inner.add_edge(START, "reason")
         inner.add_conditional_edges("reason", after_reason, {"tools": "tools", "done": END})
-        inner.add_conditional_edges("tools", after_tools, {"reason": "reason", "human": "human"})
+        inner.add_edge("tools", "inspect_tools")
+        inner.add_conditional_edges("inspect_tools", after_inspect, {"reason": "reason", "human": "human"})
         inner.add_edge("human", "reason")
         return inner.compile()
 
@@ -134,21 +217,21 @@ class Agents:
             return {"iteration": iteration, "phase": "human_help", "last_decision": decision,
                     "pending_action": decision.model_dump(), "needs_human": True}
         try:
-            result = await self._reason(Role.SUPERVISOR, state, "Select the highest-value next action. Choose validation, testing, debugging, judge, reporting, approval, or end.")
-        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            result = await self._structured_supervisor(state)
+        except Exception as exc:
             decision = Decision(next_agent="end", objective="human_help", action="end", target="environment",
                                 justification=f"Supervisor could not produce a valid decision: {exc}")
             return {"iteration": iteration, "phase": "human_help", "last_decision": decision,
                     "pending_action": decision.model_dump(), "needs_human": True,
                     "errors": [str(exc)]}
-        agent = result.get("next_agent", "validation")
-        action = result.get("action", "observe")
-        requested_target = result.get("target")
+        agent = result.next_agent
+        action = result.action
+        requested_target = result.target
         target = requested_target if requested_target and requested_target != "environment" else state.get("target", "environment")
-        decision = Decision(next_agent=agent, objective=result.get("objective", state.get("objective", "QA")),
+        decision = Decision(next_agent=agent, objective=result.objective or state.get("objective", "QA"),
                             action=action, target=target,
-                            justification=result.get("justification", "Resolve the highest-value uncertainty."),
-                            expected_information_gain=float(result.get("expected_information_gain", .5)),
+                            justification=result.justification or "Resolve the highest-value uncertainty.",
+                            expected_information_gain=result.expected_information_gain,
                             approval_required=self.policy.requires_approval(action))
         self.progress("supervisor_decision", agent=(decision.next_agent.value if isinstance(decision.next_agent, Role) else str(decision.next_agent)), action=decision.action,
                       target=decision.target)
@@ -182,16 +265,40 @@ class Agents:
         evidence = []
         proposal: dict[str, Any] = {}
         if self.llm and self.tools.tools:
-            result = await self._react_graph(role, state).ainvoke(
-                {"messages": list(state.get("messages", [])[-20:])}
-            )
-            for message in result.get("messages", []):
+            react_messages: list[Any] = []
+            try:
+                async for update in self._react_graph(role, state).astream(
+                    {"messages": self._conversation_context(state.get("messages", []))},
+                    stream_mode="updates",
+                ):
+                    for patch in update.values() if isinstance(update, dict) else ():
+                        if isinstance(patch, dict):
+                            react_messages.extend(patch.get("messages", []))
+            except Exception as exc:
+                self.progress("agent_error", agent=role.value, error=str(exc))
+                proposal["error"] = str(exc)
+                proposal["needs_human"] = True
+                from .models import Evidence
+                evidence.append(Evidence(source=f"agent:{role.value}", action=action, target=target,
+                                         exit_code=-1, stderr=str(exc),
+                                         facts={"ok": False, "agent_error": True}))
+            for message in react_messages:
                 if isinstance(message, ToolMessage):
                     try:
                         payload = json.loads(message.content) if isinstance(message.content, str) else message.content
+                        if not isinstance(payload, dict):
+                            continue
                         if payload.get("evidence"):
                             from .models import Evidence
                             evidence.append(Evidence.model_validate(payload["evidence"]))
+                        elif payload.get("needs_human"):
+                            from .models import Evidence
+                            evidence.append(Evidence(
+                                source=f"tool:{payload.get('tool', message.name or 'unknown')}",
+                                action=action, target=target, exit_code=-1,
+                                stderr=str(payload.get("error", "tool failure")),
+                                facts={"ok": False, "needs_human": True, "tool_result": payload},
+                            ))
                     except (TypeError, ValueError, json.JSONDecodeError):
                         pass
                 if isinstance(message, AIMessage) and message.content:
@@ -211,7 +318,11 @@ class Agents:
                       Role.REPORTING: "REPORT_UPDATED"}[role]
         event = Event(type=event_type, run_id=state["run_id"], emitted_by=role, target=target,
                       evidence_ids=[e.id for e in evidence], payload=proposal)
-        await self.events.publish(event)
+        try:
+            await self.events.publish(event)
+        except Exception as exc:
+            self.progress("event_error", event_type=event.type, error=str(exc))
+            proposal.setdefault("event_error", str(exc))
         self.progress("agent_done", agent=role.value, evidence_count=len(evidence), target=target)
         patch: dict[str, Any] = {
             "evidence": evidence,
@@ -233,7 +344,10 @@ class Agents:
                                       [e.id for e in state.get("evidence", [])[-10:]])
         event = Event(type="APPROVAL_REQUIRED", run_id=state["run_id"], emitted_by=Role.SUPERVISOR,
                       target=decision.target, payload=request.model_dump())
-        await self.events.publish(event)
+        try:
+            await self.events.publish(event)
+        except Exception as exc:
+            self.progress("event_error", event_type=event.type, error=str(exc))
         answer = interrupt({"kind": "approval", "request": request.model_dump(mode="json"),
                             "question": "Approve this action? Reply approve or reject."})
         request.status = "approved" if str(answer).lower() in {"approve", "approved", "yes"} else "rejected"

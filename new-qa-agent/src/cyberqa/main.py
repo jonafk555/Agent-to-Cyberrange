@@ -31,6 +31,10 @@ def print_progress(event: str, data: dict) -> None:
         print(f"[Target] 發現並加入授權清單：{data['target']}", flush=True)
     elif event == "agent_done":
         print(f"[{data['agent']}] 回報 {data['evidence_count']} 筆 evidence，返回 Supervisor", flush=True)
+    elif event == "agent_error":
+        print(f"[{data['agent']}] Agent error，已記錄 evidence：{data['error']}", flush=True)
+    elif event == "event_error":
+        print(f"[EventBus] {data['event_type']} 發布失敗，流程繼續：{data['error']}", flush=True)
 
 
 def parse_args() -> argparse.Namespace:
@@ -51,11 +55,13 @@ async def run(args: argparse.Namespace | None = None) -> None:
     # deliberately runs in offline, observe-only fallback mode.
     args = args or parse_args()
     if args.allowed_targets:
-        os.environ["CYBERQA_ALLOWED_TARGETS"] = args.allowed_targets
-    elif not os.getenv("CYBERQA_ALLOWED_TARGETS"):
-        # An explicit --target is an operator authorization for this run.
-        # Users can still provide a stricter/multiple-target policy via env/flag.
-        os.environ["CYBERQA_ALLOWED_TARGETS"] = args.target
+        configured_targets = {item.strip() for item in args.allowed_targets.split(",") if item.strip()}
+    else:
+        configured_targets = {item.strip() for item in os.getenv("CYBERQA_ALLOWED_TARGETS", "").split(",") if item.strip()}
+    # An explicit --target is an operator authorization for this run. Preserve
+    # configured ranges, but never make the selected target fail its own policy.
+    configured_targets.add(args.target)
+    os.environ["CYBERQA_ALLOWED_TARGETS"] = ",".join(sorted(configured_targets))
     app = build_graph(Agents(llm=build_llm(), tools=build_kali_registry(on_event=print_progress),
                              on_progress=print_progress))
     config = {"configurable": {"thread_id": str(uuid4())}}
@@ -73,6 +79,14 @@ async def run(args: argparse.Namespace | None = None) -> None:
                 if node in {"supervisor", "validation", "testing", "debugging", "judge", "reporting"}:
                     print(f"[Graph] {node} node completed; state updated", flush=True)
         snapshot = await app.aget_state(config)
+        # LangGraph versions differ: some expose interrupts in stream updates,
+        # others expose them only on pending task metadata in the checkpoint.
+        if interrupt_value is None:
+            for task in getattr(snapshot, "tasks", ()):
+                pending = getattr(task, "interrupts", ())
+                if pending:
+                    interrupt_value = pending
+                    break
         return snapshot.values, interrupt_value
 
     async def execute_task(objective: str, target: str, scenario_id: str):
@@ -82,13 +96,22 @@ async def run(args: argparse.Namespace | None = None) -> None:
                    "completed_goals": [], "errors": [], "memory": {}, "human_requests": [],
                    "react_steps": 0, "needs_human": False, "aborted": False,
                    "messages": [HumanMessage(content=objective)]}
-        result, interrupt_value = await stream_graph(initial)
+        try:
+            result, interrupt_value = await stream_graph(initial)
+        except Exception as exc:
+            print(f"\n[Graph error] {type(exc).__name__}: {exc}", flush=True)
+            print("此任務已停止，但互動 session 仍可繼續輸入下一個任務。", flush=True)
+            return {"iteration": 0, "events": [], "evidence": [], "errors": [str(exc)]}
         while interrupt_value:
             print("\n[Human input required]", interrupt_value, flush=True)
             answer = input("你：").strip()
             if answer.lower() in {"quit", "exit"}:
                 return None
-            result, interrupt_value = await stream_graph(Command(resume=answer))
+            try:
+                result, interrupt_value = await stream_graph(Command(resume=answer))
+            except Exception as exc:
+                print(f"\n[Resume error] {type(exc).__name__}: {exc}", flush=True)
+                return {"iteration": 0, "events": [], "evidence": [], "errors": [str(exc)]}
         print(f"\n[Task completed] iterations={result.get('iteration')} "
               f"events={len(result.get('events', []))} evidence={len(result.get('evidence', []))}", flush=True)
         return result

@@ -132,12 +132,12 @@ class KaliTool:
 def _discover_ip_addresses(output: str) -> set[str]:
     candidates = set(re.findall(r"(?<![\w.])(?:\d{1,3}\.){3}\d{1,3}(?![\w.])", output))
     discovered: set[str] = set()
-    try:
-        for candidate in candidates:
+    for candidate in candidates:
+        try:
             ipaddress.ip_address(candidate)
             discovered.add(candidate)
-    except ValueError:
-        pass
+        except ValueError:
+            continue
     return discovered
 
 
