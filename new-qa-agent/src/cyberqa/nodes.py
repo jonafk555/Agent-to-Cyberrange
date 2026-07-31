@@ -143,12 +143,14 @@ class Agents:
                     "errors": [str(exc)]}
         agent = result.get("next_agent", "validation")
         action = result.get("action", "observe")
+        requested_target = result.get("target")
+        target = requested_target if requested_target and requested_target != "environment" else state.get("target", "environment")
         decision = Decision(next_agent=agent, objective=result.get("objective", state.get("objective", "QA")),
-                            action=action, target=result.get("target", state.get("target", "environment")),
+                            action=action, target=target,
                             justification=result.get("justification", "Resolve the highest-value uncertainty."),
                             expected_information_gain=float(result.get("expected_information_gain", .5)),
                             approval_required=self.policy.requires_approval(action))
-        self.progress("supervisor_decision", agent=str(decision.next_agent), action=decision.action,
+        self.progress("supervisor_decision", agent=(decision.next_agent.value if isinstance(decision.next_agent, Role) else str(decision.next_agent)), action=decision.action,
                       target=decision.target)
         signature = f"{action}:{decision.target}"
         history = state.get("action_history", [])

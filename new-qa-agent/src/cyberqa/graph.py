@@ -25,11 +25,27 @@ def build_graph(agents: Agents | None = None, checkpointer=None):
     agents = agents or Agents()
     graph = StateGraph(QAState)
     graph.add_node("supervisor", agents.supervisor)
-    graph.add_node("validation", lambda s: agents.specialist(Role.VALIDATION, s))
-    graph.add_node("testing", lambda s: agents.specialist(Role.TESTING, s))
-    graph.add_node("debugging", lambda s: agents.specialist(Role.DEBUGGING, s))
-    graph.add_node("judge", lambda s: agents.specialist(Role.JUDGE, s))
-    graph.add_node("reporting", lambda s: agents.specialist(Role.REPORTING, s))
+
+    async def validation(s):
+        return await agents.specialist(Role.VALIDATION, s)
+
+    async def testing(s):
+        return await agents.specialist(Role.TESTING, s)
+
+    async def debugging(s):
+        return await agents.specialist(Role.DEBUGGING, s)
+
+    async def judge(s):
+        return await agents.specialist(Role.JUDGE, s)
+
+    async def reporting(s):
+        return await agents.specialist(Role.REPORTING, s)
+
+    graph.add_node("validation", validation)
+    graph.add_node("testing", testing)
+    graph.add_node("debugging", debugging)
+    graph.add_node("judge", judge)
+    graph.add_node("reporting", reporting)
     graph.add_node("approval", agents.approval)
     graph.add_node("human_help", agents.human_help)
     graph.add_edge(START, "supervisor")
