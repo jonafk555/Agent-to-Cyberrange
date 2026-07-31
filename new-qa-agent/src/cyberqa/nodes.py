@@ -27,6 +27,7 @@ class ReactState(TypedDict, total=False):
     """Small private state contract used by each specialist ReAct subgraph."""
     messages: Annotated[list[Any], add_messages]
     failed_tool_signatures: list[str]
+    tool_signatures: list[str]
 
 
 class Agents:
@@ -100,7 +101,10 @@ class Agents:
             "target": state.get("target", "environment"),
             "phase": state.get("phase"),
             "evidence": [e.model_dump(mode="json") for e in state.get("evidence", [])[-20:]],
-            "instruction": "Choose the highest-value next specialist or end. Do not assume a fixed phase order.",
+            "observed_signatures": list(state.get("observation_index", {}).keys())[-50:],
+            "available_tools": list(self.tools.tools),
+            "no_progress_count": state.get("no_progress_count", 0),
+            "instruction": "Choose the highest-value next specialist or end. Do not assume a fixed phase order. Never repeat a cached observation; switch target/tool or report the current finding.",
         })
         self.progress("reasoning_start", agent=Role.SUPERVISOR.value)
         response = await model.ainvoke([
@@ -146,6 +150,7 @@ class Agents:
                     "objective": state.get("objective"),
                     "target": state.get("last_decision").target if state.get("last_decision") else "environment",
                     "evidence": [e.model_dump(mode="json") for e in state.get("evidence", [])[-20:]],
+                    "observed_signatures": list(state.get("observation_index", {}).keys())[-50:],
                     "instruction": state.get("last_decision").justification if state.get("last_decision") else "Collect useful facts",
                 })),
                 *self._react_context(s.get("messages", [])),
@@ -171,6 +176,13 @@ class Agents:
                         current = f"{tool_name}:{error}"
                         repeats = sum(item == current for item in signature)
                         return "human" if repeats >= 2 else "reason"
+                    if isinstance(result, dict) and result.get("signature"):
+                        signatures = s.get("tool_signatures", [])
+                        current = result["signature"]
+                        # A cached/repeated observation has no new information;
+                        # stop this sub-agent rather than spending more calls.
+                        if result.get("cached") or signatures.count(current) >= 2:
+                            return "done"
                 except (TypeError, json.JSONDecodeError):
                     return "reason"
             return "reason"
@@ -185,8 +197,12 @@ class Agents:
                 payload = {"needs_human": True, "tool": last.name or "unknown", "error": str(last.content)}
             if isinstance(payload, dict) and payload.get("needs_human"):
                 signature = f"{payload.get('tool', last.name or 'unknown')}:{payload.get('error', 'unknown tool failure')}"
-                return {"failed_tool_signatures": s.get("failed_tool_signatures", []) + [signature]}
-            return {}
+                patch = {"failed_tool_signatures": s.get("failed_tool_signatures", []) + [signature]}
+            else:
+                patch = {}
+            if isinstance(payload, dict) and payload.get("signature"):
+                patch["tool_signatures"] = s.get("tool_signatures", []) + [payload["signature"]]
+            return patch
 
         async def human(s: dict[str, Any]) -> dict[str, Any]:
             request = {
@@ -206,12 +222,18 @@ class Agents:
         inner.add_edge(START, "reason")
         inner.add_conditional_edges("reason", after_reason, {"tools": "tools", "done": END})
         inner.add_edge("tools", "inspect_tools")
-        inner.add_conditional_edges("inspect_tools", after_inspect, {"reason": "reason", "human": "human"})
+        inner.add_conditional_edges("inspect_tools", after_inspect, {"reason": "reason", "human": "human", "done": END})
         inner.add_edge("human", "reason")
         return inner.compile()
 
     async def supervisor(self, state: QAState) -> dict[str, Any]:
         iteration = state.get("iteration", 0) + 1
+        if state.get("no_progress_count", 0) >= 2:
+            decision = Decision(next_agent="end", objective="human_help", action="end",
+                                target=state.get("target", "environment"),
+                                justification="Two consecutive specialist steps produced no new observations.")
+            return {"iteration": iteration, "phase": "human_help", "last_decision": decision,
+                    "pending_action": decision.model_dump(), "needs_human": True}
         if iteration >= state.get("max_iterations", 20):
             decision = Decision(next_agent="end", objective="stop", action="end", target="environment", justification="Iteration budget exhausted; human guidance is required to continue.")
             return {"iteration": iteration, "phase": "human_help", "last_decision": decision,
@@ -264,6 +286,7 @@ class Agents:
         target, action = (decision.target, decision.action) if decision else ("environment", "observe")
         evidence = []
         proposal: dict[str, Any] = {}
+        new_observation = False
         if self.llm and self.tools.tools:
             react_messages: list[Any] = []
             try:
@@ -282,6 +305,7 @@ class Agents:
                 evidence.append(Evidence(source=f"agent:{role.value}", action=action, target=target,
                                          exit_code=-1, stderr=str(exc),
                                          facts={"ok": False, "agent_error": True}))
+            observation_index = dict(state.get("observation_index", {}))
             for message in react_messages:
                 if isinstance(message, ToolMessage):
                     try:
@@ -290,7 +314,18 @@ class Agents:
                             continue
                         if payload.get("evidence"):
                             from .models import Evidence
-                            evidence.append(Evidence.model_validate(payload["evidence"]))
+                            observed = Evidence.model_validate(payload["evidence"])
+                            evidence.append(observed)
+                            new_observation = new_observation or not payload.get("cached", False)
+                            if payload.get("signature"):
+                                observation_index[payload["signature"]] = {
+                                    "tool": payload.get("tool", message.name),
+                                    "target": observed.target,
+                                    "action": observed.action,
+                                    "ok": payload.get("ok", True),
+                                    "cached": payload.get("cached", False),
+                                    "exit_code": observed.exit_code,
+                                }
                         elif payload.get("needs_human"):
                             from .models import Evidence
                             evidence.append(Evidence(
@@ -299,6 +334,16 @@ class Agents:
                                 stderr=str(payload.get("error", "tool failure")),
                                 facts={"ok": False, "needs_human": True, "tool_result": payload},
                             ))
+                            new_observation = new_observation or not payload.get("cached", False)
+                            if payload.get("signature"):
+                                observation_index[payload["signature"]] = {
+                                    "tool": payload.get("tool", message.name),
+                                    "target": target,
+                                    "action": action,
+                                    "ok": False,
+                                    "cached": payload.get("cached", False),
+                                    "error": payload.get("error", "tool failure"),
+                                }
                     except (TypeError, ValueError, json.JSONDecodeError):
                         pass
                 if isinstance(message, AIMessage) and message.content:
@@ -313,6 +358,7 @@ class Agents:
                 proposal = {"tool": tool_name, "offline": True, "error": str(exc), "needs_human": True}
             else:
                 proposal = {"tool": tool_name, "offline": True}
+                new_observation = True
         event_type = {Role.VALIDATION: "SERVICE_VALIDATED", Role.TESTING: "ATTACK_PATH_VALIDATED",
                       Role.DEBUGGING: "REPAIR_COMPLETED", Role.JUDGE: "SCENARIO_EVALUATED",
                       Role.REPORTING: "REPORT_UPDATED"}[role]
@@ -331,6 +377,8 @@ class Agents:
             "messages": [AIMessage(content=(
                 f"{role.value} completed its current step and collected {len(evidence)} evidence item(s)."
             ))],
+            "observation_index": observation_index,
+            "no_progress_count": 0 if new_observation else state.get("no_progress_count", 0) + 1,
         }
         if role == Role.DEBUGGING and action == "generate_hypotheses":
             patch["hypotheses"] = [Hypothesis(statement=x, likelihood=.5) for x in proposal.get("hypotheses", [])]

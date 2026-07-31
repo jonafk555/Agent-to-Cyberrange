@@ -14,7 +14,7 @@ async def main():
                           "testing": DryRunTool("testing", {"expected": ["request_tgt", "use_ticket"], "observed": ["request_tgt", "use_ticket"], "result": "passed"}),
                           "debugging": DryRunTool("debugging", {"hypothesis": "DNS forwarder unavailable", "verified": True})})
     app = build_graph(Agents(llm=build_llm(), tools=tools))
-    state = {"run_id": str(uuid4()), "scenario_id": "ad-lab-01", "objective": "Validate LDAP, test an attack path, and score the scenario", "target": "127.0.0.1", "iteration": 0, "max_iterations": 5, "hosts": {}, "evidence": [], "events": [], "approvals": [], "action_history": [], "completed_goals": [], "errors": [], "memory": {}, "human_requests": [], "react_steps": 0, "needs_human": False}
+    state = {"run_id": str(uuid4()), "scenario_id": "ad-lab-01", "objective": "Validate LDAP, test an attack path, and score the scenario", "target": "127.0.0.1", "iteration": 0, "max_iterations": 5, "hosts": {}, "evidence": [], "events": [], "approvals": [], "action_history": [], "completed_goals": [], "errors": [], "memory": {}, "human_requests": [], "react_steps": 0, "needs_human": False, "no_progress_count": 0}
     result = await app.ainvoke(state)
     for event in result.get("events", []):
         print(event.type, event.target)

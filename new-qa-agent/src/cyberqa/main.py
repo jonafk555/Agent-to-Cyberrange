@@ -95,6 +95,7 @@ async def run(args: argparse.Namespace | None = None) -> None:
                    "hosts": {}, "evidence": [], "events": [], "approvals": [], "action_history": [],
                    "completed_goals": [], "errors": [], "memory": {}, "human_requests": [],
                    "react_steps": 0, "needs_human": False, "aborted": False,
+                   "no_progress_count": 0,
                    "messages": [HumanMessage(content=objective)]}
         try:
             result, interrupt_value = await stream_graph(initial)

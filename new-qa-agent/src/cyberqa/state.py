@@ -37,3 +37,5 @@ class QAState(TypedDict, total=False):
     react_steps: int
     needs_human: bool
     aborted: bool
+    observation_index: Annotated[dict[str, Any], merge_dict]
+    no_progress_count: int

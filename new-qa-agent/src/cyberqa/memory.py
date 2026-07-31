@@ -1,9 +1,29 @@
 from __future__ import annotations
 
 import json
+import hashlib
 from typing import Any
 
 from .models import Evidence, Host
+
+
+class ObservationStore:
+    """Deduplicates tool observations for the lifetime of a run process."""
+
+    def __init__(self):
+        self.records: dict[str, dict[str, Any]] = {}
+
+    @staticmethod
+    def signature(tool: str, target: str, action: str, parameters: dict[str, Any] | None = None) -> str:
+        payload = json.dumps({"tool": tool, "target": target, "action": action,
+                              "parameters": parameters or {}}, sort_keys=True, default=str)
+        return hashlib.sha256(payload.encode()).hexdigest()[:20]
+
+    def get(self, signature: str) -> dict[str, Any] | None:
+        return self.records.get(signature)
+
+    def put(self, signature: str, result: dict[str, Any]) -> None:
+        self.records[signature] = result
 
 
 class RedisMemory:

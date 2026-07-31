@@ -10,6 +10,7 @@ from typing import Any, Callable, Protocol
 
 from langchain_core.tools import BaseTool, tool
 
+from .memory import ObservationStore
 from .models import Evidence
 
 
@@ -150,6 +151,7 @@ class ToolRegistry:
                  target_policy: TargetPolicy | None = None):
         self.tools = tools or {}
         self.target_policy = target_policy or TargetPolicy()
+        self.observations = ObservationStore()
 
     def register(self, tool: FactTool) -> None:
         self.tools[tool.name] = tool
@@ -178,11 +180,19 @@ class ToolRegistry:
                 async def probe(target: str, action: str,
                                 parameters: dict[str, Any] | None = None) -> dict[str, Any]:
                     """Run one authorized, fact-only probe against the cyber-range target."""
+                    parameters = parameters or {}
+                    signature = self.observations.signature(bound_name, target, action, parameters)
+                    cached = self.observations.get(signature)
+                    if cached is not None:
+                        return {**cached, "signature": signature, "cached": True}
                     try:
                         evidence = await bound_adapter.observe(target, action, **(parameters or {}))
-                        return {"ok": True, "tool": bound_name, "evidence": evidence.model_dump(mode="json")}
+                        result = {"ok": True, "tool": bound_name,
+                                  "evidence": evidence.model_dump(mode="json")}
                     except Exception as exc:  # surfaced to ReAct; never silently treated as evidence
-                        return {"ok": False, "tool": bound_name, "error": str(exc), "needs_human": True}
+                        result = {"ok": False, "tool": bound_name, "error": str(exc), "needs_human": True}
+                    self.observations.put(signature, result)
+                    return {**result, "signature": signature, "cached": False}
 
                 return probe
 
@@ -201,6 +211,10 @@ def build_kali_registry(on_event: Callable[[str, dict[str, Any]], None] | None =
         KaliTool("http_health_check", "curl", ("--fail", "--silent", "--show-error", "--max-time", "15"), target_prefix="http://", on_event=on_event, target_policy=policy),
         KaliTool("ldap_bind", "ldapsearch", ("-x", "-H"), target_prefix="ldap://", on_event=on_event, target_policy=policy),
         KaliTool("smb_negotiate", "smbclient", ("-L", "-N"), target_prefix="//", on_event=on_event, target_policy=policy),
+        KaliTool("nxc_smb_recon", "nxc", ("smb", "--shares", "-u", "", "-p", ""), on_event=on_event, target_policy=policy),
+        KaliTool("nxc_ldap_recon", "nxc", ("ldap", "-u", "", "-p", ""), on_event=on_event, target_policy=policy),
+        KaliTool("impacket_rpc_recon", "impacket-rpcdump", (), on_event=on_event, target_policy=policy),
+        KaliTool("bloodhound_recon", "bloodhound-python", ("-c", "DCOnly", "-ns"), on_event=on_event, target_policy=policy),
         KaliTool("inspect_routes", "ip", ("route",), target_arg=False, requires_target=False, on_event=on_event, target_policy=policy),
         KaliTool("inspect_dns_config", "cat", ("/etc/resolv.conf",), target_arg=False, requires_target=False, on_event=on_event, target_policy=policy),
         KaliTool("inspect_firewall", "nft", ("list", "ruleset"), target_arg=False, requires_target=False, on_event=on_event, target_policy=policy),
