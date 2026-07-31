@@ -17,7 +17,20 @@ from .state import QAState
 from .tools import ToolRegistry
 
 
-SYSTEM = """You are a cyber-range QA specialist operating only on authorized targets. Use OODA:
+AD_QA_PLAYBOOK = """For an AD range, do not stop at one domain controller. Inventory all valuable
+authorized targets and services: domain controllers, DNS, LDAP/LDAPS, Kerberos, SMB/file servers,
+member servers, workstations, web/IIS, WinRM, MSSQL, AD CS/CA, backup and management systems, trusts,
+and high-value shares. Track host/service coverage and do not call the task complete after DC recon.
+
+Use evidence-driven, read-only QA checks for applicable abuse classes: anonymous LDAP, SMB signing and
+share access, Kerberoasting/SPNs, AS-REP roasting, NTLM relay prerequisites, delegation, privileged
+group and ACL edges, LAPS/GPO exposure, AD CS enrollment weaknesses, DNS/trust misconfiguration,
+stale principals, and excessive local-admin paths. Never invent credentials or claim exploitability;
+enumerate prerequisites and state what is proven, blocked, or unknown. Prefer a different target/service
+or diagnostic probe over repeating a cached command.
+"""
+
+SYSTEM = AD_QA_PLAYBOOK + """You are a cyber-range QA specialist operating only on authorized targets. Use OODA:
 observe facts, orient against the objective and prior evidence, decide one justified action, and act
 through the supplied fact-only tools. Inspect every tool result before selecting the next tool. Continue
 until the objective is complete. Never invent facts, credentials, vulnerabilities, or successful attacks."""
@@ -40,6 +53,31 @@ class Agents:
     def progress(self, event: str, **data: Any) -> None:
         if self.on_progress:
             self.on_progress(event, data)
+
+    async def _human_problem(self, state: QAState, kind: str, raw: str = "") -> str:
+        """Create an operator-facing issue summary without exposing hidden reasoning."""
+        failures = [
+            f"{e.source} target={e.target} exit={e.exit_code} stderr={e.stderr[-1000:]}"
+            for e in state.get("evidence", [])[-8:]
+            if e.exit_code not in (None, 0) or e.facts.get("ok") is False
+        ]
+        fallback = (failures[-1] if failures else raw[-1500:]) or "流程沒有取得新的可用觀測結果。"
+        if not self.llm:
+            return fallback
+        try:
+            import asyncio
+            response = await asyncio.wait_for(self.llm.ainvoke([
+                SystemMessage(content=(
+                    "Summarize an authorized AD QA problem for a human operator in Traditional Chinese. "
+                    "Give only what failed, likely category, exact useful evidence, and what decision "
+                    "the operator should provide. Do not reveal hidden chain-of-thought."
+                )),
+                HumanMessage(content=json.dumps({"kind": kind, "failures": failures, "raw": raw[-3000:]}, ensure_ascii=False)),
+            ]), timeout=15)
+            text = response.content if isinstance(response.content, str) else str(response.content)
+            return text.strip() or fallback
+        except Exception:
+            return fallback
 
     @staticmethod
     def _conversation_context(messages: list[Any]) -> list[Any]:
@@ -114,9 +152,11 @@ class Agents:
             "evidence": [e.model_dump(mode="json") for e in state.get("evidence", [])[-20:]],
             "observed_signatures": list(state.get("observation_index", {}).keys())[-50:],
             "available_tools": list(self.tools.tools),
+            "discovered_targets": state.get("discovered_targets", []),
+            "recon_coverage": state.get("recon_coverage", {}),
             "no_progress_count": state.get("no_progress_count", 0),
             "tool_failures": failures,
-            "instruction": "Choose the highest-value next specialist or end. Do not assume a fixed phase order. Never repeat a cached observation or re-run an identical failed command. If tool_failures are present, route to debugging and use the exact stderr, exit code, and argv to diagnose arguments, credentials, permissions, connectivity, or timeout before choosing a replacement probe.",
+            "instruction": "Choose the highest-value next specialist or end. Do not assume a fixed phase order. Cover every discovered host and valuable service before ending; a DC result alone is insufficient. Never repeat a cached observation or re-run an identical failed command. If tool_failures are present, route to debugging and use the exact stderr, exit code, and argv to diagnose arguments, credentials, permissions, connectivity, or timeout before choosing a replacement probe.",
         })
         self.progress("reasoning_start", agent=Role.SUPERVISOR.value)
         response = await model.ainvoke([
@@ -158,7 +198,9 @@ class Agents:
             self.progress("reasoning_start", agent=role.value)
             response = await model.ainvoke([
                 SystemMessage(content=(SYSTEM + f"\nYou are the {role.value} specialist. "
-                                       "Do not choose another agent or route the workflow.")),
+                                       "Do not choose another agent or route the workflow. "
+                                       "For debugging, explain the observed tool error and choose a "
+                                       "non-duplicate diagnostic or alternate target/service.")),
                 HumanMessage(content=json.dumps({
                     "objective": state.get("objective"),
                     "target": state.get("last_decision").target if state.get("last_decision") else "environment",
@@ -183,12 +225,11 @@ class Agents:
                 try:
                     result = json.loads(last.content) if isinstance(last.content, str) else last.content
                     if isinstance(result, dict) and result.get("needs_human"):
-                        signature = s.get("failed_tool_signatures", [])
-                        tool_name = result.get("tool", last.name or "unknown")
-                        error = result.get("error", "unknown tool failure")
-                        current = f"{tool_name}:{error}"
-                        repeats = sum(item == current for item in signature)
-                        return "human" if repeats >= 2 else "reason"
+                        # The failed result is already durable evidence. Stop
+                        # this specialist and let the outer Supervisor route
+                        # to debugging; retrying here is how identical nmap
+                        # commands used to escape the cache in practice.
+                        return "done"
                     if isinstance(result, dict) and result.get("signature"):
                         signatures = s.get("tool_signatures", [])
                         current = result["signature"]
@@ -218,12 +259,15 @@ class Agents:
             return patch
 
         async def human(s: dict[str, Any]) -> dict[str, Any]:
+            raw = str(s.get("messages", [])[-1].content if s.get("messages") else "")
+            problem = await self._human_problem(state, "tool_failure", raw)
             request = {
                 "kind": "tool_failure",
                 "agent": role.value,
-                "question": "A tool failed or returned an unusable result. Choose a safe next step.",
-                "options": ["retry", "inspect_another_path", "abort"],
-                "last_message": str(s.get("messages", [])[-1].content if s.get("messages") else ""),
+                "problem": problem,
+                "question": "請說明要改用哪個診斷方向、目標或工具；也可以直接提供自然語言指示。",
+                "options": ["retry_with_correction", "inspect_another_path", "abort"],
+                "last_message": raw,
             }
             answer = interrupt(request)
             return {"messages": [HumanMessage(content=f"Human guidance: {answer}")]}
@@ -263,6 +307,15 @@ class Agents:
         action = result.action
         requested_target = result.target
         target = requested_target if requested_target and requested_target != "environment" else state.get("target", "environment")
+        # When discovery has produced additional hosts, make the next
+        # validation step pay down coverage debt instead of repeatedly
+        # returning to the first DC-shaped target.
+        uncovered = [
+            item for item in state.get("discovered_targets", [])
+            if not state.get("recon_coverage", {}).get(item)
+        ]
+        if uncovered and result.next_agent == Role.VALIDATION:
+            target = uncovered[0]
         decision = Decision(next_agent=agent, objective=result.objective or state.get("objective", "QA"),
                             action=action, target=target,
                             justification=result.justification or "Resolve the highest-value uncertainty.",
@@ -284,9 +337,14 @@ class Agents:
     async def human_help(self, state: QAState) -> dict[str, Any]:
         """Pause the outer workflow when the supervisor detects no progress."""
         decision = state.get("last_decision")
-        request = {"kind": "no_progress", "question": "The workflow made no progress. Choose the next safe direction.",
-                   "options": ["retry", "validation", "testing", "debugging", "abort"],
-                   "reason": decision.justification if decision else "No supervisor decision"}
+        problem = await self._human_problem(
+            state, "no_progress", decision.justification if decision else "No supervisor decision"
+        )
+        request = {"kind": "no_progress", "problem": problem,
+                   "question": "請用自然語言指定下一步：檢查哪個目標/服務、如何修正，或是否停止。",
+                   "options": ["validation", "testing", "debugging", "abort"],
+                   "reason": decision.justification if decision else "No supervisor decision",
+                   "evidence_summary": "; ".join(problem.splitlines()[-2:])}
         answer = interrupt(request)
         guidance = str(answer).lower()
         # A human response is a deliberate change of direction.  Clear the
@@ -386,6 +444,17 @@ class Agents:
             self.progress("event_error", event_type=event.type, error=str(exc))
             proposal.setdefault("event_error", str(exc))
         self.progress("agent_done", agent=role.value, evidence_count=len(evidence), target=target)
+        discovered_targets = set(state.get("discovered_targets", []))
+        recon_coverage = dict(state.get("recon_coverage", {}))
+        for observed in evidence:
+            discovered_targets.add(observed.target)
+            facts = observed.facts if isinstance(observed.facts, dict) else {}
+            discovered_targets.update(facts.get("discovered_targets", []))
+            coverage = set(recon_coverage.get(observed.target, []))
+            coverage.add(observed.source)
+            for service in facts.get("open_ports", []):
+                coverage.add(f"{service.get('protocol', 'tcp')}/{service.get('port')}/{service.get('service')}")
+            recon_coverage[observed.target] = sorted(coverage)
         patch: dict[str, Any] = {
             "evidence": evidence,
             "events": [event],
@@ -395,6 +464,8 @@ class Agents:
             ))],
             "observation_index": observation_index,
             "no_progress_count": 0 if new_observation else state.get("no_progress_count", 0) + 1,
+            "discovered_targets": sorted(discovered_targets),
+            "recon_coverage": recon_coverage,
         }
         if role == Role.DEBUGGING and action == "generate_hypotheses":
             patch["hypotheses"] = [Hypothesis(statement=x, likelihood=.5) for x in proposal.get("hypotheses", [])]

@@ -14,6 +14,14 @@ from .nodes import Agents
 from .tools import build_kali_registry
 
 
+def interrupt_payload(value) -> dict:
+    """Convert LangGraph's version-dependent Interrupt wrapper to a dict."""
+    if isinstance(value, (list, tuple)) and value:
+        value = value[0]
+    value = getattr(value, "value", value)
+    return value if isinstance(value, dict) else {"question": str(value)}
+
+
 def print_progress(event: str, data: dict) -> None:
     if event == "reasoning_start":
         print(f"[{data['agent']}] 正在讀取對話與 evidence，分析下一步...", flush=True)
@@ -96,6 +104,7 @@ async def run(args: argparse.Namespace | None = None) -> None:
                    "completed_goals": [], "errors": [], "memory": {}, "human_requests": [],
                    "react_steps": 0, "needs_human": False, "aborted": False,
                    "no_progress_count": 0,
+                   "discovered_targets": [target], "recon_coverage": {},
                    "messages": [HumanMessage(content=objective)]}
         try:
             result, interrupt_value = await stream_graph(initial)
@@ -104,8 +113,18 @@ async def run(args: argparse.Namespace | None = None) -> None:
             print("此任務已停止，但互動 session 仍可繼續輸入下一個任務。", flush=True)
             return {"iteration": 0, "events": [], "evidence": [], "errors": [str(exc)]}
         while interrupt_value:
-            print("\n[Human input required]", interrupt_value, flush=True)
-            answer = input("你：").strip()
+            request = interrupt_payload(interrupt_value)
+            print("\n[Human input required]", flush=True)
+            if request.get("problem"):
+                print(f"問題摘要：{request['problem']}", flush=True)
+            if request.get("evidence_summary"):
+                print(f"相關證據：{request['evidence_summary']}", flush=True)
+            print(f"請回覆你的處置方向（可用自然語言）：{request.get('question', '請提供下一步指示')}", flush=True)
+            try:
+                answer = (await asyncio.to_thread(input, "你：")).strip()
+            except EOFError:
+                print("\n[Input closed] 未收到人類指示，任務安全停止。", flush=True)
+                return {"iteration": 0, "events": [], "evidence": [], "errors": ["human input closed"]}
             if answer.lower() in {"quit", "exit"}:
                 return None
             try:

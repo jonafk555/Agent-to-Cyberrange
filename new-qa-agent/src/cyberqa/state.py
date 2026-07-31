@@ -39,3 +39,5 @@ class QAState(TypedDict, total=False):
     aborted: bool
     observation_index: Annotated[dict[str, Any], merge_dict]
     no_progress_count: int
+    discovered_targets: list[str]
+    recon_coverage: Annotated[dict[str, Any], merge_dict]

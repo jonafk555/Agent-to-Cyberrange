@@ -126,6 +126,9 @@ class KaliTool:
             stderr=stderr.decode(errors="replace")[-12000:],
             facts={"argv": [shlex.quote(x) for x in argv], "returncode": process.returncode},
         )
+        if self.executable == "nmap":
+            evidence.facts["discovered_targets"] = sorted(_discover_ip_addresses(evidence.stdout))
+            evidence.facts["open_ports"] = _discover_open_ports(evidence.stdout)
         if self.on_event:
             self.on_event("tool_result", {"tool": self.name, "exit_code": process.returncode,
                                            "stdout": evidence.stdout, "stderr": evidence.stderr})
@@ -147,6 +150,17 @@ def _discover_ip_addresses(output: str) -> set[str]:
         except ValueError:
             continue
     return discovered
+
+
+def _discover_open_ports(output: str) -> list[dict[str, str]]:
+    """Extract the small, stable service inventory needed for QA planning."""
+    ports: list[dict[str, str]] = []
+    for line in output.splitlines():
+        match = re.match(r"\s*(\d+)/(tcp|udp)\s+open\s+(\S+)", line)
+        if match:
+            ports.append({"port": match.group(1), "protocol": match.group(2),
+                          "service": match.group(3)})
+    return ports
 
 
 TOOL_NAMES = ("ssh", "powershell", "winrm", "nmap", "bloodhound", "sharphound", "impacket",
@@ -173,6 +187,14 @@ class ToolRegistry:
             raise KeyError(f"No tool registered: {name}")
         return self.tools[name]
 
+    def _signature(self, adapter: FactTool, name: str, target: str, action: str,
+                   parameters: dict[str, Any]) -> str:
+        # For fixed adapters the LLM's prose action is not a new command.
+        # This prevents the same nmap probe being rerun under a new action
+        # description.
+        signature_action = "fixed-command" if isinstance(adapter, KaliTool) else action
+        return self.observations.signature(name, target, signature_action, parameters)
+
     def langchain_tools(self, names: list[str] | tuple[str, ...] | None = None) -> list[BaseTool]:
         """Expose allow-listed fact tools to a ReAct agent.
 
@@ -193,7 +215,7 @@ class ToolRegistry:
                                 parameters: dict[str, Any] | None = None) -> dict[str, Any]:
                     """Run one authorized, fact-only probe against the cyber-range target."""
                     parameters = parameters or {}
-                    signature = self.observations.signature(bound_name, target, action, parameters)
+                    signature = self._signature(bound_adapter, bound_name, target, action, parameters)
                     cached = self.observations.get(signature)
                     if cached is not None:
                         return {**cached, "signature": signature, "cached": True}

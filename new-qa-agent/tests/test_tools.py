@@ -25,7 +25,7 @@ async def test_netexec_places_target_after_protocol_and_deduplicates(monkeypatch
 
     await asyncio.gather(
         registry.langchain_tools()[5].ainvoke({"target": "10.0.0.1", "action": "recon"}),
-        registry.langchain_tools()[5].ainvoke({"target": "10.0.0.1", "action": "recon"}),
+        registry.langchain_tools()[5].ainvoke({"target": "10.0.0.1", "action": "different wording"}),
     )
     await registry.get("nxc_ldap_recon").observe("10.0.0.1", "recon")
 
