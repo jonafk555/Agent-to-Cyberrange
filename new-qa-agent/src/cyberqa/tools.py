@@ -5,11 +5,13 @@ import ipaddress
 import os
 import re
 import shlex
+import shutil
 from dataclasses import dataclass
 from typing import Any, Callable, Protocol
 
 from langchain_core.tools import BaseTool, tool
 
+from .ad_capability_tools import build_ad_capability_tools
 from .memory import ObservationStore
 from .models import Evidence
 
@@ -76,11 +78,13 @@ class KaliTool:
     name: str
     executable: str
     fixed_args: tuple[str, ...] = ()
+    executable_candidates: tuple[str, ...] = ()
     target_arg: bool = True
     target_prefix: str = ""
     target_index: int | None = None
     timeout: float = 30.0
     requires_target: bool = True
+    required_env: tuple[str, ...] = ()
     on_event: Callable[[str, dict[str, Any]], None] | None = None
     target_policy: TargetPolicy | None = None
 
@@ -88,9 +92,16 @@ class KaliTool:
         policy = self.target_policy or TargetPolicy()
         if self.requires_target and not policy.allows(target):
             raise PermissionError(f"Target is not in CYBERQA_ALLOWED_TARGETS: {target}")
+        missing_env = [name for name in self.required_env if not os.getenv(name)]
+        if missing_env:
+            raise RuntimeError(
+                f"{self.name} requires AD configuration: set {', '.join(missing_env)} "
+                "in the same runtime environment as cyberqa"
+            )
         if not self.requires_target:
             target = "local-kali"
-        argv = [self.executable, *self.fixed_args]
+        executable = self._resolve_executable()
+        argv = [executable, *self.fixed_args]
         if self.target_arg:
             target_arg = f"{self.target_prefix}{target}"
             if self.target_index is None:
@@ -101,8 +112,9 @@ class KaliTool:
                 argv.insert(1 + self.target_index, target_arg)
         if kwargs.get("args"):
             raise ValueError("This fixed Kali adapter does not accept arbitrary command arguments")
+        safe_argv = self._redact_argv(argv)
         if self.on_event:
-            self.on_event("tool_start", {"tool": self.name, "argv": argv})
+            self.on_event("tool_start", {"tool": self.name, "argv": safe_argv})
         try:
             process = await asyncio.create_subprocess_exec(
                 *argv, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
@@ -112,7 +124,7 @@ class KaliTool:
             if self.on_event:
                 self.on_event("tool_result", {"tool": self.name, "exit_code": -1,
                                                "stderr": str(exc), "stdout": ""})
-            raise RuntimeError(f"Kali executable is not installed: {self.executable}") from exc
+            raise RuntimeError(self._missing_executable_message()) from exc
         except asyncio.TimeoutError as exc:
             process.kill()
             await process.wait()
@@ -124,7 +136,7 @@ class KaliTool:
             source=f"kali:{self.name}", action=action, target=target,
             exit_code=process.returncode, stdout=stdout.decode(errors="replace")[-12000:],
             stderr=stderr.decode(errors="replace")[-12000:],
-            facts={"argv": [shlex.quote(x) for x in argv], "returncode": process.returncode},
+            facts={"argv": [shlex.quote(x) for x in safe_argv], "returncode": process.returncode},
         )
         if self.executable == "nmap":
             evidence.facts["discovered_targets"] = sorted(_discover_ip_addresses(evidence.stdout))
@@ -138,6 +150,27 @@ class KaliTool:
                     self.on_event("target_discovered", {"target": discovered,
                                                          "allowed_targets": policy.snapshot()})
         return evidence
+
+    def _resolve_executable(self) -> str:
+        candidates = (self.executable, *self.executable_candidates)
+        for candidate in candidates:
+            if shutil.which(candidate):
+                return candidate
+        # Preserve the primary name for mocked runners and let subprocess
+        # produce the same diagnostic if PATH changes between checks.
+        return self.executable
+
+    def _missing_executable_message(self) -> str:
+        candidates = ", ".join((self.executable, *self.executable_candidates))
+        return (f"No executable found for {self.name}. Tried: {candidates}. "
+                "Check that the Kali package is installed in the same runtime "
+                "where cyberqa is running and that its bin directory is on PATH.")
+
+    @staticmethod
+    def _redact_argv(argv: list[str]) -> list[str]:
+        secrets = {value for name in ("CYBERQA_AD_PASSWORD", "AD_PASSWORD")
+                   if (value := os.getenv(name))}
+        return ["***REDACTED***" if item in secrets else item for item in argv]
 
 
 def _discover_ip_addresses(output: str) -> set[str]:
@@ -278,20 +311,36 @@ def build_kali_registry(on_event: Callable[[str, dict[str, Any]], None] | None =
     """Create the standard fixed-command Kali tool set for ReAct agents."""
     policy = TargetPolicy(allowed_targets)
     registry = ToolRegistry(target_policy=policy)
+    bloodhound_args = (
+        "-c", os.getenv("CYBERQA_AD_COLLECTION", "DCOnly"),
+        "-d", os.getenv("CYBERQA_AD_DOMAIN", ""),
+        "-u", os.getenv("CYBERQA_AD_USERNAME", ""),
+        "-p", os.getenv("CYBERQA_AD_PASSWORD", ""),
+        "-ns",
+    )
     specs = [
         KaliTool("check_port", "nmap", ("-Pn", "-T3", "--top-ports", "100"), on_event=on_event, target_policy=policy),
         KaliTool("check_dns_resolution", "dig", ("+short",), on_event=on_event, target_policy=policy),
         KaliTool("http_health_check", "curl", ("--fail", "--silent", "--show-error", "--max-time", "15"), target_prefix="http://", on_event=on_event, target_policy=policy),
         KaliTool("ldap_bind", "ldapsearch", ("-x", "-H"), target_prefix="ldap://", on_event=on_event, target_policy=policy),
-        KaliTool("smb_negotiate", "smbclient", ("-L", "-N"), target_prefix="//", on_event=on_event, target_policy=policy),
+        # smbclient's -L consumes the server argument immediately after it:
+        # ``smbclient -L //TARGET -N``.  Appending TARGET after -N makes
+        # smbclient parse the option stream as a service/password command.
+        KaliTool("smb_negotiate", "smbclient", ("-L", "-N"), target_prefix="//",
+                 target_index=1, on_event=on_event, target_policy=policy),
         # NetExec expects the target immediately after the protocol module:
         # ``nxc smb TARGET --shares ...``.  Keeping the insertion point in the
         # fixed adapter prevents the generic argv builder from producing the
         # invalid ``nxc smb --shares ... TARGET`` form.
         KaliTool("nxc_smb_recon", "nxc", ("smb", "--shares", "-u", "", "-p", ""), target_index=1, on_event=on_event, target_policy=policy),
         KaliTool("nxc_ldap_recon", "nxc", ("ldap", "-u", "", "-p", ""), target_index=1, on_event=on_event, target_policy=policy),
-        KaliTool("impacket_rpc_recon", "impacket-rpcdump", (), on_event=on_event, target_policy=policy),
-        KaliTool("bloodhound_recon", "bloodhound-python", ("-c", "DCOnly", "-ns"), on_event=on_event, target_policy=policy),
+        KaliTool("impacket_rpc_recon", "impacket-rpcdump", fixed_args=(),
+                 executable_candidates=("rpcdump.py", "rpcdump"),
+                 on_event=on_event, target_policy=policy),
+        KaliTool("bloodhound_recon", "bloodhound-python", fixed_args=bloodhound_args,
+                 target_index=len(bloodhound_args),
+                 required_env=("CYBERQA_AD_DOMAIN", "CYBERQA_AD_USERNAME", "CYBERQA_AD_PASSWORD"),
+                 on_event=on_event, target_policy=policy),
         KaliTool("inspect_routes", "ip", ("route",), target_arg=False, requires_target=False, on_event=on_event, target_policy=policy),
         KaliTool("inspect_dns_config", "cat", ("/etc/resolv.conf",), target_arg=False, requires_target=False, on_event=on_event, target_policy=policy),
         KaliTool("inspect_firewall", "nft", ("list", "ruleset"), target_arg=False, requires_target=False, on_event=on_event, target_policy=policy),
@@ -299,4 +348,6 @@ def build_kali_registry(on_event: Callable[[str, dict[str, Any]], None] | None =
     ]
     for spec in specs:
         registry.register(spec)
+    for capability_tool in build_ad_capability_tools(policy):
+        registry.register(capability_tool)
     return registry

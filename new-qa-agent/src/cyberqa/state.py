@@ -4,7 +4,7 @@ from typing import Annotated, Any, TypedDict
 
 from langgraph.graph.message import add_messages
 
-from .models import ApprovalRequest, AttackPath, Decision, Evidence, Event, Host, Hypothesis, Scorecard
+from .models import ADKnowledge, ApprovalRequest, AttackPath, Decision, Evidence, Event, Host, Hypothesis, Scorecard
 
 
 def merge_dict(left: dict[str, Any], right: dict[str, Any]) -> dict[str, Any]:
@@ -41,3 +41,5 @@ class QAState(TypedDict, total=False):
     no_progress_count: int
     discovered_targets: list[str]
     recon_coverage: Annotated[dict[str, Any], merge_dict]
+    ad_knowledge: ADKnowledge
+    capability_history: list[dict[str, Any]]

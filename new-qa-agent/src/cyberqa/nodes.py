@@ -11,7 +11,9 @@ from langgraph.prebuilt import ToolNode
 from langgraph.types import interrupt
 
 from .approval import ApprovalPolicy
+from .ad_playbooks import capability_catalog
 from .events import EventBus
+from .execution_broker import CapabilityBroker
 from .models import Decision, Event, Hypothesis, Role, Scorecard, Service, ServiceProtocol
 from .state import QAState
 from .tools import ToolRegistry
@@ -49,6 +51,7 @@ class Agents:
                  on_progress: Callable[[str, dict[str, Any]], None] | None = None):
         self.llm, self.tools, self.events, self.policy = llm, tools or ToolRegistry(), events or EventBus(), policy or ApprovalPolicy()
         self.on_progress = on_progress
+        self.broker = CapabilityBroker()
 
     def progress(self, event: str, **data: Any) -> None:
         if self.on_progress:
@@ -156,6 +159,8 @@ class Agents:
             "recon_coverage": state.get("recon_coverage", {}),
             "no_progress_count": state.get("no_progress_count", 0),
             "tool_failures": failures,
+            "ad_knowledge": state.get("ad_knowledge", {}),
+            "capabilities": capability_catalog(),
             "instruction": "Choose the highest-value next specialist or end. Do not assume a fixed phase order. Cover every discovered host and valuable service before ending; a DC result alone is insufficient. Never repeat a cached observation or re-run an identical failed command. If tool_failures are present, route to debugging and use the exact stderr, exit code, and argv to diagnose arguments, credentials, permissions, connectivity, or timeout before choosing a replacement probe.",
         })
         self.progress("reasoning_start", agent=Role.SUPERVISOR.value)
@@ -164,6 +169,9 @@ class Agents:
                     "You are the workflow supervisor for an authorized cyber-range QA agent. "
                     "Choose dynamically based on the conversation and evidence. Tool failures are "
                     "diagnostic evidence: send them to debugging, do not blindly repeat them. "
+                    "Select an AD capability when applicable and fill prerequisites, expected_evidence, "
+                    "risk, and next_options. You may propose a multi-step chain; the execution broker "
+                    "will enforce scope and approvals. "
                     "Do not execute tools. Return a Decision object."
             )),
             *self._conversation_context(state.get("messages", [])),
@@ -205,6 +213,8 @@ class Agents:
                     "objective": state.get("objective"),
                     "target": state.get("last_decision").target if state.get("last_decision") else "environment",
                     "evidence": [e.model_dump(mode="json") for e in state.get("evidence", [])[-20:]],
+                    "ad_knowledge": state.get("ad_knowledge", {}),
+                    "capabilities": capability_catalog(),
                     "observed_signatures": list(state.get("observation_index", {}).keys())[-50:],
                     "instruction": state.get("last_decision").justification if state.get("last_decision") else "Collect useful facts",
                 })),
@@ -320,7 +330,22 @@ class Agents:
                             action=action, target=target,
                             justification=result.justification or "Resolve the highest-value uncertainty.",
                             expected_information_gain=result.expected_information_gain,
-                            approval_required=self.policy.requires_approval(action))
+                            approval_required=self.policy.requires_approval(action),
+                            capability=result.capability, plan_id=result.plan_id,
+                            prerequisites=result.prerequisites,
+                            expected_evidence=result.expected_evidence,
+                            risk=result.risk, next_options=result.next_options)
+        capability_check = self.broker.validate(
+            decision, target,
+            {item.get("signature") for item in state.get("capability_history", [])},
+        )
+        decision.approval_required = decision.approval_required or capability_check.get("requires_approval", False)
+        if capability_check.get("missing_prerequisites"):
+            decision.justification += (
+                " Missing capability prerequisites: "
+                + ", ".join(capability_check["missing_prerequisites"])
+                + ". Collect those facts before attempting this capability."
+            )
         self.progress("supervisor_decision", agent=(decision.next_agent.value if isinstance(decision.next_agent, Role) else str(decision.next_agent)), action=decision.action,
                       target=decision.target)
         signature = f"{action}:{decision.target}"
@@ -331,8 +356,11 @@ class Agents:
             return {"iteration": iteration, "phase": "human_help", "last_decision": decision,
                     "pending_action": decision.model_dump(), "action_history": history + [signature],
                     "needs_human": True}
+        capability_history = state.get("capability_history", [])
+        capability_history = capability_history + [{**capability_check, "iteration": iteration}]
         return {"iteration": iteration, "phase": decision.next_agent, "last_decision": decision,
-                "pending_action": decision.model_dump(), "action_history": history + [signature]}
+                "pending_action": {**decision.model_dump(), "broker": capability_check},
+                "action_history": history + [signature], "capability_history": capability_history}
 
     async def human_help(self, state: QAState) -> dict[str, Any]:
         """Pause the outer workflow when the supervisor detects no progress."""
@@ -446,6 +474,8 @@ class Agents:
         self.progress("agent_done", agent=role.value, evidence_count=len(evidence), target=target)
         discovered_targets = set(state.get("discovered_targets", []))
         recon_coverage = dict(state.get("recon_coverage", {}))
+        ad_knowledge = dict(state.get("ad_knowledge", {}))
+        ad_knowledge.setdefault("coverage", {})
         for observed in evidence:
             discovered_targets.add(observed.target)
             facts = observed.facts if isinstance(observed.facts, dict) else {}
@@ -455,6 +485,14 @@ class Agents:
             for service in facts.get("open_ports", []):
                 coverage.add(f"{service.get('protocol', 'tcp')}/{service.get('port')}/{service.get('service')}")
             recon_coverage[observed.target] = sorted(coverage)
+            for field in ("users", "spns", "asrep_candidates", "groups", "acl_edges",
+                          "delegation", "adcs_findings", "trusts"):
+                values = set(ad_knowledge.get(field, []))
+                values.update(str(item) for item in facts.get(field, []))
+                ad_knowledge[field] = sorted(values)
+            if facts.get("domain_name"):
+                ad_knowledge["domain"] = facts["domain_name"]
+            ad_knowledge["coverage"][observed.target] = recon_coverage[observed.target]
         patch: dict[str, Any] = {
             "evidence": evidence,
             "events": [event],
@@ -466,6 +504,7 @@ class Agents:
             "no_progress_count": 0 if new_observation else state.get("no_progress_count", 0) + 1,
             "discovered_targets": sorted(discovered_targets),
             "recon_coverage": recon_coverage,
+            "ad_knowledge": ad_knowledge,
         }
         if role == Role.DEBUGGING and action == "generate_hypotheses":
             patch["hypotheses"] = [Hypothesis(statement=x, likelihood=.5) for x in proposal.get("hypotheses", [])]

@@ -21,6 +21,14 @@ class Role(str, Enum):
     REPORTING = "reporting"
 
 
+class ADRisk(str, Enum):
+    READ_ONLY = "read_only"
+    CREDENTIAL_MATERIAL = "credential_material"
+    AUTHENTICATION_TEST = "authentication_test"
+    ACCOUNT_LOCKOUT = "account_lockout"
+    CHANGE = "change"
+
+
 class ServiceProtocol(str, Enum):
     DNS = "dns"; LDAP = "ldap"; LDAPS = "ldaps"; KERBEROS = "kerberos"; SMB = "smb"
     WINRM = "winrm"; ADCS = "adcs"; IIS = "iis"; MSSQL = "mssql"; SSH = "ssh"
@@ -107,6 +115,38 @@ class Decision(BaseModel):
     justification: str
     expected_information_gain: float = Field(default=0.0, ge=0, le=1)
     approval_required: bool = False
+    capability: str | None = None
+    plan_id: str | None = None
+    prerequisites: list[str] = Field(default_factory=list)
+    expected_evidence: list[str] = Field(default_factory=list)
+    risk: ADRisk = ADRisk.READ_ONLY
+    next_options: list[str] = Field(default_factory=list)
+
+
+class CapabilitySpec(BaseModel):
+    name: str
+    purpose: str
+    prerequisites: list[str] = Field(default_factory=list)
+    expected_evidence: list[str] = Field(default_factory=list)
+    allowed_tools: list[str] = Field(default_factory=list)
+    risk: ADRisk = ADRisk.READ_ONLY
+    requires_approval: bool = False
+    notes: str = ""
+
+
+class ADKnowledge(BaseModel):
+    domain: str | None = None
+    hosts: list[str] = Field(default_factory=list)
+    users: list[str] = Field(default_factory=list)
+    spns: list[str] = Field(default_factory=list)
+    asrep_candidates: list[str] = Field(default_factory=list)
+    credentials_validated: list[str] = Field(default_factory=list)
+    groups: list[str] = Field(default_factory=list)
+    acl_edges: list[str] = Field(default_factory=list)
+    delegation: list[str] = Field(default_factory=list)
+    adcs_findings: list[str] = Field(default_factory=list)
+    trusts: list[str] = Field(default_factory=list)
+    coverage: dict[str, list[str]] = Field(default_factory=dict)
 
 
 class Scorecard(BaseModel):

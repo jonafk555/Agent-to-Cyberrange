@@ -12,6 +12,7 @@ from .graph import build_graph
 from .llm import build_llm
 from .nodes import Agents
 from .tools import build_kali_registry
+from .models import ADKnowledge
 
 
 def interrupt_payload(value) -> dict:
@@ -105,6 +106,7 @@ async def run(args: argparse.Namespace | None = None) -> None:
                    "react_steps": 0, "needs_human": False, "aborted": False,
                    "no_progress_count": 0,
                    "discovered_targets": [target], "recon_coverage": {},
+                   "ad_knowledge": ADKnowledge().model_dump(), "capability_history": [],
                    "messages": [HumanMessage(content=objective)]}
         try:
             result, interrupt_value = await stream_graph(initial)
