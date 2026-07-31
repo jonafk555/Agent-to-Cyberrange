@@ -96,6 +96,17 @@ class Agents:
                             action="observe", target=state.get("target", "environment"),
                             justification="Collect missing facts before changing state.")
         model = self.llm.with_structured_output(Decision)
+        failures = [
+            {
+                "source": evidence.source,
+                "target": evidence.target,
+                "exit_code": evidence.exit_code,
+                "stderr": evidence.stderr[-2000:],
+                "argv": evidence.facts.get("argv") if isinstance(evidence.facts, dict) else None,
+            }
+            for evidence in state.get("evidence", [])[-20:]
+            if evidence.exit_code not in (None, 0) or evidence.facts.get("ok") is False
+        ]
         prompt = json.dumps({
             "objective": state.get("objective"),
             "target": state.get("target", "environment"),
@@ -104,14 +115,16 @@ class Agents:
             "observed_signatures": list(state.get("observation_index", {}).keys())[-50:],
             "available_tools": list(self.tools.tools),
             "no_progress_count": state.get("no_progress_count", 0),
-            "instruction": "Choose the highest-value next specialist or end. Do not assume a fixed phase order. Never repeat a cached observation; switch target/tool or report the current finding.",
+            "tool_failures": failures,
+            "instruction": "Choose the highest-value next specialist or end. Do not assume a fixed phase order. Never repeat a cached observation or re-run an identical failed command. If tool_failures are present, route to debugging and use the exact stderr, exit code, and argv to diagnose arguments, credentials, permissions, connectivity, or timeout before choosing a replacement probe.",
         })
         self.progress("reasoning_start", agent=Role.SUPERVISOR.value)
         response = await model.ainvoke([
-            SystemMessage(content=(
-                "You are the workflow supervisor for an authorized cyber-range QA agent. "
-                "Choose dynamically based on the conversation and evidence. "
-                "Do not execute tools. Return a Decision object."
+                SystemMessage(content=(
+                    "You are the workflow supervisor for an authorized cyber-range QA agent. "
+                    "Choose dynamically based on the conversation and evidence. Tool failures are "
+                    "diagnostic evidence: send them to debugging, do not blindly repeat them. "
+                    "Do not execute tools. Return a Decision object."
             )),
             *self._conversation_context(state.get("messages", [])),
             HumanMessage(content=prompt),
@@ -276,7 +289,10 @@ class Agents:
                    "reason": decision.justification if decision else "No supervisor decision"}
         answer = interrupt(request)
         guidance = str(answer).lower()
-        return {"needs_human": False, "action_history": [],
+        # A human response is a deliberate change of direction.  Clear the
+        # guard that caused this pause, otherwise the supervisor immediately
+        # interrupts again before it can evaluate the guidance.
+        return {"needs_human": False, "no_progress_count": 0, "action_history": [],
                 "messages": [HumanMessage(content=f"Human guidance for supervisor: {answer}")],
                 "errors": [] if guidance != "abort" else ["Human aborted after no progress"],
                 "aborted": guidance == "abort"}

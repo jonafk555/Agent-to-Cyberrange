@@ -78,6 +78,7 @@ class KaliTool:
     fixed_args: tuple[str, ...] = ()
     target_arg: bool = True
     target_prefix: str = ""
+    target_index: int | None = None
     timeout: float = 30.0
     requires_target: bool = True
     on_event: Callable[[str, dict[str, Any]], None] | None = None
@@ -91,7 +92,13 @@ class KaliTool:
             target = "local-kali"
         argv = [self.executable, *self.fixed_args]
         if self.target_arg:
-            argv.append(f"{self.target_prefix}{target}")
+            target_arg = f"{self.target_prefix}{target}"
+            if self.target_index is None:
+                argv.append(target_arg)
+            else:
+                if not 0 <= self.target_index <= len(self.fixed_args):
+                    raise ValueError(f"target_index is out of range for {self.name}")
+                argv.insert(1 + self.target_index, target_arg)
         if kwargs.get("args"):
             raise ValueError("This fixed Kali adapter does not accept arbitrary command arguments")
         if self.on_event:
@@ -152,6 +159,11 @@ class ToolRegistry:
         self.tools = tools or {}
         self.target_policy = target_policy or TargetPolicy()
         self.observations = ObservationStore()
+        # ToolNode may schedule identical tool calls concurrently.  A cache
+        # lookup alone is not enough in that case: both calls can miss before
+        # either result is stored.  One lock per signature makes each probe a
+        # single-flight operation, including failed probes.
+        self._observation_locks: dict[str, asyncio.Lock] = {}
 
     def register(self, tool: FactTool) -> None:
         self.tools[tool.name] = tool
@@ -185,19 +197,58 @@ class ToolRegistry:
                     cached = self.observations.get(signature)
                     if cached is not None:
                         return {**cached, "signature": signature, "cached": True}
-                    try:
-                        evidence = await bound_adapter.observe(target, action, **(parameters or {}))
-                        result = {"ok": True, "tool": bound_name,
-                                  "evidence": evidence.model_dump(mode="json")}
-                    except Exception as exc:  # surfaced to ReAct; never silently treated as evidence
-                        result = {"ok": False, "tool": bound_name, "error": str(exc), "needs_human": True}
-                    self.observations.put(signature, result)
-                    return {**result, "signature": signature, "cached": False}
+                    lock = self._observation_locks.setdefault(signature, asyncio.Lock())
+                    async with lock:
+                        # Re-check after waiting: another concurrent caller
+                        # may have completed this exact probe.
+                        cached = self.observations.get(signature)
+                        if cached is not None:
+                            return {**cached, "signature": signature, "cached": True}
+                        try:
+                            evidence = await bound_adapter.observe(target, action, **(parameters or {}))
+                            evidence_data = evidence.model_dump(mode="json")
+                            if evidence.exit_code not in (None, 0):
+                                result = {
+                                    "ok": False, "tool": bound_name,
+                                    "error": _tool_error_message(evidence),
+                                    "error_kind": _tool_error_kind(evidence),
+                                    "needs_human": True, "evidence": evidence_data,
+                                }
+                            else:
+                                result = {"ok": True, "tool": bound_name,
+                                          "evidence": evidence_data}
+                        except Exception as exc:  # surfaced to ReAct; never silently treated as evidence
+                            result = {"ok": False, "tool": bound_name,
+                                      "error": str(exc), "error_kind": type(exc).__name__,
+                                      "needs_human": True}
+                        # Cache failures too. Retrying the same broken command
+                        # is not debugging and can create noisy/infinite loops.
+                        self.observations.put(signature, result)
+                        return {**result, "signature": signature, "cached": False}
 
                 return probe
 
             wrapped.append(make_probe(adapter, tool_name))
         return wrapped
+
+
+def _tool_error_kind(evidence: Evidence) -> str:
+    text = f"{evidence.stderr}\n{evidence.stdout}".lower()
+    if "usage:" in text or "unrecognized arguments" in text or "required" in text:
+        return "invalid_arguments"
+    if "permission denied" in text or "access denied" in text:
+        return "permission_denied"
+    if "timed out" in text or "timeout" in text:
+        return "timeout"
+    if "connection refused" in text or "no route to host" in text:
+        return "connectivity"
+    return "nonzero_exit"
+
+
+def _tool_error_message(evidence: Evidence) -> str:
+    detail = (evidence.stderr or evidence.stdout or "tool exited with a non-zero status").strip()
+    argv = evidence.facts.get("argv") if isinstance(evidence.facts, dict) else None
+    return f"exit={evidence.exit_code}; argv={argv}; {detail[-2000:]}"
 
 
 def build_kali_registry(on_event: Callable[[str, dict[str, Any]], None] | None = None,
@@ -211,8 +262,12 @@ def build_kali_registry(on_event: Callable[[str, dict[str, Any]], None] | None =
         KaliTool("http_health_check", "curl", ("--fail", "--silent", "--show-error", "--max-time", "15"), target_prefix="http://", on_event=on_event, target_policy=policy),
         KaliTool("ldap_bind", "ldapsearch", ("-x", "-H"), target_prefix="ldap://", on_event=on_event, target_policy=policy),
         KaliTool("smb_negotiate", "smbclient", ("-L", "-N"), target_prefix="//", on_event=on_event, target_policy=policy),
-        KaliTool("nxc_smb_recon", "nxc", ("smb", "--shares", "-u", "", "-p", ""), on_event=on_event, target_policy=policy),
-        KaliTool("nxc_ldap_recon", "nxc", ("ldap", "-u", "", "-p", ""), on_event=on_event, target_policy=policy),
+        # NetExec expects the target immediately after the protocol module:
+        # ``nxc smb TARGET --shares ...``.  Keeping the insertion point in the
+        # fixed adapter prevents the generic argv builder from producing the
+        # invalid ``nxc smb --shares ... TARGET`` form.
+        KaliTool("nxc_smb_recon", "nxc", ("smb", "--shares", "-u", "", "-p", ""), target_index=1, on_event=on_event, target_policy=policy),
+        KaliTool("nxc_ldap_recon", "nxc", ("ldap", "-u", "", "-p", ""), target_index=1, on_event=on_event, target_policy=policy),
         KaliTool("impacket_rpc_recon", "impacket-rpcdump", (), on_event=on_event, target_policy=policy),
         KaliTool("bloodhound_recon", "bloodhound-python", ("-c", "DCOnly", "-ns"), on_event=on_event, target_policy=policy),
         KaliTool("inspect_routes", "ip", ("route",), target_arg=False, requires_target=False, on_event=on_event, target_policy=policy),
