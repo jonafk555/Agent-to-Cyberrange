@@ -3,12 +3,14 @@
 An implementation-ready foundation for an autonomous cyber-range QA platform using LangGraph. It is designed for authorized lab/range environments and separates **facts**, **reasoning**, **state**, and **control**:
 
 ```text
-facts (tools) -> observations -> specialist proposal -> supervisor decision -> one action -> event
-                                      ^                                      |
-                                      +----------- shared memory -----------+
+Supervisor -> Specialist ReAct reason -> ToolNode -> tool result -> reason -> done
+     ^                                                          |
+     +---------------- shared evidence/events ------------------+
+                              |
+                         interrupt() -> Human -> Command(resume=...)
 ```
 
-The supervisor is the only workflow controller. Specialists implement OODA (`observe`, `orient`, `decide`, `act`) and return proposals; they never route the graph. Tool wrappers are intentionally fact-only and can be replaced with real SSH/WinRM/PowerShell/Nmap/etc. adapters.
+The supervisor is the only workflow controller. Each specialist binds an allow-listed set of LangChain tools and runs a ReAct loop (`reason -> ToolNode -> reason`) until it has enough facts. Specialists never route to another specialist. Tool wrappers are intentionally fact-only and can be replaced with real SSH/WinRM/PowerShell/Nmap/etc. adapters. Tool failures, unusable results, destructive actions, and repeated no-progress paths pause with `interrupt()`; the CLI resumes the checkpoint using `Command(resume=...)`.
 
 ## Run
 
@@ -29,6 +31,20 @@ export OPENAI_API_KEY=sk-...
 python -m cyberqa.main
 ```
 
+To let the ReAct agents call Kali Linux tools, explicitly authorize the lab targets:
+
+```bash
+export CYBERQA_ALLOWED_TARGETS="127.0.0.1,localhost,10.10.10.10,dc01.lab.local"
+python -m cyberqa.main --target 10.10.10.10 \
+  --scenario-id ad-lab-01 \
+  --objective "Validate LDAP and test the authorized attack path" \
+  --max-iterations 12
+```
+
+The CLI uses LangGraph streaming while the LLM remains the decision-maker. It reports reasoning status, selected tools, command execution, results, and graph state updates without exposing private chain-of-thought. It stays in interactive mode after the task finishes: type a new objective at `你：` to continue the same conversation/checkpoint session; type `exit` or `quit` to leave. Add `--once` for a single non-interactive run.
+
+`build_kali_registry()` provides fixed adapters for `nmap`, `dig`, `curl`, `ldapsearch`, `smbclient`, `ip`, `cat`, `nft`, and `timedatectl`. Commands run with `create_subprocess_exec` (no shell), a timeout, and the target allowlist. Install the corresponding Kali packages first, such as `nmap`, `dnsutils`, `curl`, `ldap-utils`, and `smbclient`.
+
 Without `OPENAI_API_KEY`, the graph uses a safe observe-only fallback. The API key is read from the environment and is never placed in graph state or tool evidence.
 
 External services are optional for the dry-run example. Set `REDIS_URL`, `NEO4J_URI`, `NEO4J_USER`, `NEO4J_PASSWORD`, and `RABBITMQ_URL` to enable production adapters. `CYBERQA_LLM_MODEL` defaults to `gpt-4.1-mini`.
@@ -47,7 +63,7 @@ External services are optional for the dry-run example. Set `REDIS_URL`, `NEO4J_
 
 ## Graph topology
 
-`START -> supervisor -> {validation | testing | debugging | judge | reporting | approval | END}`. Every specialist returns to `supervisor`; no specialist can select a different specialist. The supervisor chooses the next action from current evidence, unresolved goals, failures, and repair history. An iteration budget and repeated-signature guard stop non-progress loops.
+`START -> supervisor -> {validation | testing | debugging | judge | reporting | approval | human_help | END}`. Validation, testing, and debugging contain nested `reason -> tools -> reason` ReAct subgraphs. Every specialist returns to `supervisor`; no specialist can select a different specialist. The supervisor chooses the next specialist from current evidence, unresolved goals, failures, and repair history. An iteration budget and repeated-signature guard route non-progress loops to `human_help`. `MemorySaver` is the default checkpoint backend; production deployments can inject a durable checkpointer.
 
 ## Neo4j graph schema
 

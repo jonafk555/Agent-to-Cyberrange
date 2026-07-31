@@ -105,7 +105,7 @@ class Decision(BaseModel):
     action: str
     target: str
     justification: str
-    expected_information_gain: float = Field(ge=0, le=1)
+    expected_information_gain: float = Field(default=0.0, ge=0, le=1)
     approval_required: bool = False
 
 

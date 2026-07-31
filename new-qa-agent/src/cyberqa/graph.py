@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from langgraph.graph import END, START, StateGraph
+from langgraph.checkpoint.memory import MemorySaver
 
 from .models import Role
 from .nodes import Agents
@@ -8,6 +9,10 @@ from .state import QAState
 
 
 def route(state: QAState) -> str:
+    if state.get("aborted"):
+        return END
+    if state.get("needs_human"):
+        return "human_help"
     decision = state.get("last_decision")
     if not decision or decision.next_agent == "end":
         return END
@@ -16,7 +21,7 @@ def route(state: QAState) -> str:
     return decision.next_agent.value
 
 
-def build_graph(agents: Agents | None = None):
+def build_graph(agents: Agents | None = None, checkpointer=None):
     agents = agents or Agents()
     graph = StateGraph(QAState)
     graph.add_node("supervisor", agents.supervisor)
@@ -26,8 +31,10 @@ def build_graph(agents: Agents | None = None):
     graph.add_node("judge", lambda s: agents.specialist(Role.JUDGE, s))
     graph.add_node("reporting", lambda s: agents.specialist(Role.REPORTING, s))
     graph.add_node("approval", agents.approval)
+    graph.add_node("human_help", agents.human_help)
     graph.add_edge(START, "supervisor")
-    graph.add_conditional_edges("supervisor", route, {"validation":"validation", "testing":"testing", "debugging":"debugging", "judge":"judge", "reporting":"reporting", "approval":"approval", END:END})
+    graph.add_conditional_edges("supervisor", route, {"validation":"validation", "testing":"testing", "debugging":"debugging", "judge":"judge", "reporting":"reporting", "approval":"approval", "human_help":"human_help", END:END})
     for node in ("validation", "testing", "debugging", "judge", "reporting", "approval"):
         graph.add_edge(node, "supervisor")
-    return graph.compile()
+    graph.add_edge("human_help", "supervisor")
+    return graph.compile(checkpointer=checkpointer or MemorySaver())

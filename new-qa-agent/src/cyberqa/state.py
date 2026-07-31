@@ -15,6 +15,7 @@ class QAState(TypedDict, total=False):
     run_id: str
     scenario_id: str
     objective: str
+    target: str
     phase: str
     hosts: Annotated[dict[str, Host], merge_dict]
     evidence: Annotated[list[Evidence], lambda a, b: a + b]
@@ -32,3 +33,7 @@ class QAState(TypedDict, total=False):
     action_history: list[str]
     completed_goals: list[str]
     errors: list[str]
+    human_requests: Annotated[list[dict[str, Any]], lambda a, b: a + b]
+    react_steps: int
+    needs_human: bool
+    aborted: bool
