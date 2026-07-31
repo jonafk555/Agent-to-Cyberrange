@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import os
+import re
 import shlex
 from dataclasses import dataclass
 from typing import Any, Callable, Protocol
@@ -38,6 +40,35 @@ class CommandTool:
                         stderr=result.get("stderr", ""), facts=result.get("facts", {}))
 
 
+class TargetPolicy:
+    """Runtime target authorization with CIDR and discovery support."""
+
+    def __init__(self, entries: list[str] | tuple[str, ...] | None = None):
+        configured = entries or [item.strip() for item in os.getenv(
+            "CYBERQA_ALLOWED_TARGETS", "127.0.0.1,localhost,::1"
+        ).split(",") if item.strip()]
+        self.entries: set[str] = set(configured)
+
+    def allows(self, target: str) -> bool:
+        if target in self.entries:
+            return True
+        try:
+            address = ipaddress.ip_address(target)
+            return any(address in ipaddress.ip_network(entry, strict=False)
+                       for entry in self.entries if "/" in entry)
+        except ValueError:
+            return False
+
+    def add(self, target: str) -> bool:
+        if target and target not in self.entries:
+            self.entries.add(target)
+            return True
+        return False
+
+    def snapshot(self) -> list[str]:
+        return sorted(self.entries)
+
+
 @dataclass
 class KaliTool:
     """Run one fixed, allow-listed Kali command without invoking a shell."""
@@ -49,9 +80,11 @@ class KaliTool:
     timeout: float = 30.0
     requires_target: bool = True
     on_event: Callable[[str, dict[str, Any]], None] | None = None
+    target_policy: TargetPolicy | None = None
 
     async def observe(self, target: str, action: str, **kwargs: Any) -> Evidence:
-        if self.requires_target and not _target_allowed(target):
+        policy = self.target_policy or TargetPolicy()
+        if self.requires_target and not policy.allows(target):
             raise PermissionError(f"Target is not in CYBERQA_ALLOWED_TARGETS: {target}")
         if not self.requires_target:
             target = "local-kali"
@@ -88,12 +121,24 @@ class KaliTool:
         if self.on_event:
             self.on_event("tool_result", {"tool": self.name, "exit_code": process.returncode,
                                            "stdout": evidence.stdout, "stderr": evidence.stderr})
+        if self.name == "check_port" or self.executable == "nmap":
+            for discovered in _discover_ip_addresses(evidence.stdout):
+                if policy.add(discovered) and self.on_event:
+                    self.on_event("target_discovered", {"target": discovered,
+                                                         "allowed_targets": policy.snapshot()})
         return evidence
 
 
-def _target_allowed(target: str) -> bool:
-    configured = os.getenv("CYBERQA_ALLOWED_TARGETS", "127.0.0.1,localhost,::1")
-    return target in {item.strip() for item in configured.split(",") if item.strip()}
+def _discover_ip_addresses(output: str) -> set[str]:
+    candidates = set(re.findall(r"(?<![\w.])(?:\d{1,3}\.){3}\d{1,3}(?![\w.])", output))
+    discovered: set[str] = set()
+    try:
+        for candidate in candidates:
+            ipaddress.ip_address(candidate)
+            discovered.add(candidate)
+    except ValueError:
+        pass
+    return discovered
 
 
 TOOL_NAMES = ("ssh", "powershell", "winrm", "nmap", "bloodhound", "sharphound", "impacket",
@@ -101,8 +146,10 @@ TOOL_NAMES = ("ssh", "powershell", "winrm", "nmap", "bloodhound", "sharphound", 
 
 
 class ToolRegistry:
-    def __init__(self, tools: dict[str, FactTool] | None = None):
+    def __init__(self, tools: dict[str, FactTool] | None = None,
+                 target_policy: TargetPolicy | None = None):
         self.tools = tools or {}
+        self.target_policy = target_policy or TargetPolicy()
 
     def register(self, tool: FactTool) -> None:
         self.tools[tool.name] = tool
@@ -143,19 +190,21 @@ class ToolRegistry:
         return wrapped
 
 
-def build_kali_registry(on_event: Callable[[str, dict[str, Any]], None] | None = None) -> ToolRegistry:
+def build_kali_registry(on_event: Callable[[str, dict[str, Any]], None] | None = None,
+                        allowed_targets: list[str] | tuple[str, ...] | None = None) -> ToolRegistry:
     """Create the standard fixed-command Kali tool set for ReAct agents."""
-    registry = ToolRegistry()
+    policy = TargetPolicy(allowed_targets)
+    registry = ToolRegistry(target_policy=policy)
     specs = [
-        KaliTool("check_port", "nmap", ("-Pn", "-T3", "--top-ports", "100"), on_event=on_event),
-        KaliTool("check_dns_resolution", "dig", ("+short",), on_event=on_event),
-        KaliTool("http_health_check", "curl", ("--fail", "--silent", "--show-error", "--max-time", "15"), target_prefix="http://", on_event=on_event),
-        KaliTool("ldap_bind", "ldapsearch", ("-x", "-H"), target_prefix="ldap://", on_event=on_event),
-        KaliTool("smb_negotiate", "smbclient", ("-L", "-N"), target_prefix="//", on_event=on_event),
-        KaliTool("inspect_routes", "ip", ("route",), target_arg=False, requires_target=False, on_event=on_event),
-        KaliTool("inspect_dns_config", "cat", ("/etc/resolv.conf",), target_arg=False, requires_target=False, on_event=on_event),
-        KaliTool("inspect_firewall", "nft", ("list", "ruleset"), target_arg=False, requires_target=False, on_event=on_event),
-        KaliTool("inspect_time_sync", "timedatectl", ("show-timesync",), target_arg=False, requires_target=False, on_event=on_event),
+        KaliTool("check_port", "nmap", ("-Pn", "-T3", "--top-ports", "100"), on_event=on_event, target_policy=policy),
+        KaliTool("check_dns_resolution", "dig", ("+short",), on_event=on_event, target_policy=policy),
+        KaliTool("http_health_check", "curl", ("--fail", "--silent", "--show-error", "--max-time", "15"), target_prefix="http://", on_event=on_event, target_policy=policy),
+        KaliTool("ldap_bind", "ldapsearch", ("-x", "-H"), target_prefix="ldap://", on_event=on_event, target_policy=policy),
+        KaliTool("smb_negotiate", "smbclient", ("-L", "-N"), target_prefix="//", on_event=on_event, target_policy=policy),
+        KaliTool("inspect_routes", "ip", ("route",), target_arg=False, requires_target=False, on_event=on_event, target_policy=policy),
+        KaliTool("inspect_dns_config", "cat", ("/etc/resolv.conf",), target_arg=False, requires_target=False, on_event=on_event, target_policy=policy),
+        KaliTool("inspect_firewall", "nft", ("list", "ruleset"), target_arg=False, requires_target=False, on_event=on_event, target_policy=policy),
+        KaliTool("inspect_time_sync", "timedatectl", ("show-timesync",), target_arg=False, requires_target=False, on_event=on_event, target_policy=policy),
     ]
     for spec in specs:
         registry.register(spec)

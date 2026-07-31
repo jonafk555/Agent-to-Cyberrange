@@ -27,6 +27,8 @@ def print_progress(event: str, data: dict) -> None:
     elif event == "tool_result":
         output = (data.get("stdout") or data.get("stderr") or "").strip().replace("\n", " ")
         print(f"[Tool] 結果 exit={data['exit_code']} | {output[:240]}", flush=True)
+    elif event == "target_discovered":
+        print(f"[Target] 發現並加入授權清單：{data['target']}", flush=True)
     elif event == "agent_done":
         print(f"[{data['agent']}] 回報 {data['evidence_count']} 筆 evidence，返回 Supervisor", flush=True)
 
@@ -50,6 +52,10 @@ async def run(args: argparse.Namespace | None = None) -> None:
     args = args or parse_args()
     if args.allowed_targets:
         os.environ["CYBERQA_ALLOWED_TARGETS"] = args.allowed_targets
+    elif not os.getenv("CYBERQA_ALLOWED_TARGETS"):
+        # An explicit --target is an operator authorization for this run.
+        # Users can still provide a stricter/multiple-target policy via env/flag.
+        os.environ["CYBERQA_ALLOWED_TARGETS"] = args.target
     app = build_graph(Agents(llm=build_llm(), tools=build_kali_registry(on_event=print_progress),
                              on_progress=print_progress))
     config = {"configurable": {"thread_id": str(uuid4())}}

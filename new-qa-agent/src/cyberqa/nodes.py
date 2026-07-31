@@ -199,8 +199,13 @@ class Agents:
         elif self.tools.tools:
             # Offline mode remains deterministic, but uses the same allow-listed adapter boundary.
             tool_name = role.value if role.value in self.tools.tools else next(iter(self.tools.tools))
-            evidence.append(await self.tools.get(tool_name).observe(target, action))
-            proposal = {"tool": tool_name, "offline": True}
+            try:
+                evidence.append(await self.tools.get(tool_name).observe(target, action))
+            except Exception as exc:
+                self.progress("tool_result", tool=tool_name, exit_code=-1, stderr=str(exc), stdout="")
+                proposal = {"tool": tool_name, "offline": True, "error": str(exc), "needs_human": True}
+            else:
+                proposal = {"tool": tool_name, "offline": True}
         event_type = {Role.VALIDATION: "SERVICE_VALIDATED", Role.TESTING: "ATTACK_PATH_VALIDATED",
                       Role.DEBUGGING: "REPAIR_COMPLETED", Role.JUDGE: "SCENARIO_EVALUATED",
                       Role.REPORTING: "REPORT_UPDATED"}[role]
