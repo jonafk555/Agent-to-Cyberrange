@@ -48,3 +48,12 @@ def test_nmap_default_and_nxc_profiles_are_reviewed_but_selectable():
     assert registry.get("nxc_smb_recon").build_argv("10.0.0.1", {"profile": "sessions"}) == [
         "nxc", "smb", "10.0.0.1", "--sessions"
     ]
+
+
+def test_probe_parameter_shapes_and_host_port_allowlist():
+    registry = build_kali_registry(allowed_targets=["10.0.0.1"])
+    assert registry.get("check_dns_resolution").build_argv(
+        "10.0.0.1", {"name": "example.local"}
+    ) == ["dig", "+short", "example.local"]
+    assert registry.get("inspect_open_ports").fixed_args == ("-lntup",)
+    assert registry.target_policy.allows("10.0.0.1:5985")

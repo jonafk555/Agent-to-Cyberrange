@@ -6,6 +6,7 @@ import os
 import re
 import shlex
 import shutil
+from urllib.parse import urlsplit
 from dataclasses import dataclass
 from typing import Any, Callable, Protocol
 
@@ -53,10 +54,11 @@ class TargetPolicy:
         self.entries: set[str] = set(configured)
 
     def allows(self, target: str) -> bool:
-        if target in self.entries:
+        host = _target_host(target)
+        if target in self.entries or host in self.entries:
             return True
         try:
-            address = ipaddress.ip_address(target)
+            address = ipaddress.ip_address(host)
             return any(address in ipaddress.ip_network(entry, strict=False)
                        for entry in self.entries if "/" in entry)
         except ValueError:
@@ -131,6 +133,10 @@ class KaliTool:
         if self.executable == "nmap":
             evidence.facts["discovered_targets"] = sorted(_discover_ip_addresses(evidence.stdout))
             evidence.facts["open_ports"] = _discover_open_ports(evidence.stdout)
+        if self.name == "nxc_ldap_recon" or self.executable == "ldapsearch":
+            users = _discover_user_names(evidence.stdout)
+            if users:
+                evidence.facts["users"] = sorted(users)
         if self.on_event:
             self.on_event("tool_result", {"tool": self.name, "exit_code": process.returncode,
                                            "stdout": evidence.stdout, "stderr": evidence.stderr})
@@ -144,7 +150,14 @@ class KaliTool:
     def build_argv(self, target: str, parameters: dict[str, Any] | None = None) -> list[str]:
         """Build the reviewed argv used both for execution and cache identity."""
         parameters = parameters or {}
-        supported = {"profile"} if self.name in {"check_port", "nxc_smb_recon", "nxc_ldap_recon"} else set()
+        if self.name in {"check_port", "nxc_smb_recon", "nxc_ldap_recon"}:
+            supported = {"profile"}
+            if self.name.startswith("nxc_"):
+                supported.add("allow_anonymous_nxc")
+        elif self.name == "check_dns_resolution":
+            supported = {"name"}
+        else:
+            supported = set()
         unknown = set(parameters) - supported
         if unknown:
             raise ValueError(
@@ -152,6 +165,9 @@ class KaliTool:
             )
         executable = self._resolve_executable()
         fixed_args = self.fixed_args
+        if self.name == "check_dns_resolution":
+            query = str(parameters.get("name") or target)
+            return [executable, "+short", query, *self.tail_args]
         if self.name == "check_port":
             profiles = {
                 "default": ("-sC", "-sV"),
@@ -239,6 +255,18 @@ def _discover_ip_addresses(output: str) -> set[str]:
     return discovered
 
 
+def _target_host(target: str) -> str:
+    """Normalize host:port and URL targets for allowlist checks."""
+    value = str(target).strip()
+    if "://" in value:
+        return urlsplit(value).hostname or value
+    if value.count(":") == 1:
+        host, port = value.rsplit(":", 1)
+        if port.isdigit():
+            return host
+    return value
+
+
 def _discover_open_ports(output: str) -> list[dict[str, str]]:
     """Extract the small, stable service inventory needed for QA planning."""
     ports: list[dict[str, str]] = []
@@ -248,6 +276,18 @@ def _discover_open_ports(output: str) -> list[dict[str, str]]:
             ports.append({"port": match.group(1), "protocol": match.group(2),
                           "service": match.group(3)})
     return ports
+
+
+def _discover_user_names(output: str) -> set[str]:
+    """Extract conservative username facts from anonymous LDAP/NXC output."""
+    users: set[str] = set()
+    patterns = (
+        r"\bsAMAccountName\s*:\s*([A-Za-z0-9_.$-]+)",
+        r"\b(?:username|user)\s*:\s*([A-Za-z0-9_.$-]+)",
+    )
+    for pattern in patterns:
+        users.update(match.group(1) for match in re.finditer(pattern, output, re.IGNORECASE))
+    return {user for user in users if len(user) <= 128 and user.lower() not in {"user", "username"}}
 
 
 TOOL_NAMES = ("ssh", "powershell", "winrm", "nmap", "bloodhound", "sharphound", "impacket",
@@ -296,7 +336,13 @@ class ToolRegistry:
         if name in SENSITIVE_TOOL_NAMES:
             allowed = (authorization or {}).get("allowed_tools", [])
             expected = (authorization or {}).get("tool_parameters", {})
-            if name not in allowed or parameters != expected:
+            # LangChain may omit Pydantic default fields from a tool call;
+            # compare the meaningful reviewed values, not serialization shape.
+            normalize = lambda value: {
+                key: item for key, item in (value or {}).items()
+                if item not in (None, "", [], False)
+            }
+            if name not in allowed or normalize(parameters) != normalize(expected):
                 return {
                     "ok": False, "tool": name,
                     "error": "Sensitive tool requires an exact approved capability and parameters",

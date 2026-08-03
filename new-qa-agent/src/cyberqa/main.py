@@ -124,6 +124,9 @@ def print_progress(event: str, data: dict) -> None:
     elif event == "tool_result":
         output = (data.get("stdout") or data.get("stderr") or "").strip().replace("\n", " ")
         print(f"[Tool] 結果 exit={data['exit_code']} | {output[:240]}", flush=True)
+    elif event == "tool_cached":
+        print(f"[Tool] 快取命中：{data['tool']} target={data['target']} "
+              f"signature={data['signature']}", flush=True)
     elif event == "target_discovered":
         print(f"[Target] 發現並加入授權清單：{data['target']}", flush=True)
     elif event == "agent_done":

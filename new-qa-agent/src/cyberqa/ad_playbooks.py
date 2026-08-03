@@ -26,7 +26,10 @@ AD_CAPABILITIES: tuple[CapabilitySpec, ...] = (
     CapabilitySpec(
         name="asrep_roasting_assessment",
         purpose="Identify accounts without Kerberos pre-authentication and assess the authorized QA path.",
-        prerequisites=["domain_inventory", "user enumeration"],
+        # A domain credential is intentionally not a prerequisite. AS-REP is
+        # the unauthenticated branch; it needs a domain/DC and a candidate
+        # username source (range file, anonymous enumeration, or evidence).
+        prerequisites=["domain_inventory", "candidate username source"],
         expected_evidence=["asrep_candidates", "ticket_obtained_or_blocked", "credential_validation_status"],
         allowed_tools=["ad_asrep_roasting", "nxc_ldap_recon"],
         risk=ADRisk.CREDENTIAL_MATERIAL,

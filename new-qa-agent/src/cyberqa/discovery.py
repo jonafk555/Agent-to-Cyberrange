@@ -110,12 +110,30 @@ def synthesize_evidence(evidence_items: Iterable[Evidence], target_profiles: dic
     unresolved = [target for target, profile in target_profiles.items()
                   if profile.get("domain_relation") == "unknown_domain"
                   or profile.get("connectivity") == "unknown"]
+    all_users = sorted({str(user) for item in items
+                        for user in (item.facts.get("users", []) if isinstance(item.facts, dict) else [])})
+    has_domain = bool(target_profiles and any(profile.get("domain") for profile in target_profiles.values()))
+    has_credential = bool(os.getenv("CYBERQA_AD_USERNAME") and os.getenv("CYBERQA_AD_PASSWORD"))
+    anonymous_attempted = any(
+        ("ldap" in item.source.lower() or "nxc" in item.source.lower())
+        and item.exit_code not in (None, 0) for item in items
+    )
+    if has_domain and not has_credential and all_users:
+        next_actions = ["asrep_roasting_assessment"]
+    elif has_domain and not has_credential and not anonymous_attempted:
+        next_actions = ["anonymous_ldap_or_nxc_user_enumeration"]
+    elif has_domain and not has_credential and anonymous_attempted and not all_users:
+        next_actions = ["request_username_source_or_enable_anonymous_enumeration"]
+    else:
+        next_actions = []
     return {
         "total_observations": len(items),
         "targets": targets,
         "target_profiles": target_profiles,
         "cross_forest_candidates": sorted(foreign),
         "unresolved_targets": sorted(set(unresolved)),
+        "candidate_users": all_users,
+        "next_actions": next_actions,
     }
 
 

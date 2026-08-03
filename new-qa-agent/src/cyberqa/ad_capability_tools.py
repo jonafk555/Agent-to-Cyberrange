@@ -105,9 +105,12 @@ class ADCapabilityTool:
             return argv
         if self.capability == "asrep_roasting_assessment":
             users = parameters.get("users", [])
-            users_file = parameters.get("users_file")
+            users_file = parameters.get("users_file") or os.getenv("CYBERQA_AD_USERS_FILE", "")
             if not domain or (not users and not users_file):
-                raise RuntimeError("AS-REP assessment requires CYBERQA_AD_DOMAIN and users or users_file")
+                raise RuntimeError(
+                    "AS-REP assessment requires CYBERQA_AD_DOMAIN and a candidate username source; "
+                    "set CYBERQA_AD_USERS_FILE or provide tool_parameters.users"
+                )
             if users_file:
                 users_path = os.path.abspath(os.path.expanduser(str(users_file)))
                 if not os.path.isfile(users_path):

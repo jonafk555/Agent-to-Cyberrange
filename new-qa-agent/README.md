@@ -59,6 +59,8 @@ Every new session begins with a bounded `initial_recon` Agent. It collects the l
 
 After reconnaissance, non-secret values such as the discovered AD domain, base DN, DC, DNS servers, and networks are written to `CYBERQA_DISCOVERED_ENV` (default `.cyberqa/discovered.env`) and loaded on the next process start. Existing secrets are never inferred or written. Target profiles preserve domain/forest relationships: an LDAP authentication or forest-context error is not automatically labelled as a network outage, and a different domain/forest is retained as a cross-forest candidate for later trust analysis.
 
+When no domain credential is configured, the planner first performs a bounded anonymous identity probe across LDAP, SMB, and NXC LDAP. It then aggregates the results: if usernames are found, it prioritizes `asrep_roasting_assessment`; AS-REP does not require a domain credential. A username source can also be `CYBERQA_AD_USERS_FILE` (one username per line). Anonymous discovery defaults to enabled for the authorized range and can be disabled with `CYBERQA_ALLOW_ANONYMOUS_NXC=0`. AS-REP assessment remains behind the credential-material approval gate. If anonymous paths produce no usernames, the Agent asks for a username source instead of repeating recon.
+
 Without `OPENAI_API_KEY`, the graph uses a safe observe-only fallback. The API key is read from the environment and is never placed in graph state or tool evidence.
 
 External services are optional for the dry-run example. Set `REDIS_URL`, `NEO4J_URI`, `NEO4J_USER`, `NEO4J_PASSWORD`, and `RABBITMQ_URL` to enable production adapters. `CYBERQA_LLM_MODEL` defaults to `gpt-4.1-mini`.
