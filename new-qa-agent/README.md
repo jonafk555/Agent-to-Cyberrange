@@ -22,6 +22,16 @@ python examples/trace.py
 pytest
 ```
 
+Copy `.env.example` to `.env` to configure the run without placing settings in the command line:
+
+```bash
+cp .env.example .env
+# edit .env, then run:
+python -m cyberqa.main
+```
+
+Command-line arguments override `.env`. Keep real API keys and lab credentials in `.env` only for local testing; `.env` is git-ignored. The optional AD variables are configuration references for credential-aware adapters and are not written into reconnaissance reports.
+
 The LLM is created in `src/cyberqa/llm.py` and injected into `Agents` from `main.py`:
 
 ```bash
@@ -42,6 +52,8 @@ python -m cyberqa.main --target 10.10.10.10 \
 ```
 
 The CLI uses LangGraph streaming while the LLM remains the decision-maker. It reports reasoning status, selected tools, command execution, results, and graph state updates without exposing private chain-of-thought. It stays in interactive mode after the task finishes: type a new objective at `你：` to continue the same conversation/checkpoint session; type `exit` or `quit` to leave. Add `--once` for a single non-interactive run.
+
+Every new session begins with an `initial_recon` Agent. It collects OS/release, interfaces and routes, DNS, firewall, listening ports, ACLs, local/domain users, privileges, SUID/SGID files, range configuration, and initial `nxc`, Impacket, and BloodHound observations. The result is written to `reports/<scenario-id>-initial-recon.md`. The report contains observed facts and command output, not model guesses.
 
 `build_kali_registry()` provides fixed adapters for `nmap`, `nxc` (SMB/LDAP recon), `impacket-rpcdump`, `bloodhound-python`, `dig`, `curl`, `ldapsearch`, `smbclient`, `ip`, `cat`, `nft`, and `timedatectl`. Commands run with `create_subprocess_exec` (no shell), a timeout, and the target policy. A CIDR entry such as `10.0.0.0/24` authorizes every address in that network. After an Nmap result, discovered IPv4 addresses are added to the runtime policy and reported as `[Target]`; this lets the ReAct agent continue with the discovered hosts. The observation store records `tool + target + action + parameters` signatures, returns cached results, and prevents repeated identical probes from consuming another subprocess call. Install the corresponding Kali packages first, such as `nmap`, `netexec`, `impacket-scripts`, `bloodhound.py`, `dnsutils`, `curl`, `ldap-utils`, and `smbclient`.
 

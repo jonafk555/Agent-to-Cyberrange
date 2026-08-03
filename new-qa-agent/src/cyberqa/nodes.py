@@ -43,6 +43,8 @@ class ReactState(TypedDict, total=False):
     messages: Annotated[list[Any], add_messages]
     failed_tool_signatures: list[str]
     tool_signatures: list[str]
+    needs_human: bool
+    human_request: dict[str, Any]
 
 
 class Agents:
@@ -179,7 +181,8 @@ class Agents:
         ])
         return response if isinstance(response, Decision) else Decision.model_validate(response)
 
-    def _react_graph(self, role: Role, state: QAState):
+    def _react_graph(self, role: Role, state: QAState, instruction: str | None = None,
+                     tool_names: list[str] | None = None):
         """Build one specialist's reason -> tools -> reason loop."""
         role_tool_names = {
             Role.VALIDATION: ("check_port", "check_dns_resolution", "ldap_bind", "kerberos_request_ticket",
@@ -196,7 +199,7 @@ class Agents:
         # registered fact tool when evidence shows that the original role
         # assumption was wrong; routing remains dynamically controlled by the
         # Supervisor instead of a fixed phase sequence.
-        allowed = self.tools.langchain_tools()
+        allowed = self.tools.langchain_tools(tool_names)
         model = self.llm.bind_tools(allowed) if self.llm and allowed else None
         inner = StateGraph(ReactState)
 
@@ -216,7 +219,7 @@ class Agents:
                     "ad_knowledge": state.get("ad_knowledge", {}),
                     "capabilities": capability_catalog(),
                     "observed_signatures": list(state.get("observation_index", {}).keys())[-50:],
-                    "instruction": state.get("last_decision").justification if state.get("last_decision") else "Collect useful facts",
+                    "instruction": instruction or (state.get("last_decision").justification if state.get("last_decision") else "Collect useful facts"),
                 })),
                 *self._react_context(s.get("messages", [])),
             ])
@@ -279,8 +282,11 @@ class Agents:
                 "options": ["retry_with_correction", "inspect_another_path", "abort"],
                 "last_message": raw,
             }
-            answer = interrupt(request)
-            return {"messages": [HumanMessage(content=f"Human guidance: {answer}")]}
+            # Human interaction is handled by the outer graph. Returning a
+            # request marker here prevents nested-subgraph interrupts from
+            # swallowing stdin and makes CLI resume reliable.
+            return {"needs_human": True, "human_request": request,
+                    "messages": [AIMessage(content=json.dumps(request))]}
 
         inner.add_node("reason", reason)
         inner.add_node("tools", ToolNode(allowed))
@@ -290,8 +296,100 @@ class Agents:
         inner.add_conditional_edges("reason", after_reason, {"tools": "tools", "done": END})
         inner.add_edge("tools", "inspect_tools")
         inner.add_conditional_edges("inspect_tools", after_inspect, {"reason": "reason", "human": "human", "done": END})
-        inner.add_edge("human", "reason")
+        inner.add_edge("human", END)
         return inner.compile()
+
+    async def initial_recon(self, state: QAState) -> dict[str, Any]:
+        """Run the mandatory baseline reconnaissance before QA decisions."""
+        recon_tools = [
+            "inspect_os_version", "inspect_os_release", "inspect_interfaces", "inspect_routes", "inspect_dns_config",
+            "inspect_firewall", "inspect_open_ports", "inspect_acl", "inspect_local_users",
+            "inspect_domain_users", "inspect_privileges", "inspect_sudo", "inspect_suid_files", "inspect_range_config",
+            "check_port", "nxc_smb_recon", "nxc_ldap_recon", "impacket_rpc_recon", "bloodhound_recon",
+        ]
+        available = [name for name in recon_tools if name in self.tools.tools]
+        target = state.get("target", "environment")
+        evidence = []
+        observation_index = dict(state.get("observation_index", {}))
+        proposal: dict[str, Any] = {"phase": "initial_recon", "tools": available}
+        if self.llm and available:
+            messages: list[Any] = []
+            observed_tools: set[str] = set()
+            try:
+                async for update in self._react_graph(
+                    Role.VALIDATION, state,
+                    instruction=(
+                        "Perform the mandatory initial cyber-range baseline reconnaissance. Cover OS version, "
+                        "interfaces/IP/subnets/routes, inbound/outbound firewall, listening ports, ACLs, local "
+                        "and domain users, privileges, special files, range configuration, then use nxc, "
+                        "Impacket and BloodHound where applicable. Do not repeat cached observations."
+                    ), tool_names=available,
+                ).astream({"messages": self._conversation_context(state.get("messages", []))}, stream_mode="updates"):
+                    for patch in update.values() if isinstance(update, dict) else ():
+                        if isinstance(patch, dict):
+                            messages.extend(patch.get("messages", []))
+                            if patch.get("needs_human"):
+                                proposal["needs_human"] = True
+                                proposal["human_request"] = patch.get("human_request")
+                for message in messages:
+                    if isinstance(message, ToolMessage):
+                        payload = json.loads(message.content) if isinstance(message.content, str) else message.content
+                        if not isinstance(payload, dict):
+                            continue
+                        if payload.get("evidence"):
+                            from .models import Evidence
+                            observed = Evidence.model_validate(payload["evidence"])
+                            evidence.append(observed)
+                            observed_tools.add(str(payload.get("tool", message.name or "")))
+                            if payload.get("signature"):
+                                observation_index[payload["signature"]] = {
+                                    "tool": payload.get("tool", message.name), "target": observed.target,
+                                    "action": observed.action, "ok": payload.get("ok", True),
+                                    "cached": payload.get("cached", False), "exit_code": observed.exit_code,
+                                }
+                        elif payload.get("needs_human"):
+                            from .models import Evidence
+                            observed_tools.add(str(payload.get("tool", message.name or "")))
+                            evidence.append(Evidence(source=f"tool:{payload.get('tool', message.name)}",
+                                                     action="initial_recon", target=target, exit_code=-1,
+                                                     stderr=str(payload.get("error", "tool failure")),
+                                                     facts=payload))
+            except Exception as exc:
+                proposal["error"] = str(exc)
+                from .models import Evidence
+                evidence.append(Evidence(source="agent:initial_recon", action="initial_recon", target=target,
+                                         exit_code=-1, stderr=str(exc), facts={"agent_error": True}))
+            # Baseline coverage is a QA invariant. The LLM controls ordering
+            # and interpretation, but an incomplete plan cannot silently
+            # produce a complete-looking environment report.
+            for name in available:
+                if name in observed_tools:
+                    continue
+                try:
+                    evidence.append(await self.tools.get(name).observe(target, "initial_recon"))
+                except Exception as exc:
+                    from .models import Evidence
+                    evidence.append(Evidence(source=f"tool:{name}", action="initial_recon", target=target,
+                                             exit_code=-1, stderr=str(exc), facts={"ok": False, "coverage_fallback": True}))
+        else:
+            for name in available:
+                try:
+                    evidence.append(await self.tools.get(name).observe(target, "initial_recon"))
+                except Exception as exc:
+                    from .models import Evidence
+                    evidence.append(Evidence(source=f"tool:{name}", action="initial_recon", target=target,
+                                             exit_code=-1, stderr=str(exc), facts={"ok": False}))
+        event = Event(type="INITIAL_RECON_COMPLETE", run_id=state["run_id"], emitted_by=Role.VALIDATION,
+                      target=target, evidence_ids=[item.id for item in evidence], payload=proposal)
+        try:
+            await self.events.publish(event)
+        except Exception:
+            pass
+        return {"evidence": evidence, "events": [event], "baseline_complete": True,
+                "observation_index": observation_index,
+                "needs_human": bool(proposal.get("needs_human")),
+                "human_requests": [proposal["human_request"]] if proposal.get("human_request") else [],
+                "messages": [AIMessage(content=f"Initial reconnaissance collected {len(evidence)} evidence item(s). ")]}
 
     async def supervisor(self, state: QAState) -> dict[str, Any]:
         iteration = state.get("iteration", 0) + 1
@@ -389,6 +487,8 @@ class Agents:
         evidence = []
         proposal: dict[str, Any] = {}
         new_observation = False
+        inner_needs_human = False
+        inner_human_request: dict[str, Any] | None = None
         if self.llm and self.tools.tools:
             react_messages: list[Any] = []
             try:
@@ -399,6 +499,9 @@ class Agents:
                     for patch in update.values() if isinstance(update, dict) else ():
                         if isinstance(patch, dict):
                             react_messages.extend(patch.get("messages", []))
+                            if patch.get("needs_human"):
+                                inner_needs_human = True
+                                inner_human_request = patch.get("human_request")
             except Exception as exc:
                 self.progress("agent_error", agent=role.value, error=str(exc))
                 proposal["error"] = str(exc)
@@ -505,6 +608,8 @@ class Agents:
             "discovered_targets": sorted(discovered_targets),
             "recon_coverage": recon_coverage,
             "ad_knowledge": ad_knowledge,
+            "needs_human": inner_needs_human,
+            "human_requests": [inner_human_request] if inner_human_request else [],
         }
         if role == Role.DEBUGGING and action == "generate_hypotheses":
             patch["hypotheses"] = [Hypothesis(statement=x, likelihood=.5) for x in proposal.get("hypotheses", [])]

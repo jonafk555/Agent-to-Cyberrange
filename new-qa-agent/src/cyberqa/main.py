@@ -2,16 +2,67 @@ from __future__ import annotations
 
 import asyncio
 import argparse
+import json
 import os
 import shlex
+from pathlib import Path
+from datetime import datetime, timezone
 from uuid import uuid4
 from langgraph.types import Command
 from langchain_core.messages import HumanMessage
+from dotenv import load_dotenv
 
 from .graph import build_graph
 from .llm import build_llm
 from .nodes import Agents
 from .tools import build_kali_registry
+
+
+load_dotenv()
+
+
+def write_initial_recon_report(values: dict, scenario_id: str) -> str:
+    report_dir = Path(os.getenv("CYBERQA_REPORT_DIR", "reports"))
+    report_dir.mkdir(parents=True, exist_ok=True)
+    path = report_dir / f"{scenario_id}-initial-recon.md"
+    evidence = [item for item in values.get("evidence", []) if getattr(item, "action", "") == "initial_recon"]
+    lines = [f"# Cyber Range Initial Reconnaissance — {scenario_id}", "",
+             f"Generated: {datetime.now(timezone.utc).isoformat()}",
+             f"Target: `{values.get('target', 'not specified')}`", "",
+             "This report contains observed facts from the mandatory baseline reconnaissance phase.", ""]
+    expected_keys = (
+        "CYBERQA_EXPECTED_LOCAL_USERS", "CYBERQA_EXPECTED_DOMAIN_USERS",
+        "CYBERQA_EXPECTED_PRIVILEGED_GROUPS", "CYBERQA_EXPECTED_OPEN_PORTS",
+        "CYBERQA_EXPECTED_NETWORKS",
+    )
+    lines.extend(["## Expected QA baseline", "", "Configured expectations are compared by the QA Agent in later analysis:", ""])
+    for key in expected_keys:
+        lines.append(f"- `{key}`: `{os.getenv(key, '')}`")
+    lines.append("")
+    for item in evidence:
+        lines.extend([
+            f"## {item.source} — `{item.target}`",
+            f"- Exit code: `{item.exit_code}`",
+            f"- Observed at: `{item.observed_at.isoformat()}`",
+            "",
+            "### Facts",
+            "```json",
+            json.dumps(item.facts, indent=2, ensure_ascii=False, default=str),
+            "```",
+            "",
+            "### stdout",
+            "```text",
+            (item.stdout or "")[-8000:],
+            "```",
+            "",
+            "### stderr",
+            "```text",
+            (item.stderr or "")[-4000:],
+            "```",
+            "",
+        ])
+    path.write_text("\n".join(lines), encoding="utf-8")
+    return str(path)
 from .models import ADKnowledge
 
 
@@ -48,10 +99,10 @@ def print_progress(event: str, data: dict) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Cyber-range QA ReAct multi-agent")
-    parser.add_argument("--target", default="127.0.0.1", help="Authorized lab target")
-    parser.add_argument("--objective", default="Validate the range and produce a QA scorecard")
-    parser.add_argument("--scenario-id", default="demo")
-    parser.add_argument("--max-iterations", type=int, default=8)
+    parser.add_argument("--target", default=os.getenv("CYBERQA_TARGET", "127.0.0.1"), help="Authorized lab target")
+    parser.add_argument("--objective", default=os.getenv("CYBERQA_OBJECTIVE", "Validate the range and produce a QA scorecard"))
+    parser.add_argument("--scenario-id", default=os.getenv("CYBERQA_SCENARIO_ID", "demo"))
+    parser.add_argument("--max-iterations", type=int, default=int(os.getenv("CYBERQA_MAX_ITERATIONS", "8")))
     parser.add_argument("--allowed-targets", default=None,
                         help="Comma-separated allowlist; defaults to CYBERQA_ALLOWED_TARGETS")
     parser.add_argument("--once", action="store_true",
@@ -85,7 +136,11 @@ async def run(args: argparse.Namespace | None = None) -> None:
                 interrupt_value = update["__interrupt__"]
                 continue
             for node, patch in update.items():
-                if node in {"supervisor", "validation", "testing", "debugging", "judge", "reporting"}:
+                if node == "initial_recon":
+                    snapshot = await app.aget_state(config)
+                    report_path = write_initial_recon_report(snapshot.values, snapshot.values.get("scenario_id", "scenario"))
+                    print(f"[Recon] baseline report written: {report_path}", flush=True)
+                if node in {"initial_recon", "supervisor", "validation", "testing", "debugging", "judge", "reporting"}:
                     print(f"[Graph] {node} node completed; state updated", flush=True)
         snapshot = await app.aget_state(config)
         # LangGraph versions differ: some expose interrupts in stream updates,
@@ -96,6 +151,18 @@ async def run(args: argparse.Namespace | None = None) -> None:
                 if pending:
                     interrupt_value = pending
                     break
+        if interrupt_value is None and snapshot.values.get("needs_human"):
+            interrupt_value = {
+                "kind": "human_help",
+                "question": "The Agent needs human guidance before it can continue.",
+                "options": ["retry", "validation", "testing", "debugging", "abort"],
+            }
+        if interrupt_value is None and "approval" in getattr(snapshot, "next", ()):
+            interrupt_value = {
+                "kind": "approval",
+                "question": "The Agent is waiting for approval. Type approve or reject.",
+                "options": ["approve", "reject"],
+            }
         return snapshot.values, interrupt_value
 
     async def execute_task(objective: str, target: str, scenario_id: str):

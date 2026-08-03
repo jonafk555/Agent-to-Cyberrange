@@ -78,6 +78,7 @@ class KaliTool:
     name: str
     executable: str
     fixed_args: tuple[str, ...] = ()
+    tail_args: tuple[str, ...] = ()
     executable_candidates: tuple[str, ...] = ()
     target_arg: bool = True
     target_prefix: str = ""
@@ -110,6 +111,7 @@ class KaliTool:
                 if not 0 <= self.target_index <= len(self.fixed_args):
                     raise ValueError(f"target_index is out of range for {self.name}")
                 argv.insert(1 + self.target_index, target_arg)
+        argv.extend(self.tail_args)
         if kwargs.get("args"):
             raise ValueError("This fixed Kali adapter does not accept arbitrary command arguments")
         safe_argv = self._redact_argv(argv)
@@ -322,7 +324,7 @@ def build_kali_registry(on_event: Callable[[str, dict[str, Any]], None] | None =
         KaliTool("check_port", "nmap", ("-Pn", "-T3", "--top-ports", "100"), on_event=on_event, target_policy=policy),
         KaliTool("check_dns_resolution", "dig", ("+short",), on_event=on_event, target_policy=policy),
         KaliTool("http_health_check", "curl", ("--fail", "--silent", "--show-error", "--max-time", "15"), target_prefix="http://", on_event=on_event, target_policy=policy),
-        KaliTool("ldap_bind", "ldapsearch", ("-x", "-H"), target_prefix="ldap://", on_event=on_event, target_policy=policy),
+        KaliTool("ldap_bind", "ldapsearch", ("-x", "-H"), tail_args=("-s", "base", "-b", ""), target_prefix="ldap://", on_event=on_event, target_policy=policy),
         # smbclient's -L consumes the server argument immediately after it:
         # ``smbclient -L //TARGET -N``.  Appending TARGET after -N makes
         # smbclient parse the option stream as a service/password command.
@@ -345,6 +347,17 @@ def build_kali_registry(on_event: Callable[[str, dict[str, Any]], None] | None =
         KaliTool("inspect_dns_config", "cat", ("/etc/resolv.conf",), target_arg=False, requires_target=False, on_event=on_event, target_policy=policy),
         KaliTool("inspect_firewall", "nft", ("list", "ruleset"), target_arg=False, requires_target=False, on_event=on_event, target_policy=policy),
         KaliTool("inspect_time_sync", "timedatectl", ("show-timesync",), target_arg=False, requires_target=False, on_event=on_event, target_policy=policy),
+        KaliTool("inspect_os_version", "uname", ("-a",), target_arg=False, requires_target=False, on_event=on_event, target_policy=policy),
+        KaliTool("inspect_os_release", "cat", ("/etc/os-release",), target_arg=False, requires_target=False, on_event=on_event, target_policy=policy),
+        KaliTool("inspect_interfaces", "ip", ("-j", "addr"), target_arg=False, requires_target=False, on_event=on_event, target_policy=policy),
+        KaliTool("inspect_open_ports", "ss", ("-lntup"), target_arg=False, requires_target=False, on_event=on_event, target_policy=policy),
+        KaliTool("inspect_acl", "getfacl", ("-p", "/etc", "/opt", "/srv"), target_arg=False, requires_target=False, on_event=on_event, target_policy=policy),
+        KaliTool("inspect_local_users", "getent", ("passwd",), target_arg=False, requires_target=False, on_event=on_event, target_policy=policy),
+        KaliTool("inspect_domain_users", "wbinfo", ("-u",), target_arg=False, requires_target=False, on_event=on_event, target_policy=policy),
+        KaliTool("inspect_privileges", "id", (), target_arg=False, requires_target=False, on_event=on_event, target_policy=policy),
+        KaliTool("inspect_sudo", "sudo", ("-n", "-l"), target_arg=False, requires_target=False, on_event=on_event, target_policy=policy),
+        KaliTool("inspect_suid_files", "find", ("/", "-xdev", "-type", "f", "-perm", "/6000", "-print"), target_arg=False, requires_target=False, timeout=90.0, on_event=on_event, target_policy=policy),
+        KaliTool("inspect_range_config", "find", ("/etc", "/opt", "/srv", "-maxdepth", "3", "-type", "f", "-print"), target_arg=False, requires_target=False, timeout=45.0, on_event=on_event, target_policy=policy),
     ]
     for spec in specs:
         registry.register(spec)
