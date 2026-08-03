@@ -5,7 +5,7 @@ from enum import Enum
 from typing import Any, Literal
 from uuid import uuid4
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 def utcnow() -> datetime:
@@ -107,7 +107,19 @@ class Event(BaseModel):
     payload: dict[str, Any] = Field(default_factory=dict)
 
 
+class ToolParameters(BaseModel):
+    """Closed schema for model-selected, reviewed tool variations."""
+    model_config = ConfigDict(extra="forbid")
+
+    profile: str | None = None
+    users_file: str | None = None
+    users: list[str] = Field(default_factory=list)
+    allow_anonymous_nxc: bool = False
+
+
 class Decision(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     next_agent: Role | Literal["approval", "end"]
     objective: str
     action: str
@@ -121,7 +133,7 @@ class Decision(BaseModel):
     expected_evidence: list[str] = Field(default_factory=list)
     risk: ADRisk = ADRisk.READ_ONLY
     next_options: list[str] = Field(default_factory=list)
-    tool_parameters: dict[str, Any] = Field(default_factory=dict)
+    tool_parameters: ToolParameters = Field(default_factory=ToolParameters)
 
 
 class CapabilitySpec(BaseModel):

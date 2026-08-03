@@ -35,7 +35,7 @@ def decision_fingerprint(decision: Decision) -> str:
         "target": decision.target,
         "capability": decision.capability,
         "risk": decision.risk.value,
-        "tool_parameters": decision.tool_parameters,
+        "tool_parameters": decision.tool_parameters.model_dump(mode="json", exclude_none=True),
         "allowed_tools": capability.allowed_tools if capability else [],
     }
     raw = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)

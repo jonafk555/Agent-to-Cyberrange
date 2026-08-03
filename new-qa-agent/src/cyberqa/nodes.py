@@ -117,7 +117,8 @@ class Agents:
         if knowledge.get("users"):
             known.add("user enumeration")
         decision = state.get("last_decision")
-        if decision and (decision.tool_parameters.get("users") or decision.tool_parameters.get("users_file")):
+        tool_parameters = decision.tool_parameters.model_dump() if decision else {}
+        if decision and (tool_parameters.get("users") or tool_parameters.get("users_file")):
             known.add("user enumeration")
         if knowledge.get("credentials_validated"):
             known.add("validated domain credential")
@@ -217,7 +218,7 @@ class Agents:
             return Decision(next_agent=Role.VALIDATION, objective=state.get("objective", "QA"),
                             action="observe", target=state.get("target", "environment"),
                             justification="Collect missing facts before changing state.")
-        model = self.llm.with_structured_output(Decision)
+        model = self.llm.with_structured_output(Decision, method="function_calling")
         failures = [
             {
                 "source": evidence.source,
@@ -244,7 +245,7 @@ class Agents:
             "ad_knowledge": state.get("ad_knowledge", {}),
             "target_profiles": state.get("target_profiles", {}),
             "runtime_config": state.get("runtime_config", {}),
-            "approved_tool_parameters": state.get("last_decision").tool_parameters if state.get("last_decision") else {},
+            "approved_tool_parameters": state.get("last_decision").tool_parameters.model_dump(mode="json") if state.get("last_decision") else {},
             "capabilities": capability_catalog(),
             "instruction": "Reason over the complete evidence synthesis, not only the last result. Advance one or more unresolved findings. Cover all discovered hosts/services and cross-forest candidates. Never repeat an identical effective argv; a different reviewed argv/profile is allowed. Treat LDAP authentication, DNS context, forest mismatch, permissions, and command syntax as different hypotheses. If domain credentials are absent, do not loop over empty-credential SMB/LDAP/NXC probes; use domain discovery, anonymous LDAP only when justified, a supplied users_file for AS-REP assessment, or another evidence-backed path. For check_port choose a profile deliberately; for NXC choose shares/users/groups/sessions/pass-pol/enum deliberately. Return one primary decision plus useful next_options and exact tool_parameters, including users_file when supplied.",
         })
@@ -310,7 +311,8 @@ class Agents:
         has_ad_credentials = bool(os.getenv("CYBERQA_AD_DOMAIN") and
                                   os.getenv("CYBERQA_AD_USERNAME") and
                                   os.getenv("CYBERQA_AD_PASSWORD"))
-        allow_anonymous_nxc = bool(decision and decision.tool_parameters.get("allow_anonymous_nxc"))
+        decision_parameters = decision.tool_parameters.model_dump() if decision else {}
+        allow_anonymous_nxc = bool(decision_parameters.get("allow_anonymous_nxc"))
         if not has_ad_credentials and not allow_anonymous_nxc:
             selected_names = [name for name in selected_names
                               if name not in {"nxc_smb_recon", "nxc_ldap_recon"}]
@@ -746,7 +748,7 @@ class Agents:
         grant = {
             "decision_fingerprint": fingerprint,
             "allowed_tools": get_capability(decision.capability).allowed_tools if get_capability(decision.capability) else [],
-            "tool_parameters": decision.tool_parameters,
+            "tool_parameters": decision.tool_parameters.model_dump(mode="json", exclude_none=True),
         } if request.status == "approved" else None
         return {"approvals": [request], "events": [event], "pending_action": None,
                 "last_decision": approved_decision if request.status == "approved" else decision,

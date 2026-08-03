@@ -2,10 +2,24 @@ from __future__ import annotations
 
 from langgraph.graph import END, START, StateGraph
 from langgraph.checkpoint.memory import MemorySaver
+from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 
 from .models import Role
 from .nodes import Agents
 from .state import QAState
+
+
+def _memory_saver() -> MemorySaver:
+    # State intentionally contains domain models and enums. Register only
+    # those application types instead of allowing arbitrary msgpack imports.
+    allowed = [
+        ("cyberqa.models", name) for name in (
+            "ADKnowledge", "ADRisk", "ApprovalRequest", "AttackPath", "CapabilitySpec",
+            "Decision", "Evidence", "Event", "Host", "Hypothesis", "Role", "Scorecard", "ToolParameters",
+            "Service", "ServiceProtocol",
+        )
+    ]
+    return MemorySaver(serde=JsonPlusSerializer(allowed_msgpack_modules=allowed))
 
 
 def route(state: QAState) -> str:
@@ -77,4 +91,4 @@ def build_graph(agents: Agents | None = None, checkpointer=None):
          "judge": "judge", "reporting": "reporting", "human_help": "human_help", END: END},
     )
     graph.add_edge("human_help", "supervisor")
-    return graph.compile(checkpointer=checkpointer or MemorySaver())
+    return graph.compile(checkpointer=checkpointer or _memory_saver())

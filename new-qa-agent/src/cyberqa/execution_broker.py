@@ -45,7 +45,7 @@ class CapabilityBroker:
             "capability": decision.capability or decision.action,
             "target": target,
             "parameters": decision.next_options,
-            "tool_parameters": decision.tool_parameters,
+            "tool_parameters": decision.tool_parameters.model_dump(mode="json", exclude_none=True),
         }
         raw = json.dumps(payload, sort_keys=True)
         return hashlib.sha256(raw.encode()).hexdigest()[:20]

@@ -8,6 +8,12 @@ def test_router_accepts_literal_end_and_approval_values():
     assert route({"last_decision": approval}) == "approval"
 
 
+def test_decision_schema_closes_nested_tool_parameters_object():
+    schema = Decision.model_json_schema()
+    assert schema["additionalProperties"] is False
+    assert schema["$defs"]["ToolParameters"]["additionalProperties"] is False
+
+
 def test_broker_does_not_accept_prerequisites_from_llm_prose():
     decision = Decision(
         next_agent=Role.TESTING, objective="AD QA", action="collect", target="10.0.0.1",

@@ -22,7 +22,7 @@ The compiled graph is intentionally small because the behavior is not encoded in
 
 The supervisor receives current evidence, unresolved goals, prior action signatures, hypotheses, repair history, and the scenario objective. It returns exactly one `Decision`. A specialist can collect facts and emit a proposal, but cannot choose the next node. The `route` function only interprets the supervisor's decision.
 
-In production, bind `Agents._reason` to a structured-output model (`with_structured_output(Decision)` for the supervisor and role-specific proposal models for specialists). The fallback is intentionally conservative and only observes.
+In production, bind `Agents._reason` to a structured-output model (`with_structured_output(Decision, method="function_calling")` for the supervisor and role-specific proposal models for specialists). The fallback is intentionally conservative and only observes.
 
 ## Validation contract
 

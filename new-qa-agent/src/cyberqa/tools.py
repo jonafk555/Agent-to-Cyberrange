@@ -417,7 +417,7 @@ def build_kali_registry(on_event: Callable[[str, dict[str, Any]], None] | None =
     policy = TargetPolicy(allowed_targets)
     registry = ToolRegistry(target_policy=policy)
     specs = [
-        KaliTool("check_port", "nmap", (), on_event=on_event, target_policy=policy),
+        KaliTool("check_port", "nmap", (), timeout=180.0, on_event=on_event, target_policy=policy),
         KaliTool("check_dns_resolution", "dig", ("+short",), on_event=on_event, target_policy=policy),
         KaliTool("http_health_check", "curl", ("--fail", "--silent", "--show-error", "--max-time", "15"), target_prefix="http://", on_event=on_event, target_policy=policy),
         KaliTool("ldap_bind", "ldapsearch", ("-x", "-H"), tail_args=("-s", "base", "-b", ""), target_prefix="ldap://", on_event=on_event, target_policy=policy),
@@ -440,7 +440,7 @@ def build_kali_registry(on_event: Callable[[str, dict[str, Any]], None] | None =
         KaliTool("inspect_os_version", "uname", ("-a",), target_arg=False, requires_target=False, on_event=on_event, target_policy=policy),
         KaliTool("inspect_os_release", "cat", ("/etc/os-release",), target_arg=False, requires_target=False, on_event=on_event, target_policy=policy),
         KaliTool("inspect_interfaces", "ip", ("-j", "addr"), target_arg=False, requires_target=False, on_event=on_event, target_policy=policy),
-        KaliTool("inspect_open_ports", "ss", ("-lntup"), target_arg=False, requires_target=False, on_event=on_event, target_policy=policy),
+        KaliTool("inspect_open_ports", "ss", ("-lntup",), target_arg=False, requires_target=False, on_event=on_event, target_policy=policy),
         KaliTool("inspect_acl", "getfacl", ("-p", "/etc", "/opt", "/srv"), target_arg=False, requires_target=False, on_event=on_event, target_policy=policy),
         KaliTool("inspect_local_users", "getent", ("passwd",), target_arg=False, requires_target=False, on_event=on_event, target_policy=policy),
         KaliTool("inspect_domain_users", "wbinfo", ("-u",), target_arg=False, requires_target=False, on_event=on_event, target_policy=policy),
