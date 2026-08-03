@@ -33,8 +33,9 @@ def test_broker_deduplicates_capability_target_pair():
         prerequisites=["domain_inventory", "validated domain credential", "DNS resolution"],
     )
     broker = CapabilityBroker()
-    first = broker.validate(decision, decision.target)
-    second = broker.validate(decision, decision.target, {first["signature"]})
+    known = {"domain_inventory", "validated domain credential", "DNS resolution"}
+    first = broker.validate(decision, decision.target, known_prerequisites=known)
+    second = broker.validate(decision, decision.target, {first["signature"]}, known)
     assert first["ok"] is True
     assert second["duplicate"] is True
     assert second["ok"] is False

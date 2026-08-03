@@ -5,12 +5,13 @@ import argparse
 import json
 import os
 import shlex
+import sys
 from pathlib import Path
 from datetime import datetime, timezone
 from uuid import uuid4
 from langgraph.types import Command
 from langchain_core.messages import HumanMessage
-from dotenv import load_dotenv
+from dotenv import dotenv_values, load_dotenv
 
 from .graph import build_graph
 from .llm import build_llm
@@ -19,6 +20,12 @@ from .tools import build_kali_registry
 
 
 load_dotenv()
+_discovered_env = os.getenv("CYBERQA_DISCOVERED_ENV", ".cyberqa/discovered.env")
+load_dotenv(_discovered_env, override=False)
+for _key, _value in dotenv_values(_discovered_env).items():
+    # A blank value in .env should not hide a previously discovered safe value.
+    if _value and not os.getenv(_key):
+        os.environ[_key] = _value
 
 
 def write_initial_recon_report(values: dict, scenario_id: str) -> str:
@@ -39,6 +46,15 @@ def write_initial_recon_report(values: dict, scenario_id: str) -> str:
     for key in expected_keys:
         lines.append(f"- `{key}`: `{os.getenv(key, '')}`")
     lines.append("")
+    lines.extend(["## Runtime configuration discovered by the Agent", "",
+                  "Only non-secret values are persisted; credentials are never inferred or written here.", ""])
+    for key, value in sorted(values.get("runtime_config", {}).items()):
+        lines.append(f"- `{key}`: `{value}`")
+    lines.extend(["", "## Target and domain profiles", "", "```json",
+                  json.dumps(values.get("target_profiles", {}), indent=2, ensure_ascii=False, default=str),
+                  "```", "", "## Evidence synthesis", "", "```json",
+                  json.dumps(values.get("evidence_synthesis", {}), indent=2, ensure_ascii=False, default=str),
+                  "```", ""])
     for item in evidence:
         lines.extend([
             f"## {item.source} — `{item.target}`",
@@ -72,6 +88,27 @@ def interrupt_payload(value) -> dict:
         value = value[0]
     value = getattr(value, "value", value)
     return value if isinstance(value, dict) else {"question": str(value)}
+
+
+def read_human_input(prompt: str = "你：") -> str:
+    """Read from the controlling terminal even when stdin is redirected."""
+    print(prompt, end="", flush=True)
+    stream = sys.stdin
+    tty = None
+    try:
+        if not getattr(stream, "isatty", lambda: False)():
+            try:
+                tty = open("/dev/tty", "r", encoding="utf-8", errors="replace")
+                stream = tty
+            except OSError:
+                pass
+        line = stream.readline()
+        if line == "":
+            raise EOFError
+        return line.strip()
+    finally:
+        if tty is not None:
+            tty.close()
 
 
 def print_progress(event: str, data: dict) -> None:
@@ -124,12 +161,10 @@ async def run(args: argparse.Namespace | None = None) -> None:
     os.environ["CYBERQA_ALLOWED_TARGETS"] = ",".join(sorted(configured_targets))
     app = build_graph(Agents(llm=build_llm(), tools=build_kali_registry(on_event=print_progress),
                              on_progress=print_progress))
-    config = {"configurable": {"thread_id": str(uuid4())}}
-
-    async def stream_graph(input_state):
+    async def stream_graph(input_state, task_config):
         """Stream graph updates while the LLM remains the decision-maker."""
         interrupt_value = None
-        async for update in app.astream(input_state, config, stream_mode="updates"):
+        async for update in app.astream(input_state, task_config, stream_mode="updates"):
             if not isinstance(update, dict):
                 continue
             if "__interrupt__" in update:
@@ -137,12 +172,12 @@ async def run(args: argparse.Namespace | None = None) -> None:
                 continue
             for node, patch in update.items():
                 if node == "initial_recon":
-                    snapshot = await app.aget_state(config)
+                    snapshot = await app.aget_state(task_config)
                     report_path = write_initial_recon_report(snapshot.values, snapshot.values.get("scenario_id", "scenario"))
                     print(f"[Recon] baseline report written: {report_path}", flush=True)
                 if node in {"initial_recon", "supervisor", "validation", "testing", "debugging", "judge", "reporting"}:
                     print(f"[Graph] {node} node completed; state updated", flush=True)
-        snapshot = await app.aget_state(config)
+        snapshot = await app.aget_state(task_config)
         # LangGraph versions differ: some expose interrupts in stream updates,
         # others expose them only on pending task metadata in the checkpoint.
         if interrupt_value is None:
@@ -151,32 +186,40 @@ async def run(args: argparse.Namespace | None = None) -> None:
                 if pending:
                     interrupt_value = pending
                     break
-        if interrupt_value is None and snapshot.values.get("needs_human"):
-            interrupt_value = {
-                "kind": "human_help",
-                "question": "The Agent needs human guidance before it can continue.",
-                "options": ["retry", "validation", "testing", "debugging", "abort"],
-            }
         if interrupt_value is None and "approval" in getattr(snapshot, "next", ()):
             interrupt_value = {
                 "kind": "approval",
-                "question": "The Agent is waiting for approval. Type approve or reject.",
-                "options": ["approve", "reject"],
+                "request": snapshot.values.get("pending_action", {}),
+                "question": "Approve this action? Reply approve or reject.",
+            }
+        # Some LangGraph releases expose the state flag but omit interrupt
+        # metadata from the snapshot. Keep the CLI usable in that case, but
+        # mark it synthetic so resume uses a fresh graph input instead of an
+        # invalid Command(resume=...) call.
+        if interrupt_value is None and snapshot.values.get("needs_human"):
+            interrupt_value = {
+                "kind": "human_help",
+                "question": "Agent 需要你的下一步指示。",
+                "options": ["retry_with_correction", "validation", "testing", "debugging", "abort"],
+                "synthetic": True,
             }
         return snapshot.values, interrupt_value
 
     async def execute_task(objective: str, target: str, scenario_id: str):
+        task_config = {"configurable": {"thread_id": str(uuid4())}}
         initial = {"run_id": str(uuid4()), "scenario_id": scenario_id, "objective": objective,
                    "target": target, "iteration": 0, "max_iterations": args.max_iterations,
                    "hosts": {}, "evidence": [], "events": [], "approvals": [], "action_history": [],
                    "completed_goals": [], "errors": [], "memory": {}, "human_requests": [],
                    "react_steps": 0, "needs_human": False, "aborted": False,
+                   "baseline_complete": False, "approved_grant": None,
                    "no_progress_count": 0,
                    "discovered_targets": [target], "recon_coverage": {},
                    "ad_knowledge": ADKnowledge().model_dump(), "capability_history": [],
+                   "target_profiles": {}, "evidence_synthesis": {}, "runtime_config": {},
                    "messages": [HumanMessage(content=objective)]}
         try:
-            result, interrupt_value = await stream_graph(initial)
+            result, interrupt_value = await stream_graph(initial, task_config)
         except Exception as exc:
             print(f"\n[Graph error] {type(exc).__name__}: {exc}", flush=True)
             print("此任務已停止，但互動 session 仍可繼續輸入下一個任務。", flush=True)
@@ -190,14 +233,22 @@ async def run(args: argparse.Namespace | None = None) -> None:
                 print(f"相關證據：{request['evidence_summary']}", flush=True)
             print(f"請回覆你的處置方向（可用自然語言）：{request.get('question', '請提供下一步指示')}", flush=True)
             try:
-                answer = (await asyncio.to_thread(input, "你：")).strip()
+                answer = read_human_input()
             except EOFError:
                 print("\n[Input closed] 未收到人類指示，任務安全停止。", flush=True)
                 return {"iteration": 0, "events": [], "evidence": [], "errors": ["human input closed"]}
             if answer.lower() in {"quit", "exit"}:
                 return None
             try:
-                result, interrupt_value = await stream_graph(Command(resume=answer))
+                if request.get("synthetic"):
+                    result, interrupt_value = await stream_graph({
+                        "needs_human": False,
+                        "no_progress_count": 0,
+                        "action_history": [],
+                        "messages": [HumanMessage(content=f"Human guidance: {answer}")],
+                    }, task_config)
+                else:
+                    result, interrupt_value = await stream_graph(Command(resume=answer), task_config)
             except Exception as exc:
                 print(f"\n[Resume error] {type(exc).__name__}: {exc}", flush=True)
                 return {"iteration": 0, "events": [], "evidence": [], "errors": [str(exc)]}
@@ -211,7 +262,7 @@ async def run(args: argparse.Namespace | None = None) -> None:
 
     print("\n互動模式已啟動。輸入下一個任務；輸入 exit 或 quit 離開。", flush=True)
     while True:
-        objective = input("\n你：").strip()
+        objective = read_human_input("\n你：")
         if objective.lower() in {"quit", "exit", "q"}:
             print("Agent session ended.")
             return

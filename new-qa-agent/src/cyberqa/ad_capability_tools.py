@@ -6,6 +6,7 @@ arbitrary shell command. Each adapter below builds one reviewed argv shape.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import os
 import shutil
 import tempfile
@@ -41,20 +42,44 @@ class ADCapabilityTool:
     target_policy: Any
     timeout: float = 60.0
 
+    def command_identity(self, target: str, parameters: dict[str, Any]) -> dict[str, Any]:
+        """Stable effective argv identity without persisting credentials or temp paths."""
+        password = os.getenv("CYBERQA_AD_PASSWORD", "")
+        return {
+            "capability": self.capability,
+            "target": target,
+            "domain": os.getenv("CYBERQA_AD_DOMAIN", ""),
+            "username": os.getenv("CYBERQA_AD_USERNAME", ""),
+            "base_dn": os.getenv("CYBERQA_AD_BASE_DN", ""),
+            "credential_fingerprint": hashlib.sha256(password.encode()).hexdigest()[:12]
+            if password else "",
+            "parameters": parameters,
+        }
+
     async def observe(self, target: str, action: str, **kwargs: Any) -> Evidence:
         if not self.target_policy.allows(target):
             raise PermissionError(f"Target is not in CYBERQA_ALLOWED_TARGETS: {target}")
         parameters = kwargs or {}
         argv = self._argv(target, parameters)
-        process = await asyncio.create_subprocess_exec(
-            *argv, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
-        )
+        temporary_users_file = None
+        if self.capability == "asrep_roasting_assessment" and not parameters.get("users_file"):
+            temporary_users_file = next((item for index, item in enumerate(argv)
+                                         if index and argv[index - 1] == "-usersfile"), None)
         try:
+            process = await asyncio.create_subprocess_exec(
+                *argv, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+            )
             stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=self.timeout)
         except asyncio.TimeoutError:
             process.kill()
             await process.wait()
             raise TimeoutError(f"{self.name} timed out after {self.timeout}s")
+        finally:
+            if temporary_users_file:
+                try:
+                    os.unlink(temporary_users_file)
+                except FileNotFoundError:
+                    pass
         stdout_text = _redact(stdout.decode(errors="replace")[-12000:])
         stderr_text = _redact(stderr.decode(errors="replace")[-12000:])
         return Evidence(
@@ -80,11 +105,23 @@ class ADCapabilityTool:
             return argv
         if self.capability == "asrep_roasting_assessment":
             users = parameters.get("users", [])
-            if not domain or not users:
-                raise RuntimeError("AS-REP assessment requires CYBERQA_AD_DOMAIN and a users list")
-            with tempfile.NamedTemporaryFile("w", prefix="cyberqa-users-", delete=False) as handle:
-                handle.write("\n".join(str(user) for user in users) + "\n")
-                users_file = handle.name
+            users_file = parameters.get("users_file")
+            if not domain or (not users and not users_file):
+                raise RuntimeError("AS-REP assessment requires CYBERQA_AD_DOMAIN and users or users_file")
+            if users_file:
+                users_path = os.path.abspath(os.path.expanduser(str(users_file)))
+                if not os.path.isfile(users_path):
+                    raise RuntimeError(f"AS-REP users_file does not exist: {users_path}")
+                if os.path.getsize(users_path) > 1024 * 1024:
+                    raise RuntimeError("AS-REP users_file exceeds the 1 MiB limit")
+                with open(users_path, "rb") as handle:
+                    if b"\x00" in handle.read(1024 * 1024):
+                        raise RuntimeError("AS-REP users_file is not a text file")
+                users_file = users_path
+            else:
+                with tempfile.NamedTemporaryFile("w", prefix="cyberqa-users-", delete=False) as handle:
+                    handle.write("\n".join(str(user) for user in users) + "\n")
+                    users_file = handle.name
             return [_first_available(("impacket-GetNPUsers", "GetNPUsers.py")),
                     f"{domain}/", "-dc-ip", target, "-usersfile", users_file,
                     "-no-pass", "-format", "hashcat"]

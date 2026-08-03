@@ -28,6 +28,9 @@ class QAState(TypedDict, total=False):
     messages: Annotated[list[Any], add_messages]
     last_decision: Decision | None
     pending_action: dict[str, Any] | None
+    # One-shot grant for one frozen decision. Specialists consume it after the
+    # approved action is dispatched.
+    approved_grant: dict[str, Any] | None
     iteration: int
     max_iterations: int
     action_history: list[str]
@@ -44,3 +47,6 @@ class QAState(TypedDict, total=False):
     recon_coverage: Annotated[dict[str, Any], merge_dict]
     ad_knowledge: ADKnowledge
     capability_history: list[dict[str, Any]]
+    target_profiles: Annotated[dict[str, Any], merge_dict]
+    evidence_synthesis: dict[str, Any]
+    runtime_config: Annotated[dict[str, str], merge_dict]

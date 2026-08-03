@@ -80,7 +80,7 @@ validation: SERVICE_VALIDATED functional=true
 supervisor: ADCS rebuild is highest-value repair; policy=approval_required
 approval: APPROVAL_REQUIRED request_id=... status=pending
 human: approve/reject outside the specialist loop
-resume: supervisor re-evaluates with the approval decision and fresh evidence
+resume: dispatch the frozen approved decision once; sensitive tools verify the grant and exact parameters
 ```
 
 To suspend/resume with LangGraph's production checkpointer, compile with a checkpointer and use `interrupt()` in `approval`; the skeleton keeps approval as an explicit node so deployments can select their approval transport (UI, ticketing, or signed API) without changing specialist logic.

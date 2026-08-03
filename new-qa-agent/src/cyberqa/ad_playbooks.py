@@ -14,7 +14,7 @@ AD_CAPABILITIES: tuple[CapabilitySpec, ...] = (
         name="domain_inventory",
         purpose="Discover domain, hosts, services, DNS, LDAP, Kerberos, SMB, and trust boundaries.",
         expected_evidence=["domain_name", "host_inventory", "service_inventory", "dns_or_ldap_root"],
-        allowed_tools=["nmap", "dig", "ldapsearch", "nxc_ldap_recon", "smbclient"],
+        allowed_tools=["check_port", "check_dns_resolution", "ldap_bind", "nxc_ldap_recon", "smb_negotiate"],
     ),
     CapabilitySpec(
         name="enumerate_domain_users",
@@ -64,7 +64,7 @@ AD_CAPABILITIES: tuple[CapabilitySpec, ...] = (
         purpose="Collect AD relationships using a validated identity and analyze attack-path coverage.",
         prerequisites=["domain_inventory", "validated domain credential", "DNS resolution"],
         expected_evidence=["users", "groups", "sessions", "acl_edges", "delegation", "trusts"],
-        allowed_tools=["ad_bloodhound_collection", "bloodhound-python"],
+        allowed_tools=["ad_bloodhound_collection"],
         risk=ADRisk.READ_ONLY,
     ),
     CapabilitySpec(
@@ -72,7 +72,7 @@ AD_CAPABILITIES: tuple[CapabilitySpec, ...] = (
         purpose="Assess ACL, delegation, LAPS/GPO, AD CS, trust, and local-admin paths from evidence.",
         prerequisites=["bloodhound_collection or equivalent relationship evidence"],
         expected_evidence=["prerequisite_edges", "affected_principal", "impact", "blocked_or_proven"],
-        allowed_tools=["bloodhound-python", "ldapsearch", "certipy"],
+        allowed_tools=["ad_bloodhound_collection", "ldap_bind"],
     ),
 )
 

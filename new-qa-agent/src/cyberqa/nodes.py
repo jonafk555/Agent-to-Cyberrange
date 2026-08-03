@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from typing import Any, Annotated, Callable, TypedDict
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
@@ -10,11 +11,13 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.prebuilt import ToolNode
 from langgraph.types import interrupt
 
-from .approval import ApprovalPolicy
-from .ad_playbooks import capability_catalog
+from .approval import ApprovalPolicy, decision_fingerprint
+from .ad_playbooks import capability_catalog, get_capability
+from .discovery import (apply_and_persist_runtime_config, build_target_profiles,
+                         derive_runtime_config, synthesize_evidence)
 from .events import EventBus
 from .execution_broker import CapabilityBroker
-from .models import Decision, Event, Hypothesis, Role, Scorecard, Service, ServiceProtocol
+from .models import Decision, Event, Evidence, Hypothesis, Role, Scorecard, Service, ServiceProtocol
 from .state import QAState
 from .tools import ToolRegistry
 
@@ -35,7 +38,10 @@ or diagnostic probe over repeating a cached command.
 SYSTEM = AD_QA_PLAYBOOK + """You are a cyber-range QA specialist operating only on authorized targets. Use OODA:
 observe facts, orient against the objective and prior evidence, decide one justified action, and act
 through the supplied fact-only tools. Inspect every tool result before selecting the next tool. Continue
-until the objective is complete. Never invent facts, credentials, vulnerabilities, or successful attacks."""
+until the objective is complete. Never invent facts, credentials, vulnerabilities, or successful attacks.
+Build a compact evidence summary after each probe. If no domain credentials exist, do not repeat empty-
+credential SMB/LDAP/NXC probes; pivot to domain discovery, supplied username-file AS-REP assessment,
+anonymous access only when evidence supports it, or another justified path."""
 
 
 class ReactState(TypedDict, total=False):
@@ -58,6 +64,79 @@ class Agents:
     def progress(self, event: str, **data: Any) -> None:
         if self.on_progress:
             self.on_progress(event, data)
+
+    def _project_observations(self, state: QAState, new_evidence: list[Evidence]) -> dict[str, Any]:
+        """Build one cumulative view used by every future planning decision."""
+        all_evidence = [*state.get("evidence", []), *new_evidence]
+        old_profiles = state.get("target_profiles", {})
+        old_knowledge = state.get("ad_knowledge", {}) or {}
+        if hasattr(old_knowledge, "model_dump"):
+            old_knowledge = old_knowledge.model_dump()
+        profiles = build_target_profiles(all_evidence, old_profiles, old_knowledge.get("domain"))
+        synthesis = synthesize_evidence(all_evidence, profiles)
+        runtime = derive_runtime_config(all_evidence, profiles, state.get("runtime_config", {}))
+        if runtime:
+            apply_and_persist_runtime_config(runtime)
+        knowledge = dict(old_knowledge)
+        for field in ("users", "spns", "asrep_candidates", "groups", "acl_edges",
+                      "delegation", "adcs_findings", "trusts"):
+            values = set(knowledge.get(field, []))
+            for item in all_evidence:
+                facts = item.facts if isinstance(item.facts, dict) else {}
+                values.update(str(value) for value in facts.get(field, []))
+            knowledge[field] = sorted(values)
+        for item in all_evidence:
+            facts = item.facts if isinstance(item.facts, dict) else {}
+            if facts.get("domain_name") and not knowledge.get("domain"):
+                knowledge["domain"] = str(facts["domain_name"])
+        domains = set(knowledge.get("domains", []))
+        forests = set(knowledge.get("forests", []))
+        domains.update(str(profile["domain"]) for profile in profiles.values() if profile.get("domain"))
+        forests.update(str(profile["forest"]) for profile in profiles.values() if profile.get("forest"))
+        knowledge["domains"] = sorted(domains)
+        knowledge["forests"] = sorted(forests)
+        knowledge["target_domains"] = {
+            target: profile["domain"] for target, profile in profiles.items() if profile.get("domain")
+        }
+        knowledge["cross_forest_targets"] = sorted(
+            target for target, profile in profiles.items() if profile.get("deferred_for_cross_forest")
+        )
+        if not knowledge.get("domain") and knowledge.get("domains"):
+            knowledge["domain"] = knowledge["domains"][0]
+        return {"target_profiles": profiles, "evidence_synthesis": synthesis,
+                "runtime_config": runtime, "ad_knowledge": knowledge}
+
+    @staticmethod
+    def _known_prerequisites(state: QAState) -> set[str]:
+        knowledge = state.get("ad_knowledge", {}) or {}
+        if hasattr(knowledge, "model_dump"):
+            knowledge = knowledge.model_dump()
+        known: set[str] = set()
+        if knowledge.get("domain") or os.getenv("CYBERQA_AD_DOMAIN") or state.get("target_profiles"):
+            known.add("domain_inventory")
+        if knowledge.get("users"):
+            known.add("user enumeration")
+        decision = state.get("last_decision")
+        if decision and (decision.tool_parameters.get("users") or decision.tool_parameters.get("users_file")):
+            known.add("user enumeration")
+        if knowledge.get("credentials_validated"):
+            known.add("validated domain credential")
+        evidence = state.get("evidence", [])
+        for item in evidence:
+            facts = item.facts if isinstance(item.facts, dict) else {}
+            if item.exit_code in (None, 0) and "ldap" in item.source.lower():
+                known.add("valid LDAP access or explicitly allowed anonymous LDAP")
+            if facts.get("lockout_policy"):
+                known.add("lockout_policy")
+            if facts.get("dns_resolved") or "dns" in item.source.lower():
+                known.add("DNS resolution")
+        if knowledge.get("acl_edges") or knowledge.get("delegation") or knowledge.get("trusts"):
+            known.add("bloodhound_collection or equivalent relationship evidence")
+        if os.getenv("CYBERQA_APPROVED_TEST_PASSWORD"):
+            known.add("approved_test_password")
+        if os.getenv("CYBERQA_AD_USERNAME") and os.getenv("CYBERQA_AD_PASSWORD"):
+            known.add("human_supplied_or_range_issued_credential")
+        return known
 
     async def _human_problem(self, state: QAState, kind: str, raw: str = "") -> str:
         """Create an operator-facing issue summary without exposing hidden reasoning."""
@@ -155,6 +234,7 @@ class Agents:
             "target": state.get("target", "environment"),
             "phase": state.get("phase"),
             "evidence": [e.model_dump(mode="json") for e in state.get("evidence", [])[-20:]],
+            "evidence_synthesis": state.get("evidence_synthesis", {}),
             "observed_signatures": list(state.get("observation_index", {}).keys())[-50:],
             "available_tools": list(self.tools.tools),
             "discovered_targets": state.get("discovered_targets", []),
@@ -162,8 +242,11 @@ class Agents:
             "no_progress_count": state.get("no_progress_count", 0),
             "tool_failures": failures,
             "ad_knowledge": state.get("ad_knowledge", {}),
+            "target_profiles": state.get("target_profiles", {}),
+            "runtime_config": state.get("runtime_config", {}),
+            "approved_tool_parameters": state.get("last_decision").tool_parameters if state.get("last_decision") else {},
             "capabilities": capability_catalog(),
-            "instruction": "Choose the highest-value next specialist or end. Do not assume a fixed phase order. Cover every discovered host and valuable service before ending; a DC result alone is insufficient. Never repeat a cached observation or re-run an identical failed command. If tool_failures are present, route to debugging and use the exact stderr, exit code, and argv to diagnose arguments, credentials, permissions, connectivity, or timeout before choosing a replacement probe.",
+            "instruction": "Reason over the complete evidence synthesis, not only the last result. Advance one or more unresolved findings. Cover all discovered hosts/services and cross-forest candidates. Never repeat an identical effective argv; a different reviewed argv/profile is allowed. Treat LDAP authentication, DNS context, forest mismatch, permissions, and command syntax as different hypotheses. If domain credentials are absent, do not loop over empty-credential SMB/LDAP/NXC probes; use domain discovery, anonymous LDAP only when justified, a supplied users_file for AS-REP assessment, or another evidence-backed path. For check_port choose a profile deliberately; for NXC choose shares/users/groups/sessions/pass-pol/enum deliberately. Return one primary decision plus useful next_options and exact tool_parameters, including users_file when supplied.",
         })
         self.progress("reasoning_start", agent=Role.SUPERVISOR.value)
         response = await model.ainvoke([
@@ -172,7 +255,7 @@ class Agents:
                     "Choose dynamically based on the conversation and evidence. Tool failures are "
                     "diagnostic evidence: send them to debugging, do not blindly repeat them. "
                     "Select an AD capability when applicable and fill prerequisites, expected_evidence, "
-                    "risk, and next_options. You may propose a multi-step chain; the execution broker "
+                    "risk, tool_parameters, and next_options. You may propose a multi-step chain; the execution broker "
                     "will enforce scope and approvals. "
                     "Do not execute tools. Return a Decision object."
             )),
@@ -185,21 +268,53 @@ class Agents:
                      tool_names: list[str] | None = None):
         """Build one specialist's reason -> tools -> reason loop."""
         role_tool_names = {
-            Role.VALIDATION: ("check_port", "check_dns_resolution", "ldap_bind", "kerberos_request_ticket",
-                              "smb_negotiate", "winrm_execute_probe", "http_health_check", "database_connectivity"),
-            Role.TESTING: ("enumerate_spns", "request_kerberos_tickets", "check_asrep_accounts",
-                           "validate_ntlm_relay_prerequisites", "enumerate_adcs_templates",
-                           "test_authorized_attack_path", "retrieve_flag"),
+            Role.VALIDATION: ("check_port", "check_dns_resolution", "ldap_bind", "smb_negotiate",
+                              "http_health_check", "nxc_smb_recon", "nxc_ldap_recon",
+                              "impacket_rpc_recon", "inspect_routes",
+                              "inspect_dns_config"),
+            Role.TESTING: ("ad_domain_users", "ad_asrep_roasting", "ad_kerberoasting",
+                           "ad_credential_validation", "ad_password_spray", "ad_bloodhound_collection",
+                           "nxc_smb_recon", "nxc_ldap_recon", "check_port",
+                           "ldap_bind", "smb_negotiate"),
             Role.DEBUGGING: ("inspect_dns_config", "inspect_firewall", "inspect_routes", "inspect_time_sync",
-                             "inspect_ldap_config", "inspect_replication", "restart_service", "correct_dns",
-                             "correct_route", "sync_time"),
+                             "inspect_os_version", "inspect_os_release", "inspect_interfaces", "inspect_open_ports",
+                             "inspect_acl", "inspect_local_users", "inspect_domain_users", "inspect_privileges",
+                             "inspect_sudo", "check_port", "check_dns_resolution", "ldap_bind", "smb_negotiate",
+                             "nxc_smb_recon", "nxc_ldap_recon", "impacket_rpc_recon"),
         }.get(role)
         available = [name for name in (role_tool_names or ()) if name in self.tools.tools]
-        # The registry is the security boundary. Specialists may use any
-        # registered fact tool when evidence shows that the original role
-        # assumption was wrong; routing remains dynamically controlled by the
-        # Supervisor instead of a fixed phase sequence.
-        allowed = self.tools.langchain_tools(tool_names)
+        # A capability-specific list is preferred. If the Supervisor did not
+        # provide one, keep the specialist inside its role tool set instead of
+        # exposing every registered command to every specialist.
+        selected_names = tool_names
+        authorization = None
+        if selected_names is None:
+            decision = state.get("last_decision")
+            capability = get_capability(decision.capability if decision else None)
+            if capability:
+                selected_names = [name for name in capability.allowed_tools if name in self.tools.tools]
+            elif role in {Role.JUDGE, Role.REPORTING}:
+                selected_names = []
+            else:
+                selected_names = available
+            grant = state.get("approved_grant")
+            if decision and grant and grant.get("decision_fingerprint") == decision_fingerprint(decision):
+                authorization = grant
+            if authorization is None:
+                from .tools import SENSITIVE_TOOL_NAMES
+                selected_names = [name for name in selected_names if name not in SENSITIVE_TOOL_NAMES]
+        from .tools import SENSITIVE_TOOL_NAMES
+        if authorization is None:
+            selected_names = [name for name in selected_names if name not in SENSITIVE_TOOL_NAMES]
+        decision = state.get("last_decision")
+        has_ad_credentials = bool(os.getenv("CYBERQA_AD_DOMAIN") and
+                                  os.getenv("CYBERQA_AD_USERNAME") and
+                                  os.getenv("CYBERQA_AD_PASSWORD"))
+        allow_anonymous_nxc = bool(decision and decision.tool_parameters.get("allow_anonymous_nxc"))
+        if not has_ad_credentials and not allow_anonymous_nxc:
+            selected_names = [name for name in selected_names
+                              if name not in {"nxc_smb_recon", "nxc_ldap_recon"}]
+        allowed = self.tools.langchain_tools(selected_names, authorization=authorization)
         model = self.llm.bind_tools(allowed) if self.llm and allowed else None
         inner = StateGraph(ReactState)
 
@@ -216,6 +331,9 @@ class Agents:
                     "objective": state.get("objective"),
                     "target": state.get("last_decision").target if state.get("last_decision") else "environment",
                     "evidence": [e.model_dump(mode="json") for e in state.get("evidence", [])[-20:]],
+                    "evidence_synthesis": state.get("evidence_synthesis", {}),
+                    "target_profiles": state.get("target_profiles", {}),
+                    "runtime_config": state.get("runtime_config", {}),
                     "ad_knowledge": state.get("ad_knowledge", {}),
                     "capabilities": capability_catalog(),
                     "observed_signatures": list(state.get("observation_index", {}).keys())[-50:],
@@ -300,93 +418,55 @@ class Agents:
         return inner.compile()
 
     async def initial_recon(self, state: QAState) -> dict[str, Any]:
-        """Run the mandatory baseline reconnaissance before QA decisions."""
-        recon_tools = [
-            "inspect_os_version", "inspect_os_release", "inspect_interfaces", "inspect_routes", "inspect_dns_config",
-            "inspect_firewall", "inspect_open_ports", "inspect_acl", "inspect_local_users",
-            "inspect_domain_users", "inspect_privileges", "inspect_sudo", "inspect_suid_files", "inspect_range_config",
-            "check_port", "nxc_smb_recon", "nxc_ldap_recon", "impacket_rpc_recon", "bloodhound_recon",
+        """Run a bounded baseline, then let the supervisor synthesize it."""
+        baseline_tools = [
+            "inspect_os_version", "inspect_os_release", "inspect_interfaces", "inspect_routes",
+            "inspect_dns_config", "inspect_open_ports", "inspect_local_users", "inspect_privileges",
+            "check_dns_resolution", "check_port",
         ]
-        available = [name for name in recon_tools if name in self.tools.tools]
         target = state.get("target", "environment")
-        evidence = []
+        available = [name for name in baseline_tools if name in self.tools.tools]
+        evidence: list[Evidence] = []
         observation_index = dict(state.get("observation_index", {}))
-        proposal: dict[str, Any] = {"phase": "initial_recon", "tools": available}
-        if self.llm and available:
-            messages: list[Any] = []
-            observed_tools: set[str] = set()
+        proposal: dict[str, Any] = {
+            "phase": "initial_recon", "tools": available,
+            "deferred": ["ldap_bind", "nxc_smb_recon", "nxc_ldap_recon", "impacket_rpc_recon"],
+            "bounded": True,
+        }
+        for name in available:
             try:
-                async for update in self._react_graph(
-                    Role.VALIDATION, state,
-                    instruction=(
-                        "Perform the mandatory initial cyber-range baseline reconnaissance. Cover OS version, "
-                        "interfaces/IP/subnets/routes, inbound/outbound firewall, listening ports, ACLs, local "
-                        "and domain users, privileges, special files, range configuration, then use nxc, "
-                        "Impacket and BloodHound where applicable. Do not repeat cached observations."
-                    ), tool_names=available,
-                ).astream({"messages": self._conversation_context(state.get("messages", []))}, stream_mode="updates"):
-                    for patch in update.values() if isinstance(update, dict) else ():
-                        if isinstance(patch, dict):
-                            messages.extend(patch.get("messages", []))
-                            if patch.get("needs_human"):
-                                proposal["needs_human"] = True
-                                proposal["human_request"] = patch.get("human_request")
-                for message in messages:
-                    if isinstance(message, ToolMessage):
-                        payload = json.loads(message.content) if isinstance(message.content, str) else message.content
-                        if not isinstance(payload, dict):
-                            continue
-                        if payload.get("evidence"):
-                            from .models import Evidence
-                            observed = Evidence.model_validate(payload["evidence"])
-                            evidence.append(observed)
-                            observed_tools.add(str(payload.get("tool", message.name or "")))
-                            if payload.get("signature"):
-                                observation_index[payload["signature"]] = {
-                                    "tool": payload.get("tool", message.name), "target": observed.target,
-                                    "action": observed.action, "ok": payload.get("ok", True),
-                                    "cached": payload.get("cached", False), "exit_code": observed.exit_code,
-                                }
-                        elif payload.get("needs_human"):
-                            from .models import Evidence
-                            observed_tools.add(str(payload.get("tool", message.name or "")))
-                            evidence.append(Evidence(source=f"tool:{payload.get('tool', message.name)}",
-                                                     action="initial_recon", target=target, exit_code=-1,
-                                                     stderr=str(payload.get("error", "tool failure")),
-                                                     facts=payload))
+                result = await self.tools.observe(name, target, "initial_recon")
+                if result.get("evidence"):
+                    observed = Evidence.model_validate(result["evidence"])
+                    evidence.append(observed)
+                elif not result.get("ok", False):
+                    evidence.append(Evidence(source=f"tool:{name}", action="initial_recon", target=target,
+                                             exit_code=-1, stderr=str(result.get("error", "tool failure")),
+                                             facts={"ok": False, "tool_result": result}))
+                if result.get("signature"):
+                    observation_index[result["signature"]] = {
+                        "tool": name, "target": target,
+                        "action": "initial_recon", "ok": result.get("ok", False),
+                        "cached": result.get("cached", False),
+                    }
             except Exception as exc:
-                proposal["error"] = str(exc)
-                from .models import Evidence
-                evidence.append(Evidence(source="agent:initial_recon", action="initial_recon", target=target,
-                                         exit_code=-1, stderr=str(exc), facts={"agent_error": True}))
-            # Baseline coverage is a QA invariant. The LLM controls ordering
-            # and interpretation, but an incomplete plan cannot silently
-            # produce a complete-looking environment report.
-            for name in available:
-                if name in observed_tools:
-                    continue
-                try:
-                    evidence.append(await self.tools.get(name).observe(target, "initial_recon"))
-                except Exception as exc:
-                    from .models import Evidence
-                    evidence.append(Evidence(source=f"tool:{name}", action="initial_recon", target=target,
-                                             exit_code=-1, stderr=str(exc), facts={"ok": False, "coverage_fallback": True}))
-        else:
-            for name in available:
-                try:
-                    evidence.append(await self.tools.get(name).observe(target, "initial_recon"))
-                except Exception as exc:
-                    from .models import Evidence
-                    evidence.append(Evidence(source=f"tool:{name}", action="initial_recon", target=target,
-                                             exit_code=-1, stderr=str(exc), facts={"ok": False}))
+                evidence.append(Evidence(source=f"tool:{name}", action="initial_recon", target=target,
+                                         exit_code=-1, stderr=str(exc), facts={"ok": False}))
+        proposal["summary_ready"] = True
         event = Event(type="INITIAL_RECON_COMPLETE", run_id=state["run_id"], emitted_by=Role.VALIDATION,
                       target=target, evidence_ids=[item.id for item in evidence], payload=proposal)
         try:
             await self.events.publish(event)
         except Exception:
             pass
+        projection = self._project_observations(state, evidence)
+        discovered = set(state.get("discovered_targets", []))
+        for item in evidence:
+            discovered.add(item.target)
+            discovered.update(item.facts.get("discovered_targets", []))
         return {"evidence": evidence, "events": [event], "baseline_complete": True,
-                "observation_index": observation_index,
+                "observation_index": observation_index, "discovered_targets": sorted(discovered),
+                **projection,
                 "needs_human": bool(proposal.get("needs_human")),
                 "human_requests": [proposal["human_request"]] if proposal.get("human_request") else [],
                 "messages": [AIMessage(content=f"Initial reconnaissance collected {len(evidence)} evidence item(s). ")]}
@@ -399,7 +479,7 @@ class Agents:
                                 justification="Two consecutive specialist steps produced no new observations.")
             return {"iteration": iteration, "phase": "human_help", "last_decision": decision,
                     "pending_action": decision.model_dump(), "needs_human": True}
-        if iteration >= state.get("max_iterations", 20):
+        if iteration > state.get("max_iterations", 20):
             decision = Decision(next_agent="end", objective="stop", action="end", target="environment", justification="Iteration budget exhausted; human guidance is required to continue.")
             return {"iteration": iteration, "phase": "human_help", "last_decision": decision,
                     "pending_action": decision.model_dump(), "needs_human": True}
@@ -432,18 +512,31 @@ class Agents:
                             capability=result.capability, plan_id=result.plan_id,
                             prerequisites=result.prerequisites,
                             expected_evidence=result.expected_evidence,
-                            risk=result.risk, next_options=result.next_options)
+                            risk=result.risk, next_options=result.next_options,
+                            tool_parameters=result.tool_parameters)
         capability_check = self.broker.validate(
             decision, target,
             {item.get("signature") for item in state.get("capability_history", [])},
+            self._known_prerequisites(state),
         )
         decision.approval_required = decision.approval_required or capability_check.get("requires_approval", False)
         if capability_check.get("missing_prerequisites"):
-            decision.justification += (
-                " Missing capability prerequisites: "
-                + ", ".join(capability_check["missing_prerequisites"])
-                + ". Collect those facts before attempting this capability."
+            missing = ", ".join(capability_check["missing_prerequisites"])
+            decision = Decision(
+                next_agent=Role.VALIDATION, objective=decision.objective,
+                action="collect_prerequisites", target=target,
+                justification=f"Blocked capability {result.capability or result.action}; collect: {missing}",
+                expected_information_gain=decision.expected_information_gain,
+                expected_evidence=decision.expected_evidence,
             )
+            capability_check["blocked"] = True
+        elif capability_check.get("duplicate"):
+            decision = Decision(
+                next_agent=Role.DEBUGGING, objective=decision.objective,
+                action="choose_alternate_probe", target=target,
+                justification="The selected capability was already observed; choose a materially different probe.",
+            )
+            capability_check["blocked"] = True
         self.progress("supervisor_decision", agent=(decision.next_agent.value if isinstance(decision.next_agent, Role) else str(decision.next_agent)), action=decision.action,
                       target=decision.target)
         signature = f"{action}:{decision.target}"
@@ -458,7 +551,8 @@ class Agents:
         capability_history = capability_history + [{**capability_check, "iteration": iteration}]
         return {"iteration": iteration, "phase": decision.next_agent, "last_decision": decision,
                 "pending_action": {**decision.model_dump(), "broker": capability_check},
-                "action_history": history + [signature], "capability_history": capability_history}
+                "action_history": history + [signature], "capability_history": capability_history,
+                "approved_grant": None}
 
     async def human_help(self, state: QAState) -> dict[str, Any]:
         """Pause the outer workflow when the supervisor detects no progress."""
@@ -476,10 +570,13 @@ class Agents:
         # A human response is a deliberate change of direction.  Clear the
         # guard that caused this pause, otherwise the supervisor immediately
         # interrupts again before it can evaluate the guidance.
-        return {"needs_human": False, "no_progress_count": 0, "action_history": [],
+        patch = {"needs_human": False, "no_progress_count": 0, "action_history": [],
                 "messages": [HumanMessage(content=f"Human guidance for supervisor: {answer}")],
                 "errors": [] if guidance != "abort" else ["Human aborted after no progress"],
                 "aborted": guidance == "abort"}
+        if not patch["aborted"] and state.get("iteration", 0) >= state.get("max_iterations", 20):
+            patch["max_iterations"] = state.get("iteration", 0) + 5
+        return patch
 
     async def specialist(self, role: Role, state: QAState) -> dict[str, Any]:
         decision = state.get("last_decision")
@@ -557,7 +654,17 @@ class Agents:
             # Offline mode remains deterministic, but uses the same allow-listed adapter boundary.
             tool_name = role.value if role.value in self.tools.tools else next(iter(self.tools.tools))
             try:
-                evidence.append(await self.tools.get(tool_name).observe(target, action))
+                result = await self.tools.observe(tool_name, target, action)
+                if result.get("evidence"):
+                    evidence.append(Evidence.model_validate(result["evidence"]))
+                elif not result.get("ok", False):
+                    evidence.append(Evidence(source=f"tool:{tool_name}", action=action, target=target,
+                                             exit_code=-1, stderr=str(result.get("error", "tool failure")),
+                                             facts={"ok": False, "tool_result": result}))
+                    proposal = {"tool": tool_name, "offline": True, "error": result.get("error"),
+                                "needs_human": True}
+                    new_observation = True
+                    raise RuntimeError(str(result.get("error", "tool failure")))
             except Exception as exc:
                 self.progress("tool_result", tool=tool_name, exit_code=-1, stderr=str(exc), stdout="")
                 proposal = {"tool": tool_name, "offline": True, "error": str(exc), "needs_human": True}
@@ -596,6 +703,7 @@ class Agents:
             if facts.get("domain_name"):
                 ad_knowledge["domain"] = facts["domain_name"]
             ad_knowledge["coverage"][observed.target] = recon_coverage[observed.target]
+        projection = self._project_observations(state, evidence)
         patch: dict[str, Any] = {
             "evidence": evidence,
             "events": [event],
@@ -608,7 +716,8 @@ class Agents:
             "discovered_targets": sorted(discovered_targets),
             "recon_coverage": recon_coverage,
             "ad_knowledge": ad_knowledge,
-            "needs_human": inner_needs_human,
+            **projection,
+            "needs_human": inner_needs_human or bool(proposal.get("needs_human")),
             "human_requests": [inner_human_request] if inner_human_request else [],
         }
         if role == Role.DEBUGGING and action == "generate_hypotheses":
@@ -619,17 +728,28 @@ class Agents:
 
     async def approval(self, state: QAState) -> dict[str, Any]:
         decision = state["last_decision"]
+        fingerprint = decision_fingerprint(decision)
         request = self.policy.request(decision.action, decision.target, decision.justification,
                                       [e.id for e in state.get("evidence", [])[-10:]])
-        event = Event(type="APPROVAL_REQUIRED", run_id=state["run_id"], emitted_by=Role.SUPERVISOR,
+        from uuid import NAMESPACE_URL, uuid5
+        request.id = str(uuid5(NAMESPACE_URL, f"{state['run_id']}:{fingerprint}"))
+        answer = interrupt({"kind": "approval", "request": request.model_dump(mode="json"),
+                            "question": "Approve this action? Reply approve or reject."})
+        request.status = "approved" if str(answer).strip().lower() in {"approve", "approved", "yes"} else "rejected"
+        event = Event(type="APPROVAL_DECIDED", run_id=state["run_id"], emitted_by=Role.SUPERVISOR,
                       target=decision.target, payload=request.model_dump())
         try:
             await self.events.publish(event)
         except Exception as exc:
             self.progress("event_error", event_type=event.type, error=str(exc))
-        answer = interrupt({"kind": "approval", "request": request.model_dump(mode="json"),
-                            "question": "Approve this action? Reply approve or reject."})
-        request.status = "approved" if str(answer).lower() in {"approve", "approved", "yes"} else "rejected"
+        approved_decision = decision.model_copy(update={"approval_required": False})
+        grant = {
+            "decision_fingerprint": fingerprint,
+            "allowed_tools": get_capability(decision.capability).allowed_tools if get_capability(decision.capability) else [],
+            "tool_parameters": decision.tool_parameters,
+        } if request.status == "approved" else None
         return {"approvals": [request], "events": [event], "pending_action": None,
+                "last_decision": approved_decision if request.status == "approved" else decision,
+                "approved_grant": grant,
                 "messages": [HumanMessage(content=f"Human approval result: {request.status}" )],
                 "aborted": request.status == "rejected"}

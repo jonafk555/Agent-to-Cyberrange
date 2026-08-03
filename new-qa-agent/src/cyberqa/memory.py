@@ -2,28 +2,71 @@ from __future__ import annotations
 
 import json
 import hashlib
+import os
+import sqlite3
+import time
+from pathlib import Path
 from typing import Any
 
 from .models import Evidence, Host
 
 
 class ObservationStore:
-    """Deduplicates tool observations for the lifetime of a run process."""
+    """Durable observation cache keyed by the effective command identity."""
 
-    def __init__(self):
-        self.records: dict[str, dict[str, Any]] = {}
+    def __init__(self, path: str | None = None, ttl_seconds: int | None = None):
+        configured_path = path or os.getenv(
+            "CYBERQA_OBSERVATION_DB", ".cyberqa/observations.sqlite3"
+        )
+        self.path = configured_path
+        self.ttl_seconds = (
+            int(os.getenv("CYBERQA_OBSERVATION_TTL_SECONDS", "0"))
+            if ttl_seconds is None else ttl_seconds
+        )
+        if configured_path != ":memory:":
+            Path(configured_path).expanduser().parent.mkdir(parents=True, exist_ok=True)
+        self.connection = sqlite3.connect(
+            str(Path(configured_path).expanduser()) if configured_path != ":memory:" else configured_path,
+            timeout=10,
+        )
+        self.connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS observations (
+                signature TEXT PRIMARY KEY,
+                payload TEXT NOT NULL,
+                stored_at REAL NOT NULL
+            )
+            """
+        )
+        self.connection.commit()
 
     @staticmethod
-    def signature(tool: str, target: str, action: str, parameters: dict[str, Any] | None = None) -> str:
+    def signature(tool: str, target: str, action: str, parameters: Any = None) -> str:
         payload = json.dumps({"tool": tool, "target": target, "action": action,
                               "parameters": parameters or {}}, sort_keys=True, default=str)
         return hashlib.sha256(payload.encode()).hexdigest()[:20]
 
     def get(self, signature: str) -> dict[str, Any] | None:
-        return self.records.get(signature)
+        row = self.connection.execute(
+            "SELECT payload, stored_at FROM observations WHERE signature = ?", (signature,)
+        ).fetchone()
+        if not row:
+            return None
+        if self.ttl_seconds > 0 and time.time() - float(row[1]) > self.ttl_seconds:
+            self.connection.execute("DELETE FROM observations WHERE signature = ?", (signature,))
+            self.connection.commit()
+            return None
+        return json.loads(row[0])
 
     def put(self, signature: str, result: dict[str, Any]) -> None:
-        self.records[signature] = result
+        self.connection.execute(
+            "INSERT OR REPLACE INTO observations(signature, payload, stored_at) VALUES (?, ?, ?)",
+            (signature, json.dumps(result, ensure_ascii=False, default=str), time.time()),
+        )
+        self.connection.commit()
+
+    def close(self) -> None:
+        self.connection.close()
 
 
 class RedisMemory:

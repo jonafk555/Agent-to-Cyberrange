@@ -101,19 +101,7 @@ class KaliTool:
             )
         if not self.requires_target:
             target = "local-kali"
-        executable = self._resolve_executable()
-        argv = [executable, *self.fixed_args]
-        if self.target_arg:
-            target_arg = f"{self.target_prefix}{target}"
-            if self.target_index is None:
-                argv.append(target_arg)
-            else:
-                if not 0 <= self.target_index <= len(self.fixed_args):
-                    raise ValueError(f"target_index is out of range for {self.name}")
-                argv.insert(1 + self.target_index, target_arg)
-        argv.extend(self.tail_args)
-        if kwargs.get("args"):
-            raise ValueError("This fixed Kali adapter does not accept arbitrary command arguments")
+        argv = self.build_argv(target, kwargs)
         safe_argv = self._redact_argv(argv)
         if self.on_event:
             self.on_event("tool_start", {"tool": self.name, "argv": safe_argv})
@@ -152,6 +140,70 @@ class KaliTool:
                     self.on_event("target_discovered", {"target": discovered,
                                                          "allowed_targets": policy.snapshot()})
         return evidence
+
+    def build_argv(self, target: str, parameters: dict[str, Any] | None = None) -> list[str]:
+        """Build the reviewed argv used both for execution and cache identity."""
+        parameters = parameters or {}
+        supported = {"profile"} if self.name in {"check_port", "nxc_smb_recon", "nxc_ldap_recon"} else set()
+        unknown = set(parameters) - supported
+        if unknown:
+            raise ValueError(
+                f"Unsupported parameters for {self.name}: {', '.join(sorted(unknown))}"
+            )
+        executable = self._resolve_executable()
+        fixed_args = self.fixed_args
+        if self.name == "check_port":
+            profiles = {
+                "default": ("-sC", "-sV"),
+                "top100": ("-Pn", "-T3", "--top-ports", "100"),
+                "top1000": ("-Pn", "-T3", "--top-ports", "1000"),
+                "ad_tcp": ("-Pn", "-T3", "-sV", "-p",
+                           "53,80,88,135,139,389,443,445,464,593,636,3268,3269,3389,5985,5986,9389"),
+            }
+            profile = str(parameters.get("profile", "default"))
+            if profile not in profiles:
+                raise ValueError(f"Unsupported check_port profile: {profile}")
+            fixed_args = profiles[profile]
+        elif self.name in {"nxc_smb_recon", "nxc_ldap_recon"}:
+            module = "smb" if self.name == "nxc_smb_recon" else "ldap"
+            profiles = {
+                "shares": ("--shares",),
+                "users": ("--users",),
+                "groups": ("--groups",),
+                "sessions": ("--sessions",),
+                "pass-pol": ("--pass-pol",),
+                "enum": ("--shares", "--sessions"),
+            }
+            default_profile = "shares" if module == "smb" else "users"
+            profile = str(parameters.get("profile", default_profile))
+            if profile not in profiles:
+                raise ValueError(f"Unsupported {self.name} profile: {profile}")
+            credentials = []
+            username = os.getenv("CYBERQA_AD_USERNAME", "")
+            password = os.getenv("CYBERQA_AD_PASSWORD", "")
+            if username and password:
+                credentials = ["-u", username, "-p", password]
+            fixed_args = (module, *profiles[profile], *credentials)
+            self_target_index = 1
+            argv = [executable, *fixed_args]
+            argv.insert(self_target_index + 1, f"{self.target_prefix}{target}")
+            argv.extend(self.tail_args)
+            return argv
+        argv = [executable, *fixed_args]
+        if self.target_arg:
+            target_arg = f"{self.target_prefix}{target}"
+            if self.target_index is None:
+                argv.append(target_arg)
+            else:
+                if not 0 <= self.target_index <= len(fixed_args):
+                    raise ValueError(f"target_index is out of range for {self.name}")
+                argv.insert(1 + self.target_index, target_arg)
+        argv.extend(self.tail_args)
+        return argv
+
+    def command_identity(self, target: str, parameters: dict[str, Any]) -> dict[str, Any]:
+        effective_target = "local-kali" if not self.requires_target else target
+        return {"argv": self._redact_argv(self.build_argv(effective_target, parameters))}
 
     def _resolve_executable(self) -> str:
         candidates = (self.executable, *self.executable_candidates)
@@ -227,10 +279,86 @@ class ToolRegistry:
         # For fixed adapters the LLM's prose action is not a new command.
         # This prevents the same nmap probe being rerun under a new action
         # description.
-        signature_action = "fixed-command" if isinstance(adapter, KaliTool) else action
-        return self.observations.signature(name, target, signature_action, parameters)
+        signature_action = "effective-command" if hasattr(adapter, "command_identity") else action
+        identity = (
+            adapter.command_identity(target, parameters)  # type: ignore[attr-defined]
+            if hasattr(adapter, "command_identity") else parameters
+        )
+        return self.observations.signature(name, target, signature_action, identity)
 
-    def langchain_tools(self, names: list[str] | tuple[str, ...] | None = None) -> list[BaseTool]:
+    async def observe(self, name: str, target: str, action: str,
+                      parameters: dict[str, Any] | None = None,
+                      force_refresh: bool = False,
+                      authorization: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Execute one probe through the same durable cache used by ToolNode."""
+        parameters = parameters or {}
+        adapter = self.get(name)
+        if name in SENSITIVE_TOOL_NAMES:
+            allowed = (authorization or {}).get("allowed_tools", [])
+            expected = (authorization or {}).get("tool_parameters", {})
+            if name not in allowed or parameters != expected:
+                return {
+                    "ok": False, "tool": name,
+                    "error": "Sensitive tool requires an exact approved capability and parameters",
+                    "error_kind": "approval_required", "needs_human": True,
+                }
+        try:
+            signature = self._signature(adapter, name, target, action, parameters)
+        except Exception as exc:
+            # Invalid reviewed parameters are still durable diagnostic
+            # evidence; they must not escape ToolNode as an uncaught graph
+            # exception or be retried forever.
+            signature = self.observations.signature(
+                name, target, "invalid-command", {"parameters": parameters, "error": str(exc)}
+            )
+            result = {"ok": False, "tool": name, "error": str(exc),
+                      "error_kind": "invalid_arguments", "needs_human": True}
+            self.observations.put(signature, result)
+            return {**result, "signature": signature, "cached": False}
+        cached = None if force_refresh else self.observations.get(signature)
+        if cached is not None:
+            if isinstance(adapter, KaliTool) and adapter.on_event:
+                adapter.on_event("tool_cached", {"tool": name, "target": target,
+                                                  "signature": signature})
+            return self._cache_hit(cached, signature, action)
+        lock = self._observation_locks.setdefault(signature, asyncio.Lock())
+        async with lock:
+            cached = None if force_refresh else self.observations.get(signature)
+            if cached is not None:
+                return self._cache_hit(cached, signature, action)
+            try:
+                evidence = await adapter.observe(target, action, **parameters)
+                evidence_data = evidence.model_dump(mode="json")
+                if evidence.exit_code not in (None, 0):
+                    result = {
+                        "ok": False, "tool": name,
+                        "error": _tool_error_message(evidence),
+                        "error_kind": _tool_error_kind(evidence),
+                        "needs_human": True, "evidence": evidence_data,
+                    }
+                else:
+                    result = {"ok": True, "tool": name, "evidence": evidence_data}
+            except Exception as exc:
+                result = {"ok": False, "tool": name, "error": str(exc),
+                          "error_kind": type(exc).__name__, "needs_human": True}
+            self.observations.put(signature, result)
+            return {**result, "signature": signature, "cached": False}
+
+    @staticmethod
+    def _cache_hit(cached: dict[str, Any], signature: str, action: str) -> dict[str, Any]:
+        result = {**cached, "signature": signature, "cached": True}
+        if isinstance(cached.get("evidence"), dict):
+            evidence = dict(cached["evidence"])
+            facts = dict(evidence.get("facts") or {})
+            facts["cache_hit"] = True
+            facts["original_action"] = evidence.get("action")
+            evidence["action"] = action
+            evidence["facts"] = facts
+            result["evidence"] = evidence
+        return result
+
+    def langchain_tools(self, names: list[str] | tuple[str, ...] | None = None,
+                        authorization: dict[str, Any] | None = None) -> list[BaseTool]:
         """Expose allow-listed fact tools to a ReAct agent.
 
         The wrapper deliberately returns facts only.  It also converts adapter
@@ -247,41 +375,10 @@ class ToolRegistry:
             def make_probe(bound_adapter: FactTool, bound_name: str) -> BaseTool:
                 @tool(f"{bound_name}_probe")
                 async def probe(target: str, action: str,
-                                parameters: dict[str, Any] | None = None) -> dict[str, Any]:
+                                parameters: dict[str, Any] | None = None,
+                                force_refresh: bool = False) -> dict[str, Any]:
                     """Run one authorized, fact-only probe against the cyber-range target."""
-                    parameters = parameters or {}
-                    signature = self._signature(bound_adapter, bound_name, target, action, parameters)
-                    cached = self.observations.get(signature)
-                    if cached is not None:
-                        return {**cached, "signature": signature, "cached": True}
-                    lock = self._observation_locks.setdefault(signature, asyncio.Lock())
-                    async with lock:
-                        # Re-check after waiting: another concurrent caller
-                        # may have completed this exact probe.
-                        cached = self.observations.get(signature)
-                        if cached is not None:
-                            return {**cached, "signature": signature, "cached": True}
-                        try:
-                            evidence = await bound_adapter.observe(target, action, **(parameters or {}))
-                            evidence_data = evidence.model_dump(mode="json")
-                            if evidence.exit_code not in (None, 0):
-                                result = {
-                                    "ok": False, "tool": bound_name,
-                                    "error": _tool_error_message(evidence),
-                                    "error_kind": _tool_error_kind(evidence),
-                                    "needs_human": True, "evidence": evidence_data,
-                                }
-                            else:
-                                result = {"ok": True, "tool": bound_name,
-                                          "evidence": evidence_data}
-                        except Exception as exc:  # surfaced to ReAct; never silently treated as evidence
-                            result = {"ok": False, "tool": bound_name,
-                                      "error": str(exc), "error_kind": type(exc).__name__,
-                                      "needs_human": True}
-                        # Cache failures too. Retrying the same broken command
-                        # is not debugging and can create noisy/infinite loops.
-                        self.observations.put(signature, result)
-                        return {**result, "signature": signature, "cached": False}
+                    return await self.observe(bound_name, target, action, parameters, force_refresh, authorization)
 
                 return probe
 
@@ -308,20 +405,19 @@ def _tool_error_message(evidence: Evidence) -> str:
     return f"exit={evidence.exit_code}; argv={argv}; {detail[-2000:]}"
 
 
+SENSITIVE_TOOL_NAMES = frozenset({
+    "ad_asrep_roasting", "ad_kerberoasting", "ad_credential_validation",
+    "ad_password_spray", "ad_bloodhound_collection", "bloodhound_recon",
+})
+
+
 def build_kali_registry(on_event: Callable[[str, dict[str, Any]], None] | None = None,
                         allowed_targets: list[str] | tuple[str, ...] | None = None) -> ToolRegistry:
     """Create the standard fixed-command Kali tool set for ReAct agents."""
     policy = TargetPolicy(allowed_targets)
     registry = ToolRegistry(target_policy=policy)
-    bloodhound_args = (
-        "-c", os.getenv("CYBERQA_AD_COLLECTION", "DCOnly"),
-        "-d", os.getenv("CYBERQA_AD_DOMAIN", ""),
-        "-u", os.getenv("CYBERQA_AD_USERNAME", ""),
-        "-p", os.getenv("CYBERQA_AD_PASSWORD", ""),
-        "-ns",
-    )
     specs = [
-        KaliTool("check_port", "nmap", ("-Pn", "-T3", "--top-ports", "100"), on_event=on_event, target_policy=policy),
+        KaliTool("check_port", "nmap", (), on_event=on_event, target_policy=policy),
         KaliTool("check_dns_resolution", "dig", ("+short",), on_event=on_event, target_policy=policy),
         KaliTool("http_health_check", "curl", ("--fail", "--silent", "--show-error", "--max-time", "15"), target_prefix="http://", on_event=on_event, target_policy=policy),
         KaliTool("ldap_bind", "ldapsearch", ("-x", "-H"), tail_args=("-s", "base", "-b", ""), target_prefix="ldap://", on_event=on_event, target_policy=policy),
@@ -330,18 +426,12 @@ def build_kali_registry(on_event: Callable[[str, dict[str, Any]], None] | None =
         # smbclient parse the option stream as a service/password command.
         KaliTool("smb_negotiate", "smbclient", ("-L", "-N"), target_prefix="//",
                  target_index=1, on_event=on_event, target_policy=policy),
-        # NetExec expects the target immediately after the protocol module:
-        # ``nxc smb TARGET --shares ...``.  Keeping the insertion point in the
-        # fixed adapter prevents the generic argv builder from producing the
-        # invalid ``nxc smb --shares ... TARGET`` form.
-        KaliTool("nxc_smb_recon", "nxc", ("smb", "--shares", "-u", "", "-p", ""), target_index=1, on_event=on_event, target_policy=policy),
-        KaliTool("nxc_ldap_recon", "nxc", ("ldap", "-u", "", "-p", ""), target_index=1, on_event=on_event, target_policy=policy),
+        # NetExec expects the target immediately after the protocol module;
+        # build_argv selects a reviewed profile and inserts it accordingly.
+        KaliTool("nxc_smb_recon", "nxc", (), target_index=1, on_event=on_event, target_policy=policy),
+        KaliTool("nxc_ldap_recon", "nxc", (), target_index=1, on_event=on_event, target_policy=policy),
         KaliTool("impacket_rpc_recon", "impacket-rpcdump", fixed_args=(),
                  executable_candidates=("rpcdump.py", "rpcdump"),
-                 on_event=on_event, target_policy=policy),
-        KaliTool("bloodhound_recon", "bloodhound-python", fixed_args=bloodhound_args,
-                 target_index=len(bloodhound_args),
-                 required_env=("CYBERQA_AD_DOMAIN", "CYBERQA_AD_USERNAME", "CYBERQA_AD_PASSWORD"),
                  on_event=on_event, target_policy=policy),
         KaliTool("inspect_routes", "ip", ("route",), target_arg=False, requires_target=False, on_event=on_event, target_policy=policy),
         KaliTool("inspect_dns_config", "cat", ("/etc/resolv.conf",), target_arg=False, requires_target=False, on_event=on_event, target_policy=policy),

@@ -121,6 +121,7 @@ class Decision(BaseModel):
     expected_evidence: list[str] = Field(default_factory=list)
     risk: ADRisk = ADRisk.READ_ONLY
     next_options: list[str] = Field(default_factory=list)
+    tool_parameters: dict[str, Any] = Field(default_factory=dict)
 
 
 class CapabilitySpec(BaseModel):
@@ -136,6 +137,10 @@ class CapabilitySpec(BaseModel):
 
 class ADKnowledge(BaseModel):
     domain: str | None = None
+    domains: list[str] = Field(default_factory=list)
+    forests: list[str] = Field(default_factory=list)
+    target_domains: dict[str, str] = Field(default_factory=dict)
+    cross_forest_targets: list[str] = Field(default_factory=list)
     hosts: list[str] = Field(default_factory=list)
     users: list[str] = Field(default_factory=list)
     spns: list[str] = Field(default_factory=list)

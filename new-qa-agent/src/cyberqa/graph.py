@@ -18,7 +18,7 @@ def route(state: QAState) -> str:
         return END
     if decision.approval_required:
         return "approval"
-    return decision.next_agent.value
+    return decision.next_agent.value if isinstance(decision.next_agent, Role) else decision.next_agent
 
 
 def entry_route(state: QAState) -> str:
@@ -27,6 +27,15 @@ def entry_route(state: QAState) -> str:
 
 def route_after_agent(state: QAState) -> str:
     return "human_help" if state.get("needs_human") else "supervisor"
+
+
+def route_after_approval(state: QAState) -> str:
+    if state.get("aborted"):
+        return END
+    decision = state.get("last_decision")
+    if not decision or not isinstance(decision.next_agent, Role):
+        return "human_help"
+    return decision.next_agent.value
 
 
 def build_graph(agents: Agents | None = None, checkpointer=None):
@@ -62,6 +71,10 @@ def build_graph(agents: Agents | None = None, checkpointer=None):
     graph.add_conditional_edges("supervisor", route, {"validation":"validation", "testing":"testing", "debugging":"debugging", "judge":"judge", "reporting":"reporting", "approval":"approval", "human_help":"human_help", END:END})
     for node in ("validation", "testing", "debugging", "judge", "reporting"):
         graph.add_conditional_edges(node, route_after_agent, {"human_help": "human_help", "supervisor": "supervisor"})
-    graph.add_edge("approval", "supervisor")
+    graph.add_conditional_edges(
+        "approval", route_after_approval,
+        {"validation": "validation", "testing": "testing", "debugging": "debugging",
+         "judge": "judge", "reporting": "reporting", "human_help": "human_help", END: END},
+    )
     graph.add_edge("human_help", "supervisor")
     return graph.compile(checkpointer=checkpointer or MemorySaver())
