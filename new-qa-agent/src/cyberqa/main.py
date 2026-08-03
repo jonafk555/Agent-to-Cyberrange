@@ -213,6 +213,7 @@ async def run(args: argparse.Namespace | None = None) -> None:
         initial = {"run_id": str(uuid4()), "scenario_id": scenario_id, "objective": objective,
                    "target": target, "iteration": 0, "max_iterations": args.max_iterations,
                    "hosts": {}, "evidence": [], "events": [], "approvals": [], "action_history": [],
+                   "method_history": [],
                    "completed_goals": [], "errors": [], "memory": {}, "human_requests": [],
                    "react_steps": 0, "needs_human": False, "aborted": False,
                    "baseline_complete": False, "approved_grant": None,

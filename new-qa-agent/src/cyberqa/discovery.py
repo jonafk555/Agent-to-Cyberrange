@@ -113,7 +113,10 @@ def synthesize_evidence(evidence_items: Iterable[Evidence], target_profiles: dic
     all_users = sorted({str(user) for item in items
                         for user in (item.facts.get("users", []) if isinstance(item.facts, dict) else [])})
     has_domain = bool(target_profiles and any(profile.get("domain") for profile in target_profiles.values()))
-    has_credential = bool(os.getenv("CYBERQA_AD_USERNAME") and os.getenv("CYBERQA_AD_PASSWORD"))
+    has_credential = bool(os.getenv("CYBERQA_AD_USERNAME") and os.getenv("CYBERQA_AD_PASSWORD")) or any(
+        bool(item.facts.get("credentials_validated"))
+        for item in items if isinstance(item.facts, dict)
+    )
     anonymous_attempted = any(
         ("ldap" in item.source.lower() or "nxc" in item.source.lower())
         and item.exit_code not in (None, 0) for item in items

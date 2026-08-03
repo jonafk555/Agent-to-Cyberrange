@@ -11,13 +11,14 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.prebuilt import ToolNode
 from langgraph.types import interrupt
 
-from .approval import ApprovalPolicy, decision_fingerprint
+from .approval import ApprovalPolicy, approved_tools_for_decision, decision_fingerprint
 from .ad_playbooks import capability_catalog, get_capability
+from .ad_strategy import recommend as recommend_ad_method
 from .discovery import (apply_and_persist_runtime_config, build_target_profiles,
                          derive_runtime_config, synthesize_evidence)
 from .events import EventBus
 from .execution_broker import CapabilityBroker
-from .models import (Decision, Event, Evidence, Hypothesis, Role, Scorecard, Service,
+from .models import (ADRisk, Decision, Event, Evidence, Hypothesis, Role, Scorecard, Service,
                       ServiceProtocol, ToolParameters)
 from .state import QAState
 from .tools import ToolRegistry
@@ -78,7 +79,8 @@ class Agents:
         previous_facts = [item.facts for item in state.get("evidence", [])
                           if isinstance(item.facts, dict)]
         for key in ("discovered_targets", "open_ports", "users", "spns", "asrep_candidates",
-                    "groups", "acl_edges", "delegation", "adcs_findings", "trusts"):
+                    "credentials_validated", "ticket_obtained_or_blocked", "groups", "acl_edges",
+                    "delegation", "adcs_findings", "trusts"):
             current = {json.dumps(value, sort_keys=True, default=str)
                        for value in facts.get(key, [])}
             known = {json.dumps(value, sort_keys=True, default=str)
@@ -180,7 +182,7 @@ class Agents:
         if runtime:
             apply_and_persist_runtime_config(runtime)
         knowledge = dict(old_knowledge)
-        for field in ("users", "spns", "asrep_candidates", "groups", "acl_edges",
+        for field in ("users", "spns", "asrep_candidates", "credentials_validated", "groups", "acl_edges",
                       "delegation", "adcs_findings", "trusts"):
             values = set(knowledge.get(field, []))
             for item in all_evidence:
@@ -230,6 +232,7 @@ class Agents:
             known.add("candidate username source")
         if knowledge.get("credentials_validated"):
             known.add("validated domain credential")
+            known.add("authorized identity or approved anonymous path")
         evidence = state.get("evidence", [])
         for item in evidence:
             facts = item.facts if isinstance(item.facts, dict) else {}
@@ -246,105 +249,6 @@ class Agents:
         if os.getenv("CYBERQA_AD_USERNAME") and os.getenv("CYBERQA_AD_PASSWORD"):
             known.add("human_supplied_or_range_issued_credential")
         return known
-
-    @staticmethod
-    def _prioritize_uncredentialed_asrep(state: QAState, decision: Decision) -> Decision:
-        """Make the AD unauthenticated branch explicit when its inputs exist."""
-        knowledge = state.get("ad_knowledge", {}) or {}
-        if hasattr(knowledge, "model_dump"):
-            knowledge = knowledge.model_dump()
-        has_credentials = bool(
-            os.getenv("CYBERQA_AD_DOMAIN") and os.getenv("CYBERQA_AD_USERNAME")
-            and os.getenv("CYBERQA_AD_PASSWORD")
-        ) or bool(knowledge.get("credentials_validated"))
-        candidates = list(knowledge.get("users", []))
-        parameters = decision.tool_parameters.model_dump(mode="json", exclude_none=True)
-        users_file = parameters.get("users_file") or os.getenv("CYBERQA_AD_USERS_FILE", "")
-        if not candidates and not users_file:
-            candidates = list(parameters.get("users", []))
-        domain = knowledge.get("domain") or os.getenv("CYBERQA_AD_DOMAIN", "")
-        if has_credentials or not domain or not (candidates or users_file):
-            return decision
-        attempted = any(
-            item.get("capability") == "asrep_roasting_assessment"
-            for item in state.get("capability_history", [])
-        ) or any(
-            "asrep" in item.source.lower() for item in state.get("evidence", [])
-        )
-        if attempted:
-            return decision
-        target = decision.target
-        for host, profile in state.get("target_profiles", {}).items():
-            if profile.get("domain") == domain and profile.get("connectivity") == "reachable":
-                target = host
-                break
-        parameters = {"users_file": users_file} if users_file else {"users": candidates[:500]}
-        return decision.model_copy(update={
-            "next_agent": Role.TESTING,
-            "capability": "asrep_roasting_assessment",
-            "action": "asrep_roasting_assessment",
-            "target": target,
-            "tool_parameters": ToolParameters.model_validate(parameters),
-            "justification": "No domain credential is available; use the known domain and candidate usernames for the authorized AS-REP assessment before authenticated paths.",
-        })
-
-    @staticmethod
-    def _asrep_source_blocked(state: QAState) -> bool:
-        """Detect the old no-credential LDAP/NXC dead-end and stop it."""
-        knowledge = state.get("ad_knowledge", {}) or {}
-        if hasattr(knowledge, "model_dump"):
-            knowledge = knowledge.model_dump()
-        has_credentials = bool(os.getenv("CYBERQA_AD_USERNAME") and os.getenv("CYBERQA_AD_PASSWORD"))
-        has_source = bool(knowledge.get("users") or os.getenv("CYBERQA_AD_USERS_FILE"))
-        if has_credentials or not (knowledge.get("domain") or os.getenv("CYBERQA_AD_DOMAIN")) or has_source:
-            return False
-        if os.getenv("CYBERQA_ALLOW_ANONYMOUS_NXC", "1") == "1":
-            return False
-        return any(
-            ("ldap" in item.source.lower() or "nxc" in item.source.lower())
-            and item.exit_code not in (None, 0)
-            for item in state.get("evidence", [])
-        )
-
-    @staticmethod
-    def _uncredentialed_identity_plan(state: QAState) -> Decision | None:
-        """Run the bounded anonymous identity branch before authenticated QA."""
-        knowledge = state.get("ad_knowledge", {}) or {}
-        if hasattr(knowledge, "model_dump"):
-            knowledge = knowledge.model_dump()
-        if os.getenv("CYBERQA_AD_USERNAME") and os.getenv("CYBERQA_AD_PASSWORD"):
-            return None
-        if not (knowledge.get("domain") or os.getenv("CYBERQA_AD_DOMAIN")):
-            return None
-        if knowledge.get("users") or os.getenv("CYBERQA_AD_USERS_FILE"):
-            return None
-        evidence = state.get("evidence", [])
-        sources = {item.source.lower() for item in evidence}
-        missing = []
-        if not any("ldap_bind" in source or "ldapsearch" in source for source in sources):
-            missing.append("anonymous LDAP")
-        if not any("smb_negotiate" in source for source in sources):
-            missing.append("anonymous SMB")
-        if not any("nxc_ldap" in source for source in sources):
-            missing.append("anonymous LDAP user enumeration")
-        if missing:
-            return Decision(
-                next_agent=Role.VALIDATION, objective="establish unauthenticated AD context",
-                action="anonymous_identity_probe", target=state.get("target", "environment"),
-                justification=(
-                    "No domain credential is available. Probe the missing anonymous paths: "
-                    + ", ".join(missing) + ". Use the combined result to decide whether AS-REP is viable."
-                ),
-                tool_parameters=ToolParameters(allow_anonymous_nxc=True),
-            )
-        return Decision(
-            next_agent="end", objective="human_help", action="provide_asrep_username_source",
-            target=state.get("target", "environment"),
-            justification=(
-                "Anonymous SMB/LDAP and LDAP user enumeration produced no candidate usernames. "
-                "AS-REP cannot invent account names; provide CYBERQA_AD_USERS_FILE or a range-issued username source."
-            ),
-        )
 
     async def _human_problem(self, state: QAState, kind: str, raw: str = "") -> str:
         """Create an operator-facing issue summary without exposing hidden reasoning."""
@@ -448,13 +352,14 @@ class Agents:
             "discovered_targets": state.get("discovered_targets", []),
             "recon_coverage": state.get("recon_coverage", {}),
             "no_progress_count": state.get("no_progress_count", 0),
+            "method_history": state.get("method_history", [])[-30:],
             "tool_failures": failures,
             "ad_knowledge": state.get("ad_knowledge", {}),
             "target_profiles": state.get("target_profiles", {}),
             "runtime_config": state.get("runtime_config", {}),
             "approved_tool_parameters": state.get("last_decision").tool_parameters.model_dump(mode="json") if state.get("last_decision") else {},
             "capabilities": capability_catalog(),
-            "instruction": "Reason over the complete evidence synthesis, not only the last result. Advance one or more unresolved findings. Cover all discovered hosts/services and cross-forest candidates. Treat recon_coverage as authoritative: a completed semantic check is not a new task merely because the action wording changed. Never repeat an identical effective argv; a different reviewed argv/profile is allowed only when it has an explicit expected evidence gain. Treat LDAP authentication, DNS context, forest mismatch, permissions, and command syntax as different hypotheses. If domain credentials are absent and domain/DC plus a candidate username source are known, prioritize asrep_roasting_assessment immediately; AS-REP does not require a domain credential. Do not loop over empty-credential SMB/LDAP/NXC probes. If no username source exists, use only explicitly allowed anonymous enumeration or ask Human for CYBERQA_AD_USERS_FILE. For check_port choose a profile deliberately; for NXC choose shares/users/groups/sessions/pass-pol/enum deliberately. Return one primary decision plus useful next_options and exact tool_parameters, including users_file when supplied.",
+            "instruction": "Reason over the complete evidence synthesis, not only the last result. Advance one or more unresolved findings. Cover all discovered hosts/services and cross-forest candidates. Treat recon_coverage as authoritative: a completed semantic check is not a new task merely because the action wording changed. Never repeat an identical effective argv; a different reviewed argv/profile is allowed only when it has an explicit expected evidence gain. Treat LDAP authentication, DNS context, forest mismatch, permissions, and command syntax as different hypotheses. If domain credentials are absent and domain/DC plus a candidate username source are known, prioritize asrep_roasting_assessment immediately; AS-REP does not require a domain credential. Do not loop over empty-credential SMB/LDAP/NXC probes. If no username source exists, use only explicitly allowed anonymous enumeration or ask Human for CYBERQA_AD_USERS_FILE. For check_port choose a profile or safe argv deliberately; for NXC choose a profile or safe argv deliberately. Return one primary decision plus useful next_options and exact tool_parameters, including argv/users_file when supplied.",
         })
         self.progress("reasoning_start", agent=Role.SUPERVISOR.value)
         response = await model.ainvoke([
@@ -523,11 +428,20 @@ class Agents:
         # when no domain credential exists. The env flag still allows an
         # operator to disable or explicitly document that mode.
         allow_anonymous_nxc = bool(decision_parameters.get("allow_anonymous_nxc")) or os.getenv(
-            "CYBERQA_ALLOW_ANONYMOUS_NXC", "1"
+            "CYBERQA_ALLOW_ANONYMOUS_NXC", "0"
         ) == "1"
         if not has_ad_credentials and not allow_anonymous_nxc:
             selected_names = [name for name in selected_names
                               if name not in {"nxc_smb_recon", "nxc_ldap_recon"}]
+        if not has_ad_credentials and decision and decision.action not in {
+            "anonymous_identity_probe", "domain_inventory"
+        }:
+            # Anonymous LDAP/SMB is a bounded identity-discovery phase only;
+            # do not let a later testing/debugging prompt quietly turn it into
+            # repeated empty-credential reconnaissance.
+            selected_names = [name for name in selected_names
+                              if name not in {"ldap_bind", "smb_negotiate",
+                                              "nxc_smb_recon", "nxc_ldap_recon"}]
         ldap_bound = any(
             "ldap" in item.source.lower() and item.exit_code in (None, 0)
             and item.facts.get("ok", True) is not False
@@ -535,8 +449,20 @@ class Agents:
         )
         if not ldap_bound:
             selected_names = [name for name in selected_names if name != "ad_domain_users"]
+        # An analysis-only decision must never expose the generic recon tools.
+        # It exists to synthesize durable evidence after a completed probe; if
+        # it is allowed to bind tools, the model can fall back to nmap/SMB and
+        # recreate the reconnaissance loop this state is meant to prevent.
+        if decision and decision.action in {"analyze_existing_evidence", "summarize_evidence"}:
+            selected_names = []
         allowed = self.tools.langchain_tools(selected_names, authorization=authorization)
-        model = self.llm.bind_tools(allowed) if self.llm and allowed else None
+        analysis_only = decision and decision.action in {
+            "analyze_existing_evidence", "summarize_evidence", "evaluate_ad_evidence"
+        }
+        model = (
+            self.llm.bind_tools(allowed) if self.llm and allowed else
+            self.llm if self.llm and (analysis_only or role in {Role.JUDGE, Role.REPORTING}) else None
+        )
         inner = StateGraph(ReactState)
 
         async def reason(s: dict[str, Any]) -> dict[str, Any]:
@@ -685,8 +611,22 @@ class Agents:
         for item in evidence:
             discovered.add(item.target)
             discovered.update(item.facts.get("discovered_targets", []))
+        method_history = list(state.get("method_history", []))
+        for observed in evidence:
+            method_history.append({
+                "tool": observed.source,
+                "action": observed.action,
+                "target": observed.target,
+                "outcome": "success" if observed.exit_code in (None, 0) else "failed",
+                "exit_code": observed.exit_code,
+                "evidence_id": observed.id,
+                "argv": (observed.facts or {}).get("argv", []),
+                "error_kind": (observed.facts or {}).get("error_kind"),
+                "tool_result": (observed.facts or {}).get("tool_result"),
+            })
         return {"evidence": evidence, "events": [event], "baseline_complete": True,
                 "observation_index": observation_index, "discovered_targets": sorted(discovered),
+                "method_history": method_history[-200:],
                 **projection,
                 "needs_human": bool(proposal.get("needs_human")),
                 "human_requests": [proposal["human_request"]] if proposal.get("human_request") else [],
@@ -704,17 +644,6 @@ class Agents:
             decision = Decision(next_agent="end", objective="stop", action="end", target="environment", justification="Iteration budget exhausted; human guidance is required to continue.")
             return {"iteration": iteration, "phase": "human_help", "last_decision": decision,
                     "pending_action": decision.model_dump(), "needs_human": True}
-        if self._asrep_source_blocked(state):
-            decision = Decision(
-                next_agent="end", objective="human_help", action="provide_asrep_username_source",
-                target=state.get("target", "environment"),
-                justification=(
-                    "Domain is known but no domain credential or candidate username source is available. "
-                    "Provide CYBERQA_AD_USERS_FILE, supply usernames, or explicitly enable anonymous NXC/LDAP enumeration."
-                ),
-            )
-            return {"iteration": iteration, "phase": "human_help", "last_decision": decision,
-                    "pending_action": decision.model_dump(), "needs_human": True}
         try:
             result = await self._structured_supervisor(state)
         except Exception as exc:
@@ -723,8 +652,11 @@ class Agents:
             return {"iteration": iteration, "phase": "human_help", "last_decision": decision,
                     "pending_action": decision.model_dump(), "needs_human": True,
                     "errors": [str(exc)]}
-        identity_plan = self._uncredentialed_identity_plan(state)
-        result = identity_plan or self._prioritize_uncredentialed_asrep(state, result)
+        # Hard AD prerequisites outrank a free-form model proposal. The model
+        # still plans all transitions where the deterministic guard has no
+        # stronger conclusion, but it cannot select empty-credential loops or
+        # skip an available unauthenticated AS-REP branch.
+        result = recommend_ad_method(state) or result
         if result.next_agent == "end" and result.objective == "human_help":
             return {"iteration": iteration, "phase": "human_help", "last_decision": result,
                     "pending_action": result.model_dump(), "needs_human": True}
@@ -752,6 +684,18 @@ class Agents:
                             expected_evidence=result.expected_evidence,
                             risk=result.risk, next_options=result.next_options,
                             tool_parameters=result.tool_parameters)
+        # Planner output is allowed to vary in wording, but an AS-REP request
+        # must still resolve to the reviewed capability. Without this
+        # normalization an action like ``ad_asrep_roasting_probe`` could reach
+        # the tool layer with capability=None and receive an empty approval
+        # grant, which looks like "approved but did nothing" to the operator.
+        action_key = decision.action.lower().replace("-", "_")
+        if "asrep" in action_key or "as_rep" in action_key:
+            decision = decision.model_copy(update={
+                "capability": "asrep_roasting_assessment",
+                "risk": ADRisk.CREDENTIAL_MATERIAL,
+                "approval_required": True,
+            })
         capability_check = self.broker.validate(
             decision, target,
             {item.get("signature") for item in state.get("capability_history", [])},
@@ -779,23 +723,44 @@ class Agents:
                       target=decision.target)
         signature = json.dumps({
             "capability": decision.capability,
-            "action": action,
+            "action": decision.action,
             "target": decision.target,
             "tool_parameters": decision.tool_parameters.model_dump(mode="json", exclude_none=True),
         }, sort_keys=True)
         history = state.get("action_history", [])
-        if len(history) >= 3 and history[-3:] == [signature] * 3:
+        if history and history[-1] == signature:
             decision = Decision(next_agent="end", objective="stop", action="end", target=decision.target,
-                                justification="The same action produced no new information three times.")
+                                justification=(
+                                    "The same effective decision was already dispatched immediately before. "
+                                    "A changed target, credential/source, profile, or explicit operator instruction is required."
+                                ))
             return {"iteration": iteration, "phase": "human_help", "last_decision": decision,
                     "pending_action": decision.model_dump(), "action_history": history + [signature],
                     "needs_human": True}
         capability_history = state.get("capability_history", [])
         capability_history = capability_history + [{**capability_check, "iteration": iteration}]
+        reused_grant = None
+        if decision.approval_required:
+            fingerprint = decision_fingerprint(decision)
+            previously_approved = any(
+                getattr(item, "status", item.get("status") if isinstance(item, dict) else None) == "approved"
+                and getattr(item, "decision_fingerprint", item.get("decision_fingerprint") if isinstance(item, dict) else None) == fingerprint
+                for item in state.get("approvals", [])
+            )
+            if previously_approved:
+                reused_grant = {
+                    "decision_fingerprint": fingerprint,
+                    "target": decision.target,
+                    "action": decision.action,
+                    "capability": decision.capability,
+                    "allowed_tools": approved_tools_for_decision(decision),
+                    "tool_parameters": decision.tool_parameters.model_dump(mode="json", exclude_none=True),
+                }
+                decision = decision.model_copy(update={"approval_required": False})
         return {"iteration": iteration, "phase": decision.next_agent, "last_decision": decision,
                 "pending_action": {**decision.model_dump(), "broker": capability_check},
                 "action_history": history + [signature], "capability_history": capability_history,
-                "approved_grant": None}
+                "approved_grant": reused_grant}
 
     @staticmethod
     def _target_has_completed_recon(profile: Any) -> bool:
@@ -854,11 +819,18 @@ class Agents:
         problem = await self._human_problem(
             state, "no_progress", decision.justification if decision else "No supervisor decision"
         )
-        request = {"kind": "no_progress", "problem": problem,
-                   "question": "請用自然語言指定下一步：檢查哪個目標/服務、如何修正，或是否停止。",
-                   "options": ["validation", "testing", "debugging", "abort"],
-                   "reason": decision.justification if decision else "No supervisor decision",
-                   "evidence_summary": "; ".join(problem.splitlines()[-2:])}
+        request = dict((state.get("human_requests") or [])[-1] or {})
+        request.update({
+            "kind": request.get("kind", "no_progress"),
+            "problem": problem,
+            "question": request.get(
+                "question",
+                "請用自然語言指定下一步：檢查哪個目標/服務、如何修正，或是否停止。",
+            ),
+            "options": request.get("options", ["validation", "testing", "debugging", "abort"]),
+            "reason": decision.justification if decision else "No supervisor decision",
+            "evidence_summary": "; ".join(problem.splitlines()[-2:]),
+        })
         answer = interrupt(request)
         guidance = str(answer).lower()
         # A human response is a deliberate change of direction.  Clear the
@@ -872,6 +844,63 @@ class Agents:
             patch["max_iterations"] = state.get("iteration", 0) + 5
         return patch
 
+    @staticmethod
+    def _grant_for_decision(state: QAState, decision: Decision | None) -> dict[str, Any] | None:
+        """Hydrate grants from pre-fix checkpoints without widening scope.
+
+        Older checkpoints stored only the fingerprint, allowed tools, and
+        parameters. Adding the frozen target/action fields is safe because
+        they are taken from the current supervisor decision; parameters are
+        never replaced here. This lets an already-approved AS-REP action
+        continue after an upgrade instead of asking for approval again.
+        """
+        if not decision or not state.get("approved_grant"):
+            return None
+        grant = dict(state["approved_grant"])
+        grant.setdefault("target", decision.target)
+        grant.setdefault("action", decision.action)
+        grant.setdefault("capability", decision.capability)
+        if not grant.get("allowed_tools"):
+            grant["allowed_tools"] = approved_tools_for_decision(decision)
+        return grant
+
+    @staticmethod
+    def _planned_tool_for_action(decision: Decision | None) -> tuple[str, dict[str, Any]] | None:
+        """Map explicit probe actions to one reviewed adapter.
+
+        The model may still choose a higher-level capability, but once it
+        names a concrete probe the executor must run it even if the model
+        returns an empty tool-call list. This closes the "分析完成" no-op path.
+        """
+        if not decision:
+            return None
+        text = decision.action.lower().replace("-", "_")
+        params = decision.tool_parameters.model_dump(mode="json", exclude_none=True)
+        if "nmap" in text or "check_port" in text or "port_probe" in text:
+            return "check_port", {
+                key: params[key] for key in ("profile", "argv")
+                if params.get(key)
+            }
+        if "nxc" in text and "ldap" in text:
+            return "nxc_ldap_recon", {
+                "profile": params.get("profile", "users"),
+                "argv": params.get("argv", []),
+                "allow_anonymous_nxc": params.get("allow_anonymous_nxc", False),
+            }
+        if "nxc" in text or "smb_recon" in text:
+            return "nxc_smb_recon", {
+                "profile": params.get("profile", "shares"),
+                "argv": params.get("argv", []),
+                "allow_anonymous_nxc": params.get("allow_anonymous_nxc", False),
+            }
+        if "ldap_bind" in text or text in {"ldap", "ldap_probe"}:
+            return "ldap_bind", {}
+        if "smb_negotiate" in text or text in {"smb", "smb_probe"}:
+            return "smb_negotiate", {}
+        if "dns" in text and "resolution" in text:
+            return "check_dns_resolution", ({"name": params["name"]} if params.get("name") else {})
+        return None
+
     async def specialist(self, role: Role, state: QAState) -> dict[str, Any]:
         decision = state.get("last_decision")
         target, action = (decision.target, decision.action) if decision else ("environment", "observe")
@@ -880,7 +909,147 @@ class Agents:
         new_observation = False
         inner_needs_human = False
         inner_human_request: dict[str, Any] | None = None
-        if self.llm and self.tools.tools:
+        observation_index = dict(state.get("observation_index", {}))
+        decision_grant = self._grant_for_decision(state, decision)
+        # A selected capability is an executable workflow obligation, not a
+        # suggestion for the ReAct model.  In particular, AS-REP used to be
+        # selected in the log and then silently skipped when the model replied
+        # with an empty tool-call list. Execute the reviewed adapter once after
+        # approval, then let the model reason over its evidence.
+        capability_tool = None
+        if decision:
+            capability_name = (decision.capability or "").lower()
+            action_name = action.lower()
+            if "asrep" in capability_name or "as-rep" in action_name or "asrep" in action_name:
+                capability_tool = "ad_asrep_roasting"
+            else:
+                capability = get_capability(decision.capability)
+                if capability:
+                    capability_tool = next(
+                        (name for name in capability.allowed_tools
+                         if name.startswith("ad_") and name in self.tools.tools),
+                        None,
+                    )
+        planned_calls: list[tuple[str, dict[str, Any], dict[str, Any] | None]] = []
+        blocked_action = False
+        if capability_tool:
+            planned_calls.append((
+                capability_tool,
+                decision.tool_parameters.model_dump(mode="json", exclude_none=True),
+                decision_grant,
+            ))
+        elif action == "anonymous_identity_probe":
+            # This is a bounded phase, not a ReAct playground. Each anonymous
+            # identity source is attempted once; successful user discovery
+            # becomes the input to the subsequent AS-REP decision.
+            prior_sources = {str(item.source).lower() for item in state.get("evidence", [])}
+            identity_plan = (
+                ("ldap_bind", {}),
+                ("smb_negotiate", {}),
+                ("nxc_ldap_recon", {"profile": "users", "allow_anonymous_nxc": True}),
+            )
+            for name, parameters in identity_plan:
+                if any(name in source for source in prior_sources):
+                    continue
+                if name in self.tools.tools:
+                    planned_calls.append((name, parameters, None))
+        elif not capability_tool:
+            action_tool = self._planned_tool_for_action(decision)
+            if action_tool and action_tool[0] in self.tools.tools:
+                no_credentials = not bool(os.getenv("CYBERQA_AD_USERNAME") and os.getenv("CYBERQA_AD_PASSWORD"))
+                anonymous_tool = action_tool[0] in {"ldap_bind", "smb_negotiate",
+                                                    "nxc_smb_recon", "nxc_ldap_recon"}
+                if no_credentials and anonymous_tool and action not in {
+                    "anonymous_identity_probe", "domain_inventory"
+                }:
+                    blocked_action = True
+                    inner_needs_human = True
+                    proposal = {"action": action, "needs_human": True,
+                                "error": "Anonymous identity tools are restricted to the bounded identity phase"}
+                    inner_human_request = {
+                        "kind": "method_prerequisite", "agent": role.value, "target": target,
+                        "question": "目前沒有 domain credential；請提供 username source、指定 bounded identity phase，或停止。",
+                    }
+                else:
+                    planned_calls.append((action_tool[0], action_tool[1], decision_grant))
+        if planned_calls:
+            for planned_tool, parameters, authorization in planned_calls:
+                try:
+                    result = await self.tools.observe(
+                        planned_tool, target, action, parameters=parameters,
+                        authorization=authorization,
+                    )
+                    proposal = {"tool": planned_tool, "capability": decision.capability if decision else None,
+                                "result_ok": result.get("ok", False),
+                                "planned_phase": action}
+                    if result.get("evidence"):
+                        observed = Evidence.model_validate(result["evidence"])
+                        evidence.append(observed)
+                        new_observation = self._evidence_is_novel(
+                            state, observed, bool(result.get("cached", False))
+                        ) or new_observation
+                        if result.get("signature"):
+                            observation_index[result["signature"]] = {
+                                "tool": planned_tool, "target": observed.target,
+                                "action": observed.action, "ok": result.get("ok", False),
+                                "cached": result.get("cached", False),
+                                "exit_code": observed.exit_code,
+                            }
+                    if result.get("needs_human") and action == "anonymous_identity_probe":
+                        # Independent anonymous paths are allowed to fail
+                        # independently. Continue the bounded phase so an LDAP
+                        # bind failure does not prevent SMB/NXC from yielding a
+                        # username source.
+                        proposal.setdefault("failures", []).append({
+                            "tool": planned_tool, "error": result.get("error", "tool failure")
+                        })
+                        continue
+                    if result.get("needs_human"):
+                        inner_needs_human = True
+                        proposal.update({"needs_human": True, "error": result.get("error")})
+                        if not result.get("evidence"):
+                            evidence.append(Evidence(
+                                source=f"tool:{planned_tool}", action=action, target=target,
+                                exit_code=-1, stderr=str(result.get("error", "tool failure")),
+                                facts={"ok": False, "needs_human": True,
+                                       "error_kind": result.get("error_kind", "tool_failure")},
+                            ))
+                        inner_human_request = {
+                            "kind": "tool_failure", "agent": role.value,
+                            "tool": planned_tool, "target": target,
+                            "error": result.get("error", "tool failure"),
+                            "question": "請修正目前工具/參數或停止；不會自動重複同一身份探測。",
+                        }
+                        break
+                except Exception as exc:
+                    if action == "anonymous_identity_probe":
+                        proposal.setdefault("failures", []).append({
+                            "tool": planned_tool, "error": str(exc)
+                        })
+                        continue
+                    inner_needs_human = True
+                    proposal = {"tool": planned_tool, "planned_phase": action,
+                                "needs_human": True, "error": str(exc)}
+                    evidence.append(Evidence(source=f"tool:{planned_tool}", action=action,
+                                             target=target, exit_code=-1, stderr=str(exc),
+                                             facts={"ok": False, "needs_human": True}))
+                    inner_human_request = {
+                        "kind": "tool_failure", "agent": role.value,
+                        "tool": planned_tool, "target": target, "error": str(exc),
+                        "question": "請修正目前工具/參數或停止；不會自動重複同一身份探測。",
+                    }
+                    break
+        elif blocked_action:
+            pass
+        elif action == "anonymous_identity_probe":
+            proposal = {"planned_phase": action, "phase_complete": True}
+            inner_needs_human = True
+            inner_human_request = {
+                "kind": "identity_phase_unavailable", "agent": role.value,
+                "target": target,
+                "question": "匿名身份探測沒有可執行的新工具；請提供 username source、修正工具環境，或停止。",
+            }
+        elif self.llm and self.tools.tools:
             react_messages: list[Any] = []
             try:
                 async for update in self._react_graph(role, state).astream(
@@ -901,7 +1070,6 @@ class Agents:
                 evidence.append(Evidence(source=f"agent:{role.value}", action=action, target=target,
                                          exit_code=-1, stderr=str(exc),
                                          facts={"ok": False, "agent_error": True}))
-            observation_index = dict(state.get("observation_index", {}))
             for message in react_messages:
                 if isinstance(message, ToolMessage):
                     try:
@@ -924,6 +1092,16 @@ class Agents:
                                     "cached": payload.get("cached", False),
                                     "exit_code": observed.exit_code,
                                 }
+                            if payload.get("needs_human") or observed.exit_code not in (None, 0):
+                                inner_needs_human = True
+                                proposal["needs_human"] = True
+                                inner_human_request = {
+                                    "kind": "tool_failure", "agent": role.value,
+                                    "tool": payload.get("tool", message.name),
+                                    "target": observed.target,
+                                    "error": payload.get("error") or observed.stderr or "tool failed",
+                                    "question": "請指定修正方向或停止；不會自動重複失敗的偵察。",
+                                }
                         elif payload.get("needs_human"):
                             from .models import Evidence
                             evidence.append(Evidence(
@@ -933,6 +1111,15 @@ class Agents:
                                 facts={"ok": False, "needs_human": True, "tool_result": payload},
                             ))
                             new_observation = new_observation or not payload.get("cached", False)
+                            inner_needs_human = True
+                            proposal["needs_human"] = True
+                            inner_human_request = {
+                                "kind": "tool_failure", "agent": role.value,
+                                "tool": payload.get("tool", message.name),
+                                "target": target,
+                                "error": payload.get("error", "tool failure"),
+                                "question": "請指定修正方向或停止；不會自動重複失敗的偵察。",
+                            }
                             if payload.get("signature"):
                                 observation_index[payload["signature"]] = {
                                     "tool": payload.get("tool", message.name),
@@ -946,7 +1133,9 @@ class Agents:
                         pass
                 if isinstance(message, AIMessage) and message.content:
                     proposal["summary"] = message.content
-        elif self.tools.tools:
+        elif self.tools.tools and not (action in {
+            "analyze_existing_evidence", "summarize_evidence", "evaluate_ad_evidence"
+        } or role in {Role.JUDGE, Role.REPORTING}):
             # Offline mode remains deterministic, but uses the same allow-listed adapter boundary.
             tool_name = role.value if role.value in self.tools.tools else next(iter(self.tools.tools))
             try:
@@ -967,6 +1156,20 @@ class Agents:
             else:
                 proposal = {"tool": tool_name, "offline": True}
                 new_observation = True
+        elif action in {"analyze_existing_evidence", "summarize_evidence", "evaluate_ad_evidence"} \
+                or role in {Role.JUDGE, Role.REPORTING}:
+            # Analysis/reporting is not a licence to execute the first
+            # registered command when the LLM is unavailable. Preserve the
+            # accumulated evidence and surface the missing analysis engine.
+            proposal = {"analysis_only": True, "offline": True,
+                        "needs_human": not bool(self.llm)}
+            if not self.llm:
+                inner_needs_human = True
+                inner_human_request = {
+                    "kind": "analysis_engine_unavailable", "agent": role.value,
+                    "target": target,
+                    "question": "目前沒有可用的 LLM 來彙整既有 evidence；請修正模型設定或停止。",
+                }
         event_type = {Role.VALIDATION: "SERVICE_VALIDATED", Role.TESTING: "ATTACK_PATH_VALIDATED",
                       Role.DEBUGGING: "REPAIR_COMPLETED", Role.JUDGE: "SCENARIO_EVALUATED",
                       Role.REPORTING: "REPORT_UPDATED"}[role]
@@ -990,7 +1193,7 @@ class Agents:
                 coverage.add(f"{service.get('protocol', 'tcp')}/{service.get('port')}/{service.get('service')}")
             previous_service_coverage = set(ad_knowledge["coverage"].get(observed.target, []))
             ad_knowledge["coverage"][observed.target] = sorted(previous_service_coverage | coverage | {observed.source})
-            for field in ("users", "spns", "asrep_candidates", "groups", "acl_edges",
+            for field in ("users", "spns", "asrep_candidates", "credentials_validated", "groups", "acl_edges",
                           "delegation", "adcs_findings", "trusts"):
                 values = set(ad_knowledge.get(field, []))
                 values.update(str(item) for item in facts.get(field, []))
@@ -998,6 +1201,20 @@ class Agents:
             if facts.get("domain_name"):
                 ad_knowledge["domain"] = facts["domain_name"]
         projection = self._project_observations(state, evidence)
+        method_history = list(state.get("method_history", []))
+        for observed in evidence:
+            method_history.append({
+                "tool": observed.source,
+                "action": observed.action,
+                "target": observed.target,
+                "outcome": "success" if observed.exit_code in (None, 0) else "failed",
+                "exit_code": observed.exit_code,
+                "evidence_id": observed.id,
+                "argv": (observed.facts or {}).get("argv", []),
+                "error_kind": (observed.facts or {}).get("error_kind"),
+                "tool_result": (observed.facts or {}).get("tool_result"),
+            })
+        method_history = method_history[-200:]
         patch: dict[str, Any] = {
             "evidence": evidence,
             "events": [event],
@@ -1006,9 +1223,11 @@ class Agents:
                 f"{role.value} completed its current step and collected {len(evidence)} evidence item(s)."
             ))],
             "observation_index": observation_index,
+            "method_history": method_history,
             "no_progress_count": 0 if new_observation else state.get("no_progress_count", 0) + 1,
             "discovered_targets": sorted(discovered_targets),
             "ad_knowledge": ad_knowledge,
+            "approved_grant": None,
             **projection,
             "needs_human": inner_needs_human or bool(proposal.get("needs_human")),
             "human_requests": [inner_human_request] if inner_human_request else [],
@@ -1026,6 +1245,7 @@ class Agents:
                                       [e.id for e in state.get("evidence", [])[-10:]])
         from uuid import NAMESPACE_URL, uuid5
         request.id = str(uuid5(NAMESPACE_URL, f"{state['run_id']}:{fingerprint}"))
+        request.decision_fingerprint = fingerprint
         answer = interrupt({"kind": "approval", "request": request.model_dump(mode="json"),
                             "question": "Approve this action? Reply approve or reject."})
         request.status = "approved" if str(answer).strip().lower() in {"approve", "approved", "yes"} else "rejected"
@@ -1038,7 +1258,10 @@ class Agents:
         approved_decision = decision.model_copy(update={"approval_required": False})
         grant = {
             "decision_fingerprint": fingerprint,
-            "allowed_tools": get_capability(decision.capability).allowed_tools if get_capability(decision.capability) else [],
+            "target": decision.target,
+            "action": decision.action,
+            "capability": decision.capability,
+            "allowed_tools": approved_tools_for_decision(decision),
             "tool_parameters": decision.tool_parameters.model_dump(mode="json", exclude_none=True),
         } if request.status == "approved" else None
         return {"approvals": [request], "events": [event], "pending_action": None,

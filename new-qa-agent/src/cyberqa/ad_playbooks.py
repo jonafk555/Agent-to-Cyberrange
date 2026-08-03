@@ -19,9 +19,12 @@ AD_CAPABILITIES: tuple[CapabilitySpec, ...] = (
     CapabilitySpec(
         name="enumerate_domain_users",
         purpose="Enumerate users, groups, SPNs, delegation flags, and account controls.",
-        prerequisites=["domain_inventory", "valid LDAP access or explicitly allowed anonymous LDAP"],
+        # The reviewed adapter performs the LDAP bind and query in one
+        # bounded operation when a credential is supplied. Anonymous user
+        # discovery is handled by the separate nxc_ldap read-only phase.
+        prerequisites=["domain_inventory", "validated domain credential"],
         expected_evidence=["users", "groups", "spns", "preauth_flags", "delegation_flags"],
-        allowed_tools=["ad_domain_users", "nxc_ldap_recon"],
+        allowed_tools=["ad_domain_users"],
     ),
     CapabilitySpec(
         name="asrep_roasting_assessment",
@@ -31,7 +34,7 @@ AD_CAPABILITIES: tuple[CapabilitySpec, ...] = (
         # username source (range file, anonymous enumeration, or evidence).
         prerequisites=["domain_inventory", "candidate username source"],
         expected_evidence=["asrep_candidates", "ticket_obtained_or_blocked", "credential_validation_status"],
-        allowed_tools=["ad_asrep_roasting", "nxc_ldap_recon"],
+        allowed_tools=["ad_asrep_roasting"],
         risk=ADRisk.CREDENTIAL_MATERIAL,
         notes="Do not claim a password or crack result without evidence; protect ticket material.",
     ),
@@ -40,7 +43,7 @@ AD_CAPABILITIES: tuple[CapabilitySpec, ...] = (
         purpose="Identify service accounts with SPNs and assess ticket exposure under the range policy.",
         prerequisites=["domain_inventory", "user enumeration", "authorized identity or approved anonymous path"],
         expected_evidence=["spn_accounts", "ticket_obtained_or_blocked", "credential_validation_status"],
-        allowed_tools=["ad_kerberoasting", "nxc_ldap_recon"],
+        allowed_tools=["ad_kerberoasting"],
         risk=ADRisk.CREDENTIAL_MATERIAL,
         notes="Use a lab output directory and redact ticket/password material from logs.",
     ),
@@ -49,7 +52,7 @@ AD_CAPABILITIES: tuple[CapabilitySpec, ...] = (
         purpose="Validate a supplied lab credential against an explicitly scoped host/service.",
         prerequisites=["human_supplied_or_range_issued_credential"],
         expected_evidence=["authentication_success_or_failure", "protocol", "target"],
-        allowed_tools=["ad_credential_validation", "nxc_smb_recon", "ldapsearch", "smbclient"],
+        allowed_tools=["ad_credential_validation"],
         risk=ADRisk.AUTHENTICATION_TEST,
     ),
     CapabilitySpec(
@@ -57,7 +60,7 @@ AD_CAPABILITIES: tuple[CapabilitySpec, ...] = (
         purpose="Assess password reuse only after lockout policy and scope are known.",
         prerequisites=["domain_inventory", "user enumeration", "lockout_policy", "approved_test_password"],
         expected_evidence=["scope", "rate", "lockout_policy", "authentication_results"],
-        allowed_tools=["ad_password_spray", "nxc_smb_recon", "nxc_ldap_recon"],
+        allowed_tools=["ad_password_spray"],
         risk=ADRisk.ACCOUNT_LOCKOUT,
         requires_approval=True,
         notes="Never spray by default. Require explicit approval, low rate, bounded accounts, and one pass.",

@@ -93,6 +93,7 @@ class ApprovalRequest(BaseModel):
     impact: str
     rollback: str
     evidence_ids: list[str] = Field(default_factory=list)
+    decision_fingerprint: str | None = None
     status: Literal["pending", "approved", "rejected"] = "pending"
 
 
@@ -112,6 +113,10 @@ class ToolParameters(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     profile: str | None = None
+    name: str | None = None
+    # Optional reviewed argv fragments for Nmap/NXC. Adapters validate the
+    # allowed flags and always inject the authorized target/module themselves.
+    argv: list[str] = Field(default_factory=list)
     users_file: str | None = None
     users: list[str] = Field(default_factory=list)
     allow_anonymous_nxc: bool = False

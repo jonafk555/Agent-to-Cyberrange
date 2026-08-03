@@ -34,6 +34,7 @@ class QAState(TypedDict, total=False):
     iteration: int
     max_iterations: int
     action_history: list[str]
+    method_history: list[dict[str, Any]]
     completed_goals: list[str]
     errors: list[str]
     human_requests: Annotated[list[dict[str, Any]], lambda a, b: a + b]

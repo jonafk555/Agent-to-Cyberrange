@@ -154,6 +154,7 @@ class KaliTool:
             supported = {"profile"}
             if self.name.startswith("nxc_"):
                 supported.add("allow_anonymous_nxc")
+            supported.add("argv")
         elif self.name == "check_dns_resolution":
             supported = {"name"}
         else:
@@ -179,7 +180,18 @@ class KaliTool:
             profile = str(parameters.get("profile", "default"))
             if profile not in profiles:
                 raise ValueError(f"Unsupported check_port profile: {profile}")
-            fixed_args = profiles[profile]
+            custom_argv = parameters.get("argv") or []
+            fixed_args = (
+                tuple(_validated_option_argv(
+                    custom_argv,
+                    flags={"-6", "-F", "-n", "-Pn", "-sC", "-sS", "-sT", "-sU", "-sV",
+                           "-T0", "-T1", "-T2", "-T3", "-T4", "-T5",
+                           "--open", "--reason", "--traceroute", "--version-light"},
+                    value_flags={"-T", "-p", "--host-timeout", "--max-retries", "--max-rate",
+                                 "--min-rate", "--top-ports", "--version-intensity"},
+                    label="nmap",
+                )) if custom_argv else profiles[profile]
+            )
         elif self.name in {"nxc_smb_recon", "nxc_ldap_recon"}:
             module = "smb" if self.name == "nxc_smb_recon" else "ldap"
             profiles = {
@@ -194,12 +206,21 @@ class KaliTool:
             profile = str(parameters.get("profile", default_profile))
             if profile not in profiles:
                 raise ValueError(f"Unsupported {self.name} profile: {profile}")
+            custom_argv = parameters.get("argv") or []
+            selected_args = tuple(_validated_option_argv(
+                custom_argv,
+                flags={"--computers", "--continue-on-success", "--groups", "--local-auth",
+                       "--loggedon-users", "--pass-pol", "--rid-brute", "--sessions",
+                       "--shares", "--users"},
+                value_flags={"-t", "--threads", "--timeout"},
+                label="nxc",
+            )) if custom_argv else profiles[profile]
             credentials = []
             username = os.getenv("CYBERQA_AD_USERNAME", "")
             password = os.getenv("CYBERQA_AD_PASSWORD", "")
             if username and password:
                 credentials = ["-u", username, "-p", password]
-            fixed_args = (module, *profiles[profile], *credentials)
+            fixed_args = (module, *selected_args, *credentials)
             self_target_index = 1
             argv = [executable, *fixed_args]
             argv.insert(self_target_index + 1, f"{self.target_prefix}{target}")
@@ -240,7 +261,10 @@ class KaliTool:
     def _redact_argv(argv: list[str]) -> list[str]:
         secrets = {value for name in ("CYBERQA_AD_PASSWORD", "AD_PASSWORD")
                    if (value := os.getenv(name))}
-        return ["***REDACTED***" if item in secrets else item for item in argv]
+        return [
+            next((item.replace(secret, "***REDACTED***") for secret in secrets if secret in item), item)
+            for item in argv
+        ]
 
 
 def _discover_ip_addresses(output: str) -> set[str]:
@@ -265,6 +289,37 @@ def _target_host(target: str) -> str:
         if port.isdigit():
             return host
     return value
+
+
+def _validated_option_argv(
+    values: Any,
+    flags: set[str],
+    value_flags: set[str],
+    label: str,
+) -> list[str]:
+    """Validate model-selected option fragments without accepting a command."""
+    if not isinstance(values, list) or any(not isinstance(item, str) for item in values):
+        raise ValueError(f"{label} argv must be a list of strings")
+    result: list[str] = []
+    expecting: str | None = None
+    for item in values:
+        if not item or any(char in item for char in "\x00\r\n;|&><`$"):
+            raise ValueError(f"Invalid {label} argv token")
+        if expecting:
+            if item.startswith("-") or not re.fullmatch(r"[A-Za-z0-9_.,:/+%-]+", item):
+                raise ValueError(f"Invalid value for {expecting} in {label} argv")
+            result.append(item)
+            expecting = None
+        elif item in value_flags:
+            result.append(item)
+            expecting = item
+        elif item in flags:
+            result.append(item)
+        else:
+            raise ValueError(f"Unsupported {label} argv option: {item}")
+    if expecting:
+        raise ValueError(f"Missing value for {expecting} in {label} argv")
+    return result
 
 
 def _discover_open_ports(output: str) -> list[dict[str, str]]:
@@ -333,6 +388,24 @@ class ToolRegistry:
         """Execute one probe through the same durable cache used by ToolNode."""
         parameters = parameters or {}
         adapter = self.get(name)
+        # An approved grant freezes the target and concrete tool set for this
+        # dispatch. Apply the boundary to every tool in the approved branch,
+        # not only credential-material adapters.
+        if authorization:
+            approved_target = authorization.get("target")
+            allowed = authorization.get("allowed_tools", [])
+            if approved_target and target != approved_target:
+                return {
+                    "ok": False, "tool": name,
+                    "error": f"Approved action is scoped to target {approved_target}, not {target}",
+                    "error_kind": "approval_scope", "needs_human": True,
+                }
+            if name not in allowed:
+                return {
+                    "ok": False, "tool": name,
+                    "error": "Tool is not part of the approved capability",
+                    "error_kind": "approval_scope", "needs_human": True,
+                }
         if name in SENSITIVE_TOOL_NAMES:
             allowed = (authorization or {}).get("allowed_tools", [])
             expected = (authorization or {}).get("tool_parameters", {})
@@ -363,14 +436,19 @@ class ToolRegistry:
             return {**result, "signature": signature, "cached": False}
         cached = None if force_refresh else self.observations.get(signature)
         if cached is not None:
-            if isinstance(adapter, KaliTool) and adapter.on_event:
-                adapter.on_event("tool_cached", {"tool": name, "target": target,
-                                                  "signature": signature})
+            on_event = getattr(adapter, "on_event", None)
+            if on_event:
+                on_event("tool_cached", {"tool": name, "target": target,
+                                          "signature": signature})
             return self._cache_hit(cached, signature, action)
         lock = self._observation_locks.setdefault(signature, asyncio.Lock())
         async with lock:
             cached = None if force_refresh else self.observations.get(signature)
             if cached is not None:
+                on_event = getattr(adapter, "on_event", None)
+                if on_event:
+                    on_event("tool_cached", {"tool": name, "target": target,
+                                              "signature": signature})
                 return self._cache_hit(cached, signature, action)
             try:
                 evidence = await adapter.observe(target, action, **parameters)
@@ -411,7 +489,9 @@ class ToolRegistry:
         failures into a tool result so the agent can inspect the failure and
         either try a safer next step or ask a human for help.
         """
-        selected = names or tuple(self.tools)
+        # An explicit empty list means "no tools". Do not turn an
+        # analysis-only specialist back into an unrestricted tool user.
+        selected = tuple(self.tools) if names is None else names
         wrapped: list[BaseTool] = []
         for tool_name in selected:
             if tool_name not in self.tools:
@@ -421,10 +501,13 @@ class ToolRegistry:
             def make_probe(bound_adapter: FactTool, bound_name: str) -> BaseTool:
                 @tool(f"{bound_name}_probe")
                 async def probe(target: str, action: str,
-                                parameters: dict[str, Any] | None = None,
-                                force_refresh: bool = False) -> dict[str, Any]:
+                                parameters: dict[str, Any] | None = None) -> dict[str, Any]:
                     """Run one authorized, fact-only probe against the cyber-range target."""
-                    return await self.observe(bound_name, target, action, parameters, force_refresh, authorization)
+                    # A model-visible tool has no refresh switch: the
+                    # durable observation ledger is authoritative. A fresh
+                    # probe remains an explicit operator/API concern through
+                    # ToolRegistry.observe(force_refresh=True).
+                    return await self.observe(bound_name, target, action, parameters, False, authorization)
 
                 return probe
 
@@ -497,6 +580,6 @@ def build_kali_registry(on_event: Callable[[str, dict[str, Any]], None] | None =
     ]
     for spec in specs:
         registry.register(spec)
-    for capability_tool in build_ad_capability_tools(policy):
+    for capability_tool in build_ad_capability_tools(policy, on_event=on_event):
         registry.register(capability_tool)
     return registry

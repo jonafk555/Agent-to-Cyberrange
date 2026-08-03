@@ -22,6 +22,29 @@ The compiled graph is intentionally small because the behavior is not encoded in
 
 The supervisor receives current evidence, unresolved goals, prior action signatures, hypotheses, repair history, and the scenario objective. It returns exactly one `Decision`. A specialist can collect facts and emit a proposal, but cannot choose the next node. The `route` function only interprets the supervisor's decision.
 
+## AD decision contract
+
+AD method selection has a deterministic prerequisite guard between the model and the broker. The model may interpret evidence and propose an objective, but the guard owns the transitions that must not be ambiguous:
+
+```text
+domain/DC + username source + no credential
+    -> one approved AS-REP assessment
+    -> evidence judge/report (no automatic rerun)
+domain/DC + no credential + no username source
+    -> one bounded anonymous LDAP/SMB/NXC-LDAP identity phase
+    -> username source found: AS-REP
+    -> no username source: human help, no guessed accounts or empty-credential loop
+validated credential
+    -> user/SPN enumeration
+    -> Kerberoast only when SPNs exist
+    -> bounded relationship collection
+    -> judge/report
+```
+
+Each capability is mapped to one primary reviewed adapter. An approval grant freezes the target, action, capability, parameters, and allowed adapter set for one specialist dispatch. The grant is consumed when that dispatch returns. A cached observation is evidence that the method was already attempted; it is not permission to silently retry it.
+
+`method_history` records the effective tool, target, outcome, argv, and evidence id. The supervisor receives this ledger and the deterministic guard rejects an immediately repeated decision. Failure categories remain distinct: authentication/bind failure, missing username source, invalid arguments, connectivity failure, and tool/runtime failure each produce a different operator-facing next step.
+
 In production, bind `Agents._reason` to a structured-output model (`with_structured_output(Decision, method="function_calling")` for the supervisor and role-specific proposal models for specialists). The fallback is intentionally conservative and only observes.
 
 ## Validation contract
@@ -77,10 +100,10 @@ validation: SERVICE_VALIDATED functional=true
 ### Approval workflow
 
 ```text
-supervisor: ADCS rebuild is highest-value repair; policy=approval_required
+supervisor: AS-REP or another credential-material capability is selected; policy=approval_required
 approval: APPROVAL_REQUIRED request_id=... status=pending
 human: approve/reject outside the specialist loop
-resume: dispatch the frozen approved decision once; sensitive tools verify the grant and exact parameters
+resume: dispatch the frozen approved decision once; tools verify target, capability, allowed adapter, and exact parameters
 ```
 
 To suspend/resume with LangGraph's production checkpointer, compile with a checkpointer and use `interrupt()` in `approval`; the skeleton keeps approval as an explicit node so deployments can select their approval transport (UI, ticketing, or signed API) without changing specialist logic.
