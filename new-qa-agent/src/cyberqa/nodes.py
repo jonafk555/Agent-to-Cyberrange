@@ -23,7 +23,7 @@ from .execution_broker import CapabilityBroker
 from .models import (ADRisk, Decision, Event, Evidence, Hypothesis, Role, Scorecard, Service,
                       ServiceProtocol, ToolParameters)
 from .state import QAState
-from .tools import ToolRegistry, is_local_target
+from .tools import LOCAL_EXECUTION_TARGET, ToolRegistry, is_local_target
 
 
 AD_QA_PLAYBOOK = """For an AD range, do not stop at one domain controller. Inventory all valuable
@@ -46,6 +46,30 @@ until the objective is complete. Never invent facts, credentials, vulnerabilitie
 Build a compact evidence summary after each probe. If no domain credentials exist, do not repeat empty-
 credential SMB/LDAP/NXC probes; pivot to domain discovery, supplied username-file AS-REP assessment,
 anonymous access only when evidence supports it, or another justified path."""
+
+
+def _is_abort_instruction(text: str) -> bool:
+    normalized = text.strip().lower()
+    return normalized in {
+        "abort", "stop", "exit", "quit", "cancel", "end", "停止", "中止", "離開", "結束",
+    }
+
+
+def _is_rejection_instruction(text: str) -> bool:
+    """Recognize a short rejection without treating it as task termination."""
+    normalized = re.sub(r"[\s，。,.!！?？]+", "", text.strip().lower())
+    return normalized in {
+        "no", "nope", "否", "不", "不是", "不要", "不可以", "拒絕", "不授權", "未授權",
+    }
+
+
+def _is_multi_step_instruction(text: str) -> bool:
+    """Keep compound natural-language guidance in the Supervisor semantic path."""
+    normalized = text.lower()
+    return any(marker in normalized for marker in (
+        " and ", " then ", " after ", " before ", " also ",
+        "然後", "之後", "完成後", "再", "並", "同時", "優先", "除了", "不要只",
+    ))
 
 
 class ReactState(TypedDict, total=False):
@@ -156,6 +180,8 @@ class Agents:
         previous = state.get("recon_coverage", {}) or {}
         coverage: dict[str, Any] = {}
         for target, raw in previous.items():
+            if is_local_target(str(target)):
+                continue
             if isinstance(raw, dict):
                 coverage[target] = {
                     "checks": dict(raw.get("checks", {})),
@@ -167,6 +193,10 @@ class Agents:
                                                 for item in raw},
                                      "semantic": {}, "remaining": []}
         for evidence in [*state.get("evidence", []), *evidence_items]:
+            # Local runtime observations are useful context, but are never a
+            # network recon check and must not create a host-coverage debt.
+            if is_local_target(evidence.target):
+                continue
             key, category = cls._recon_check_key(evidence)
             target = evidence.target
             entry = coverage.setdefault(target, {"checks": {}, "semantic": {}, "remaining": []})
@@ -194,13 +224,29 @@ class Agents:
     def _project_observations(self, state: QAState, new_evidence: list[Evidence]) -> dict[str, Any]:
         """Build one cumulative view used by every future planning decision."""
         all_evidence = [*state.get("evidence", []), *new_evidence]
-        old_profiles = state.get("target_profiles", {})
+        scope_target = str(state.get("target", ""))
+        recon_evidence = [
+            item for item in all_evidence
+            if not is_local_target(item.target)
+            and (item.target == scope_target or self.tools.target_policy.allows(item.target))
+        ]
+        old_profiles = {
+            target: profile for target, profile in (state.get("target_profiles", {}) or {}).items()
+            if not is_local_target(str(target))
+            and (str(target) == scope_target or self.tools.target_policy.allows(str(target)))
+        }
         old_knowledge = state.get("ad_knowledge", {}) or {}
         if hasattr(old_knowledge, "model_dump"):
             old_knowledge = old_knowledge.model_dump()
-        profiles = build_target_profiles(all_evidence, old_profiles, old_knowledge.get("domain"))
-        synthesis = synthesize_evidence(all_evidence, profiles)
-        recon_coverage = self._build_recon_coverage(state, new_evidence)
+        profiles = build_target_profiles(recon_evidence, old_profiles, old_knowledge.get("domain"))
+        synthesis = synthesize_evidence(recon_evidence, profiles)
+        recon_coverage = self._build_recon_coverage(
+            state, [item for item in recon_evidence if not is_local_target(item.target)]
+        )
+        recon_coverage = {
+            target: profile for target, profile in recon_coverage.items()
+            if str(target) == scope_target or self.tools.target_policy.allows(str(target))
+        }
         synthesis["recon_coverage"] = recon_coverage
         runtime = derive_runtime_config(all_evidence, profiles, state.get("runtime_config", {}))
         if runtime:
@@ -388,9 +434,13 @@ class Agents:
             "runtime_config": state.get("runtime_config", {}),
             "operator_instruction": state.get("human_instruction", ""),
             "operator_instruction_history": state.get("human_directives", [])[-10:],
+            "operator_rejections": [
+                item for item in state.get("human_directives", [])[-10:]
+                if item.get("intent") == "reject_previous"
+            ],
             "approved_tool_parameters": state.get("last_decision").tool_parameters.model_dump(mode="json") if state.get("last_decision") else {},
             "capabilities": capability_catalog(),
-            "instruction": "Read the complete evidence.stdout, evidence.stderr, facts, and output_summary fields; the CLI progress preview is not the evidence. Reason over the complete evidence synthesis, not only the last result. Advance one or more unresolved findings. Cover all discovered hosts/services and cross-forest candidates. Treat recon_coverage as authoritative: a completed semantic check is not a new task merely because the action wording changed. Never repeat an identical effective argv; a different reviewed argv/profile is allowed only when it has an explicit expected evidence gain. Treat LDAP authentication, DNS context, forest mismatch, permissions, and command syntax as different hypotheses. If an operator instruction is present, it is a high-priority execution requirement: apply its target, username file, tool, profile, and requested next step unless the target policy, missing prerequisite, or approval gate blocks it; explain the exact blocker. If domain credentials are absent and domain/DC plus a candidate username source are known, prioritize asrep_roasting_assessment immediately; AS-REP does not require a domain credential. Do not loop over empty-credential SMB/LDAP/NXC probes. If no username source exists, use only explicitly allowed anonymous enumeration or ask Human for CYBERQA_AD_USERS_FILE. For a CIDR, host discovery must begin with nmap -sn or -F; after hosts are found, perform nmap -sC -sV (or an explicitly justified reviewed profile) against each authorized non-local host before declaring the network empty. If discovery returns no hosts, adapt with the other discovery method and inspect routing/DNS instead of stopping. For check_port choose a profile or safe argv deliberately; for NXC choose a profile or safe argv deliberately. Return one primary decision plus useful next_options and exact tool_parameters, including argv/users_file when supplied.",
+            "instruction": "Read the complete evidence.stdout, evidence.stderr, facts, and output_summary fields; the CLI progress preview is not the evidence. Reason over the complete evidence synthesis, not only the last result. Advance one or more unresolved findings. Cover all discovered hosts/services and cross-forest candidates. Treat recon_coverage as authoritative: a completed semantic check is not a new task merely because the action wording changed. Never repeat an identical effective argv; a different reviewed argv/profile is allowed only when it has an explicit expected evidence gain. Treat LDAP authentication, DNS context, forest mismatch, permissions, and command syntax as different hypotheses. The latest operator instruction is semantic, high-priority execution guidance, not a single fixed command: extract all requested goals, constraints, exclusions, ordering, target changes, username sources, and requested continuation, then combine them with the autonomous plan. Do not discard later clauses after recognizing one tool name. If the operator rejected the previous proposal, never reproduce that action/target/parameters; choose the next justified autonomous alternative. If domain credentials are absent and domain/DC plus a candidate username source are known, prioritize asrep_roasting_assessment immediately; AS-REP does not require a domain credential. Do not loop over empty-credential SMB/LDAP/NXC probes. If no username source exists, use only explicitly allowed anonymous enumeration or ask Human for CYBERQA_AD_USERS_FILE. For a CIDR, host discovery must begin with nmap -sn or -F; after hosts are found, perform nmap -sC -sV (or an explicitly justified reviewed profile) against each authorized non-local host before declaring the network empty. If discovery returns no hosts, adapt with the other discovery method and inspect routing/DNS instead of stopping. For check_port choose a profile or safe argv deliberately; for NXC choose a profile or safe argv deliberately. Return one primary decision plus useful next_options and exact tool_parameters, including argv/users_file when supplied.",
         })
         self.progress("reasoning_start", agent=Role.SUPERVISOR.value)
         response = await model.ainvoke([
@@ -438,7 +488,11 @@ class Agents:
         hosts = []
         for value in state.get("discovered_targets", []):
             host = str(value)
-            if host == network or self.tools.target_policy.is_local(host):
+            if (
+                host == network
+                or is_local_target(host)
+                or not self.tools.target_policy.allows(host)
+            ):
                 continue
             if host not in hosts:
                 hosts.append(host)
@@ -756,7 +810,7 @@ class Agents:
             discovered = {
                 host for item in evidence
                 for host in (item.facts.get("discovered_targets", []) if isinstance(item.facts, dict) else [])
-                if not self.tools.target_policy.is_local(str(host))
+                if not is_local_target(str(host)) and self.tools.target_policy.allows(str(host))
             }
             if not discovered:
                 try:
@@ -776,10 +830,17 @@ class Agents:
         except Exception:
             pass
         projection = self._project_observations(state, evidence)
-        discovered = set(state.get("discovered_targets", []))
+        discovered = {
+            str(item) for item in state.get("discovered_targets", [])
+            if not is_local_target(str(item))
+        }
         for item in evidence:
-            discovered.add(item.target)
-            discovered.update(item.facts.get("discovered_targets", []))
+            if not is_local_target(item.target):
+                discovered.add(item.target)
+            discovered.update(
+                str(host) for host in item.facts.get("discovered_targets", [])
+                if not is_local_target(str(host)) and self.tools.target_policy.allows(str(host))
+            )
         method_history = list(state.get("method_history", []))
         for observed in evidence:
             method_history.append({
@@ -825,16 +886,15 @@ class Agents:
                 "human_directive": True,
                 "needs_human": False,
             }
-        if state.get("no_progress_count", 0) >= 2:
-            decision = Decision(next_agent="end", objective="human_help", action="end",
-                                target=state.get("target", "environment"),
-                                justification="Two consecutive specialist steps produced no new observations.")
-            return {"iteration": iteration, "phase": "human_help", "last_decision": decision,
-                    "pending_action": decision.model_dump(), "needs_human": True}
         if iteration > state.get("max_iterations", 20):
             decision = Decision(next_agent="end", objective="stop", action="end", target="environment", justification="Iteration budget exhausted; human guidance is required to continue.")
             return {"iteration": iteration, "phase": "human_help", "last_decision": decision,
-                    "pending_action": decision.model_dump(), "needs_human": True}
+                    "pending_action": decision.model_dump(), "needs_human": True,
+                    "human_requests": [{
+                        "kind": "iteration_budget",
+                        "question": "自主迭代預算已用盡；請提供新的語意約束或輸入 abort。",
+                        "reason": decision.justification,
+                    }]}
         try:
             result = await self._structured_supervisor(state)
         except Exception as exc:
@@ -842,7 +902,12 @@ class Agents:
                                 justification=f"Supervisor could not produce a valid decision: {exc}")
             return {"iteration": iteration, "phase": "human_help", "last_decision": decision,
                     "pending_action": decision.model_dump(), "needs_human": True,
-                    "errors": [str(exc)]}
+                    "errors": [str(exc)],
+                    "human_requests": [{
+                        "kind": "supervisor_error",
+                        "question": "Supervisor 無法產生下一步；請提供額外語意或輸入 abort。",
+                        "reason": decision.justification,
+                    }]}
         # Hard AD prerequisites outrank a free-form model proposal. The model
         # still plans all transitions where the deterministic guard has no
         # stronger conclusion, but it cannot select empty-credential loops or
@@ -867,10 +932,29 @@ class Agents:
         # returning to the first DC-shaped target.
         uncovered = [
             item for item in state.get("discovered_targets", [])
-            if not self._target_has_completed_recon(state.get("recon_coverage", {}).get(item))
+            if not is_local_target(str(item))
+            and self.tools.target_policy.allows(str(item))
+            and not self._target_has_completed_recon(state.get("recon_coverage", {}).get(item))
         ]
         if uncovered and result.next_agent == Role.VALIDATION:
             target = uncovered[0]
+        if is_local_target(str(target)):
+            # A model may mention the runner as context, but never as a
+            # remote recon target. Prefer the next authorized host/network.
+            target = next(
+                (
+                    str(item) for item in uncovered
+                    if not is_local_target(str(item))
+                ),
+                next(
+                    (
+                        str(item) for item in state.get("discovered_targets", [])
+                        if not is_local_target(str(item))
+                        and self.tools.target_policy.allows(str(item))
+                    ),
+                    state.get("target", LOCAL_EXECUTION_TARGET),
+                ),
+            )
         decision = Decision(next_agent=agent, objective=result.objective or state.get("objective", "QA"),
                             action=action, target=target,
                             justification=result.justification or "Resolve the highest-value uncertainty.",
@@ -930,6 +1014,30 @@ class Agents:
             "target": decision.target,
             "tool_parameters": decision.tool_parameters.model_dump(mode="json", exclude_none=True),
         }, sort_keys=True)
+        rejected_fingerprints = {
+            str(item.get("rejected_fingerprint"))
+            for item in state.get("human_directives", [])
+            if item.get("intent") == "reject_previous" and item.get("rejected_fingerprint")
+        }
+        if decision_fingerprint(decision) in rejected_fingerprints:
+            # A semantic rejection is an instruction to keep going by another
+            # justified path, not permission to ask the same question again.
+            decision = Decision(
+                next_agent=Role.DEBUGGING,
+                objective=decision.objective,
+                action="choose_alternate_probe",
+                target=target,
+                justification=(
+                    "The operator rejected the previous effective action. Select a materially different "
+                    "authorized probe or continue with the next evidence-driven path."
+                ),
+            )
+            signature = json.dumps({
+                "capability": decision.capability,
+                "action": decision.action,
+                "target": decision.target,
+                "tool_parameters": decision.tool_parameters.model_dump(mode="json", exclude_none=True),
+            }, sort_keys=True)
         history = state.get("action_history", [])
         if history and history[-1] == signature:
             decision = Decision(next_agent="end", objective="stop", action="end", target=decision.target,
@@ -939,7 +1047,12 @@ class Agents:
                                 ))
             return {"iteration": iteration, "phase": "human_help", "last_decision": decision,
                     "pending_action": decision.model_dump(), "action_history": history + [signature],
-                    "needs_human": True}
+                    "needs_human": True,
+                    "human_requests": [{
+                        "kind": "no_progress",
+                        "question": "目前沒有新的自主證據路徑；請提供額外語意、目標/服務，或輸入 abort。",
+                        "reason": decision.justification,
+                    }]}
         capability_history = state.get("capability_history", [])
         capability_history = capability_history + [{**capability_check, "iteration": iteration}]
         reused_grant = None
@@ -1031,9 +1144,9 @@ class Agents:
         approved = any(marker in text for marker in (
             "approve", "approved", "allow", "run", "execute", "proceed", "核准", "允許", "執行",
         ))
-        target = os.getenv("CYBERQA_AD_DC") or state.get("target", "environment")
+        target = os.getenv("CYBERQA_AD_DC") or state.get("target", LOCAL_EXECUTION_TARGET)
         prior = state.get("last_decision")
-        if prior and prior.target and prior.target != "environment":
+        if prior and prior.target and not is_local_target(prior.target):
             target = prior.target
         if "/" in str(target):
             # GetNPUsers needs one DC address, not a CIDR. Prefer the runtime
@@ -1048,6 +1161,14 @@ class Agents:
                     if "/" not in str(candidate) and not is_local_target(str(candidate)):
                         target = str(candidate)
                         break
+        if is_local_target(str(target)):
+            target = next(
+                (
+                    str(candidate) for candidate in state.get("discovered_targets", [])
+                    if "/" not in str(candidate) and not is_local_target(str(candidate))
+                ),
+                LOCAL_EXECUTION_TARGET,
+            )
         knowledge = state.get("ad_knowledge") or {}
         if hasattr(knowledge, "model_dump"):
             knowledge = knowledge.model_dump(mode="json")
@@ -1087,6 +1208,10 @@ class Agents:
             r"(?:cyberqa_ad_users_file|users?_file|username[_ -]?file|username[_ -]?list|使用者清單|帳號清單)"
             r"\s*(?:is|為|是|=|:)?\s*[\"']?([~/][^\s,;\"']+)",
             r"--users-file\s+[\"']?([~/][^\s,;\"']+)",
+            r"(?:gain|get|obtain|retrieve|provide|取得|獲取|取得網域)"
+            r".{0,80}?(?:by|from|using|透過|使用|用)\s*[\"']?([~/][^\s,;\"']+)",
+            r"(?:domain\s+(?:cred|credential)|網域(?:憑證|帳密))"
+            r".{0,80}?[\"']?([~/][^\s,;\"']+)",
         )
         for pattern in patterns:
             match = re.search(pattern, answer, re.IGNORECASE)
@@ -1106,7 +1231,8 @@ class Agents:
         prior = state.get("last_decision")
         if prior and prior.target and prior.target != "environment" and not is_local_target(prior.target):
             return prior.target
-        return state.get("target", "environment")
+        fallback = state.get("target", LOCAL_EXECUTION_TARGET)
+        return fallback if not is_local_target(str(fallback)) else LOCAL_EXECUTION_TARGET
 
     @staticmethod
     def _apply_human_config(answer: str) -> tuple[dict[str, str], str]:
@@ -1150,6 +1276,10 @@ class Agents:
         a later model call cannot discard a direct operator command.
         """
         text = answer.lower().replace("–", "-")
+        # Compound guidance belongs to the semantic Supervisor path. Do not
+        # freeze only the first tool named in a multi-step instruction.
+        if _is_multi_step_instruction(text):
+            return None
         target = cls._human_target(state, answer)
         if is_local_target(target):
             return None
@@ -1211,7 +1341,8 @@ class Agents:
         problem = await self._human_problem(
             state, "no_progress", decision.justification if decision else "No supervisor decision"
         )
-        request = dict((state.get("human_requests") or [])[-1] or {})
+        requests = state.get("human_requests") or []
+        request = dict(requests[-1] or {}) if requests else {}
         request.update({
             "kind": request.get("kind", "no_progress"),
             "problem": problem,
@@ -1227,16 +1358,34 @@ class Agents:
         answer_text = str(answer).strip()
         guidance = answer_text.lower()
         runtime_config, safe_answer = self._apply_human_config(answer_text)
+        rejected_previous = _is_rejection_instruction(answer_text)
+        previous_decision = state.get("last_decision")
+        directive_record: dict[str, Any] = {
+            "instruction": safe_answer,
+            "source": "human",
+            "intent": "reject_previous" if rejected_previous else "semantic_guidance",
+        }
+        if rejected_previous and previous_decision and previous_decision.action != "end":
+            directive_record.update({
+                "rejected_fingerprint": decision_fingerprint(previous_decision),
+                "rejected_action": previous_decision.action,
+                "rejected_target": previous_decision.target,
+                "rejected_parameters": previous_decision.tool_parameters.model_dump(
+                    mode="json", exclude_none=True
+                ),
+            })
         # A human response is a deliberate change of direction.  Clear the
-        # guard that caused this pause, otherwise the supervisor immediately
-        # interrupts again before it can evaluate the guidance.
+        # stale decision and let the Supervisor interpret the full meaning of
+        # the response.  A short "no" rejects the previous proposal; it does
+        # not terminate the whole task or get reinterpreted as a new command.
         patch = {"needs_human": False, "no_progress_count": 0, "action_history": [],
+                "last_decision": None, "pending_action": None, "approved_grant": None,
                 "human_directive": False,
                 "messages": [HumanMessage(content=f"Human guidance for supervisor: {safe_answer}")],
                 "human_instruction": safe_answer,
-                "human_directives": [{"instruction": safe_answer, "source": "human"}],
-                "errors": [] if guidance != "abort" else ["Human aborted after no progress"],
-                "aborted": guidance == "abort"}
+                "human_directives": [directive_record],
+                "errors": [] if not _is_abort_instruction(answer_text) else ["Human aborted after no progress"],
+                "aborted": _is_abort_instruction(answer_text)}
         human_decision, approved, directive_error = self._human_asrep_decision(state, answer_text)
         if directive_error:
             patch.update({
@@ -1768,13 +1917,20 @@ class Agents:
             self.progress("event_error", event_type=event.type, error=str(exc))
             proposal.setdefault("event_error", str(exc))
         self.progress("agent_done", agent=role.value, evidence_count=len(evidence), target=target)
-        discovered_targets = set(state.get("discovered_targets", []))
+        discovered_targets = {
+            str(item) for item in state.get("discovered_targets", [])
+            if not is_local_target(str(item))
+        }
         ad_knowledge = dict(state.get("ad_knowledge", {}))
         ad_knowledge.setdefault("coverage", {})
         for observed in evidence:
-            discovered_targets.add(observed.target)
+            if not is_local_target(observed.target):
+                discovered_targets.add(observed.target)
             facts = observed.facts if isinstance(observed.facts, dict) else {}
-            discovered_targets.update(facts.get("discovered_targets", []))
+            discovered_targets.update(
+                str(host) for host in facts.get("discovered_targets", [])
+                if not is_local_target(str(host)) and self.tools.target_policy.allows(str(host))
+            )
             coverage = set()
             for service in facts.get("open_ports", []):
                 coverage.add(f"{service.get('protocol', 'tcp')}/{service.get('port')}/{service.get('service')}")

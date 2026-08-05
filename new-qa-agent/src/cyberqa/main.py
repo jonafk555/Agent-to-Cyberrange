@@ -220,21 +220,27 @@ async def run(args: argparse.Namespace | None = None) -> None:
 
     async def execute_task(objective: str, target: str, scenario_id: str):
         task_config = {"configurable": {"thread_id": str(uuid4())}}
-        initial = {"run_id": str(uuid4()), "scenario_id": scenario_id, "objective": objective,
+        runtime_config, safe_objective = Agents._apply_human_config(objective)
+        task_objective = safe_objective or objective
+        initial = {"run_id": str(uuid4()), "scenario_id": scenario_id, "objective": task_objective,
                    "target": target, "iteration": 0, "max_iterations": args.max_iterations,
                    "hosts": {}, "evidence": [], "events": [], "approvals": [], "action_history": [],
                    "method_history": [],
                    "completed_goals": [], "errors": [], "memory": {}, "human_requests": [],
                    "react_steps": 0, "needs_human": False, "aborted": False,
                    "human_directive": False,
-                   "human_instruction": "", "human_directives": [],
                    "recovery_mode": False,
                    "baseline_complete": False, "approved_grant": None,
                    "no_progress_count": 0,
                    "discovered_targets": [target], "recon_coverage": {},
                    "ad_knowledge": ADKnowledge().model_dump(), "capability_history": [],
-                   "target_profiles": {}, "evidence_synthesis": {}, "runtime_config": {},
-                   "messages": [HumanMessage(content=objective)]}
+                   "target_profiles": {}, "evidence_synthesis": {}, "runtime_config": runtime_config,
+                   "human_instruction": task_objective,
+                   "human_directives": [{
+                       "instruction": task_objective, "source": "human",
+                       "intent": "semantic_guidance",
+                   }],
+                   "messages": [HumanMessage(content=task_objective)]}
         try:
             result, interrupt_value = await stream_graph(initial, task_config)
         except Exception as exc:
@@ -258,14 +264,19 @@ async def run(args: argparse.Namespace | None = None) -> None:
                 return None
             try:
                 if request.get("synthetic"):
+                    runtime_config, safe_answer = Agents._apply_human_config(answer)
                     result, interrupt_value = await stream_graph({
                         "needs_human": False,
                         "human_directive": False,
-                        "human_instruction": answer,
-                        "human_directives": [{"instruction": answer, "source": "human"}],
+                        "human_instruction": safe_answer,
+                        "human_directives": [{
+                            "instruction": safe_answer, "source": "human",
+                            "intent": "semantic_guidance",
+                        }],
+                        "runtime_config": runtime_config,
                         "no_progress_count": 0,
                         "action_history": [],
-                        "messages": [HumanMessage(content=f"Human guidance: {answer}")],
+                        "messages": [HumanMessage(content=f"Human guidance: {safe_answer}")],
                     }, task_config)
                 else:
                     result, interrupt_value = await stream_graph(Command(resume=answer), task_config)

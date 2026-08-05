@@ -113,6 +113,30 @@ def test_probe_parameter_shapes_and_host_port_allowlist():
     assert registry.target_policy.allows("10.0.0.1:5985")
 
 
+def test_runner_names_are_never_remote_recon_targets():
+    policy = TargetPolicy(["10.0.0.0/24", "local-kali"])
+
+    assert policy.is_local("local-kali")
+    assert not policy.allows("local-kali")
+    assert not policy.allows("environment")
+
+
+@pytest.mark.asyncio
+async def test_local_inspection_is_not_labeled_as_a_recon_target(monkeypatch):
+    monkeypatch.setenv("CYBERQA_OBSERVATION_DB", ":memory:")
+
+    async def fake_create_subprocess_exec(*argv, **kwargs):
+        return FakeProcess()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+    registry = build_kali_registry(allowed_targets=["10.0.0.0/24"])
+    result = await registry.observe(
+        "inspect_os_version", "10.0.0.0/24", "initial_recon", force_refresh=True
+    )
+
+    assert result["evidence"]["target"] == "environment"
+
+
 def test_empty_tool_selection_is_not_expanded_to_registry():
     registry = build_kali_registry(allowed_targets=["10.0.0.1"])
     assert registry.langchain_tools([]) == []

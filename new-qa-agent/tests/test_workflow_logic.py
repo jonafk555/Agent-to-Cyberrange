@@ -4,11 +4,60 @@ from cyberqa.approval import approved_tools_for_decision
 from cyberqa.ad_playbooks import normalize_capability_parameters
 from cyberqa.ad_strategy import recommend as recommend_ad_method
 from cyberqa.execution_broker import CapabilityBroker
+from cyberqa.nodes import Agents
+from cyberqa.tools import build_kali_registry
 
 
 def test_router_accepts_literal_end_and_approval_values():
     approval = Decision(next_agent="approval", objective="x", action="x", target="t", justification="x")
     assert route({"last_decision": approval}) == "approval"
+
+
+def test_human_semantics_keep_compound_guidance_for_supervisor():
+    assert Agents._human_users_file("gain domain cred by ~/Desktop/username.txt") == "~/Desktop/username.txt"
+    assert Agents._human_explicit_decision(
+        {"target": "10.0.0.0/24"},
+        "nmap 10.0.0.1, then inspect SMB and continue with the next host",
+    ) is None
+
+
+def test_network_transition_excludes_runner_name():
+    agents = Agents(tools=build_kali_registry(allowed_targets=["10.0.0.0/24"]))
+    decision = agents._network_recon_transition({
+        "target": "10.0.0.0/24",
+        "discovered_targets": ["10.0.0.0/24", "local-kali", "10.0.0.1"],
+        "recon_coverage": {
+            "10.0.0.0/24": {"checks": {"nmap:host_discovery": {"status": "completed"}}},
+            "10.0.0.1": {"checks": {}},
+        },
+    })
+
+    assert decision is not None
+    assert decision.target == "10.0.0.1"
+
+
+def test_human_help_handles_missing_request_and_rejects_previous_decision(monkeypatch):
+    monkeypatch.setenv("CYBERQA_OBSERVATION_DB", ":memory:")
+    monkeypatch.setattr("cyberqa.nodes.interrupt", lambda request: "no")
+
+    import asyncio
+
+    result = asyncio.run(Agents().human_help({
+        "target": "10.0.0.0/24",
+        "evidence": [],
+        "human_requests": [],
+        "human_directives": [],
+        "last_decision": Decision(
+            next_agent=Role.VALIDATION, objective="recon", action="service_enumeration",
+            target="local-kali", justification="bad target",
+        ),
+        "iteration": 1,
+        "max_iterations": 8,
+        "needs_human": True,
+    }))
+
+    assert result["last_decision"] is None
+    assert result["human_directives"][0]["intent"] == "reject_previous"
 
 
 def test_decision_schema_closes_nested_tool_parameters_object():

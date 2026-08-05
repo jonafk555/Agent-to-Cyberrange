@@ -18,6 +18,15 @@ from .memory import ObservationStore
 from .models import Evidence
 
 
+# These values describe the runner, not an authorized cyber-range host.  They
+# must never become a remote reconnaissance target or be passed to nmap/nxc.
+LOCAL_EXECUTION_TARGET = "environment"
+LOCAL_TARGET_NAMES = frozenset({
+    "environment", "local-kali", "local_kali", "local-runtime", "local_runtime",
+    "local-runner", "local_runner", "runner", "kali",
+})
+
+
 class FactTool(Protocol):
     name: str
     async def observe(self, target: str, action: str, **kwargs: Any) -> Evidence: ...
@@ -74,6 +83,8 @@ class TargetPolicy:
 
     def is_local(self, target: str) -> bool:
         host = _target_host(target)
+        if host.lower() in LOCAL_TARGET_NAMES:
+            return True
         if host in self.local_hosts:
             return True
         if "/" in host:
@@ -145,7 +156,8 @@ class KaliTool:
                 "in the same runtime environment as cyberqa"
             )
         if not self.requires_target:
-            target = "local-kali"
+            # Local inspection is execution context, never a scan target.
+            target = LOCAL_EXECUTION_TARGET
         argv = self.build_argv(target, kwargs)
         safe_argv = self._redact_argv(argv)
         if self.on_event:
@@ -371,7 +383,7 @@ class KaliTool:
         return argv
 
     def command_identity(self, target: str, parameters: dict[str, Any]) -> dict[str, Any]:
-        effective_target = "local-kali" if not self.requires_target else target
+        effective_target = LOCAL_EXECUTION_TARGET if not self.requires_target else target
         return {"argv": self._redact_argv(self.build_argv(effective_target, parameters))}
 
     def _resolve_executable(self) -> str:
@@ -518,6 +530,16 @@ class ToolRegistry:
         )
         return self.observations.signature(name, target, signature_action, identity)
 
+    @staticmethod
+    def _execution_target(adapter: FactTool, target: str) -> str:
+        """Return a target label suitable for evidence and cache events.
+
+        Adapters without a target (the ``inspect_*`` family) run on the
+        runner.  Keeping their logical target separate prevents a CIDR or a
+        discovered host from being polluted by local runtime observations.
+        """
+        return target if getattr(adapter, "requires_target", True) else LOCAL_EXECUTION_TARGET
+
     async def observe(self, name: str, target: str, action: str,
                       parameters: dict[str, Any] | None = None,
                       force_refresh: bool = False,
@@ -525,6 +547,7 @@ class ToolRegistry:
         """Execute one probe through the same durable cache used by ToolNode."""
         parameters = parameters or {}
         adapter = self.get(name)
+        execution_target = self._execution_target(adapter, target)
         # An approved grant freezes the target and concrete tool set for this
         # dispatch. Apply the boundary to every tool in the approved branch,
         # not only credential-material adapters.
@@ -559,13 +582,13 @@ class ToolRegistry:
                     "error_kind": "approval_required", "needs_human": True,
                 }
         try:
-            signature = self._signature(adapter, name, target, action, parameters)
+            signature = self._signature(adapter, name, execution_target, action, parameters)
         except Exception as exc:
             # Invalid reviewed parameters are still durable diagnostic
             # evidence; they must not escape ToolNode as an uncaught graph
             # exception or be retried forever.
             signature = self.observations.signature(
-                name, target, "invalid-command", {"parameters": parameters, "error": str(exc)}
+                name, execution_target, "invalid-command", {"parameters": parameters, "error": str(exc)}
             )
             recoverable = _recoverable_tool_error(name, "invalid_arguments", str(exc))
             result = {"ok": False, "tool": name, "error": str(exc),
@@ -577,20 +600,20 @@ class ToolRegistry:
         if cached is not None:
             on_event = getattr(adapter, "on_event", None)
             if on_event:
-                on_event("tool_cached", {"tool": name, "target": target,
+                on_event("tool_cached", {"tool": name, "target": execution_target,
                                           "signature": signature})
-            return self._cache_hit(cached, signature, action, name)
+            return self._cache_hit(cached, signature, action, name, execution_target)
         lock = self._observation_locks.setdefault(signature, asyncio.Lock())
         async with lock:
             cached = None if force_refresh else self.observations.get(signature)
             if cached is not None:
                 on_event = getattr(adapter, "on_event", None)
                 if on_event:
-                    on_event("tool_cached", {"tool": name, "target": target,
+                    on_event("tool_cached", {"tool": name, "target": execution_target,
                                               "signature": signature})
-                return self._cache_hit(cached, signature, action, name)
+                return self._cache_hit(cached, signature, action, name, execution_target)
             try:
-                evidence = await adapter.observe(target, action, **parameters)
+                evidence = await adapter.observe(execution_target, action, **parameters)
                 evidence_data = evidence.model_dump(mode="json")
                 if evidence.exit_code not in (None, 0):
                     error_kind = _tool_error_kind(evidence)
@@ -618,23 +641,29 @@ class ToolRegistry:
                 else:
                     result = {"ok": True, "tool": name, "evidence": evidence_data}
             except Exception as exc:
+                error_kind = "invalid_target" if isinstance(exc, PermissionError) else type(exc).__name__
+                recoverable = _recoverable_tool_error(name, error_kind, str(exc))
                 result = {"ok": False, "tool": name, "error": str(exc),
-                          "error_kind": type(exc).__name__, "recoverable": False,
-                          "retryable": False, "needs_human": True}
+                          "error_kind": error_kind, "recoverable": recoverable,
+                          "retryable": recoverable, "needs_human": not recoverable}
             self.observations.put(signature, result)
             return {**result, "signature": signature, "cached": False}
 
     @staticmethod
     def _cache_hit(cached: dict[str, Any], signature: str, action: str,
-                   tool_name: str | None = None) -> dict[str, Any]:
+                   tool_name: str | None = None, target: str | None = None) -> dict[str, Any]:
         result = {**cached, "signature": signature, "cached": True}
-        if not result.get("ok", True) and "recoverable" not in result:
+        if (not result.get("ok", True)
+                and ("recoverable" not in result or result.get("error_kind") == "PermissionError")):
+            cached_kind = str(result.get("error_kind", "nonzero_exit"))
+            if cached_kind == "PermissionError" and "target is not" in str(result.get("error", "")).lower():
+                cached_kind = "invalid_target"
             recoverable = _recoverable_tool_error(
                 tool_name or str(result.get("tool", "")),
-                str(result.get("error_kind", "nonzero_exit")),
+                cached_kind,
                 str(result.get("error", "")),
             )
-            result.update({"recoverable": recoverable, "retryable": recoverable,
+            result.update({"error_kind": cached_kind, "recoverable": recoverable, "retryable": recoverable,
                            "needs_human": not recoverable})
         if isinstance(cached.get("evidence"), dict):
             evidence = dict(cached["evidence"])
@@ -645,6 +674,8 @@ class ToolRegistry:
             facts["cache_hit"] = True
             facts["original_action"] = evidence.get("action")
             evidence["action"] = action
+            if target is not None:
+                evidence["target"] = target
             evidence["facts"] = facts
             result["evidence"] = evidence
         return result
@@ -721,6 +752,10 @@ def _recoverable_tool_error(tool_name: str, error_kind: str, detail: str = "") -
         # Invalid reviewed arguments are exactly what the ReAct model can
         # correct. Runtime/executable/approval failures need operator context.
         return error_kind == "invalid_arguments"
+    if error_kind == "invalid_target":
+        # The planner can select another authorized host; only an exhausted
+        # target set should reach the human boundary.
+        return True
     if error_kind in {"connectivity", "timeout", "permission_denied", "nonzero_exit"}:
         return True
     lowered = detail.lower()

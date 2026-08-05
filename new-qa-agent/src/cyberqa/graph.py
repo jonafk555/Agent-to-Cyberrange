@@ -55,6 +55,8 @@ def route_after_approval(state: QAState) -> str:
 def route_after_human(state: QAState) -> str:
     # A malformed/incomplete human instruction should ask the human again,
     # rather than going through the LLM with a stale no-progress state.
+    if state.get("aborted"):
+        return END
     return "human_help" if state.get("needs_human") else "supervisor"
 
 
@@ -97,5 +99,5 @@ def build_graph(agents: Agents | None = None, checkpointer=None):
          "judge": "judge", "reporting": "reporting", "human_help": "human_help", END: END},
     )
     graph.add_conditional_edges("human_help", route_after_human,
-                               {"human_help": "human_help", "supervisor": "supervisor"})
+                               {"human_help": "human_help", "supervisor": "supervisor", END: END})
     return graph.compile(checkpointer=checkpointer or _memory_saver())

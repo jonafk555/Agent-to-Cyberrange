@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from .models import Decision, Role, ToolParameters
+from .tools import is_local_target
 
 
 @dataclass(frozen=True)
@@ -71,12 +72,15 @@ def _error_kind(item: Any) -> str | None:
 def _target(state: dict[str, Any], domain: str | None) -> str:
     profiles = state.get("target_profiles", {}) or {}
     for target, profile in profiles.items():
-        if domain and profile.get("domain") == domain and profile.get("connectivity") == "reachable":
+        if (not is_local_target(str(target)) and domain
+                and profile.get("domain") == domain
+                and profile.get("connectivity") == "reachable"):
             return target
     for target in state.get("discovered_targets", []):
-        if "/" not in str(target):
+        if "/" not in str(target) and not is_local_target(str(target)):
             return str(target)
-    return state.get("target", "environment")
+    fallback = state.get("target", "environment")
+    return fallback if not is_local_target(str(fallback)) else "environment"
 
 
 def derive_context(state: dict[str, Any]) -> ADContext:
