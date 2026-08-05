@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import ipaddress
 import os
 import re
 from typing import Any, Annotated, Callable, TypedDict
@@ -423,7 +424,11 @@ class Agents:
             "evidence": [e.model_dump(mode="json") for e in state.get("evidence", [])[-20:]],
             "evidence_synthesis": state.get("evidence_synthesis", {}),
             "observed_signatures": list(state.get("observation_index", {}).keys())[-50:],
-            "available_tools": list(self.tools.tools),
+            "available_tools": [
+                name for name in self.tools.tools
+                if not name.startswith("inspect_")
+            ],
+            "runner_ips": state.get("runner_ips", []),
             "discovered_targets": state.get("discovered_targets", []),
             "recon_coverage": state.get("recon_coverage", {}),
             "no_progress_count": state.get("no_progress_count", 0),
@@ -438,9 +443,11 @@ class Agents:
                 item for item in state.get("human_directives", [])[-10:]
                 if item.get("intent") == "reject_previous"
             ],
+            "iteration": state.get("iteration", 0),
+            "replan_count": state.get("replan_count", 0),
             "approved_tool_parameters": state.get("last_decision").tool_parameters.model_dump(mode="json") if state.get("last_decision") else {},
             "capabilities": capability_catalog(),
-            "instruction": "Read the complete evidence.stdout, evidence.stderr, facts, and output_summary fields; the CLI progress preview is not the evidence. Reason over the complete evidence synthesis, not only the last result. Advance one or more unresolved findings. Cover all discovered hosts/services and cross-forest candidates. Treat recon_coverage as authoritative: a completed semantic check is not a new task merely because the action wording changed. Never repeat an identical effective argv; a different reviewed argv/profile is allowed only when it has an explicit expected evidence gain. Treat LDAP authentication, DNS context, forest mismatch, permissions, and command syntax as different hypotheses. The latest operator instruction is semantic, high-priority execution guidance, not a single fixed command: extract all requested goals, constraints, exclusions, ordering, target changes, username sources, and requested continuation, then combine them with the autonomous plan. Do not discard later clauses after recognizing one tool name. If the operator rejected the previous proposal, never reproduce that action/target/parameters; choose the next justified autonomous alternative. If domain credentials are absent and domain/DC plus a candidate username source are known, prioritize asrep_roasting_assessment immediately; AS-REP does not require a domain credential. Do not loop over empty-credential SMB/LDAP/NXC probes. If no username source exists, use only explicitly allowed anonymous enumeration or ask Human for CYBERQA_AD_USERS_FILE. For a CIDR, host discovery must begin with nmap -sn or -F; after hosts are found, perform nmap -sC -sV (or an explicitly justified reviewed profile) against each authorized non-local host before declaring the network empty. If discovery returns no hosts, adapt with the other discovery method and inspect routing/DNS instead of stopping. For check_port choose a profile or safe argv deliberately; for NXC choose a profile or safe argv deliberately. Return one primary decision plus useful next_options and exact tool_parameters, including argv/users_file when supplied.",
+            "instruction": "Read the complete evidence.stdout, evidence.stderr, facts, and output_summary fields; the CLI progress preview is not the evidence. Reason over the complete evidence synthesis, not only the last result. Advance one or more unresolved findings. Cover all discovered hosts/services and cross-forest candidates. The runner_ips list contains Kali/QA-runner addresses only: it is exclusion metadata, never a recon, validation, or testing target. `environment` is execution context, not a cyber-range host. Treat recon_coverage as authoritative: a completed semantic check is not a new task merely because the action wording changed. Never repeat an identical effective argv; a different reviewed argv/profile is allowed only when it has an explicit expected evidence gain. The execution ledger and observation cache are authoritative memory: if the effective command is already present, re-plan to a different unresolved target/service/capability instead of emitting it again. Treat LDAP authentication, DNS context, forest mismatch, permissions, and command syntax as different hypotheses. The latest operator instruction is semantic, high-priority execution guidance, not a single fixed command: extract all requested goals, constraints, exclusions, ordering, target changes, username sources, and requested continuation, then combine them with the autonomous plan. Do not discard later clauses after recognizing one tool name. If the operator rejected the previous proposal, never reproduce that action/target/parameters; choose the next justified autonomous alternative. If domain credentials are absent and domain/DC plus a candidate username source are known, prioritize asrep_roasting_assessment immediately; AS-REP does not require a domain credential. Do not loop over empty-credential SMB/LDAP/NXC probes. If no username source exists, use only explicitly allowed anonymous enumeration or ask Human for CYBERQA_AD_USERS_FILE. For a CIDR, host discovery must begin with nmap -sn or -F; after hosts are found, perform nmap -sC -sV (or an explicitly justified reviewed profile) against each authorized non-local host before declaring the network empty. If discovery returns no hosts, adapt with the other discovery method and inspect routing/DNS instead of stopping. For check_port choose a profile or safe argv deliberately; for NXC choose a profile or safe argv deliberately. `iteration` is telemetry, not a stop condition; keep the Supervisor making decisions until the objective is complete, no authorized unresolved path remains, or the model/tool boundary genuinely needs Human. Return one primary decision plus useful next_options and exact tool_parameters, including argv/users_file when supplied.",
         })
         self.progress("reasoning_start", agent=Role.SUPERVISOR.value)
         response = await model.ainvoke([
@@ -514,9 +521,9 @@ class Agents:
                     tool_parameters=ToolParameters(profile="default"),
                     expected_evidence=["open_ports", "service_inventory"],
                 )
-        # If -sn produced no host facts, the initial_recon fallback normally
-        # records fast. This leaves the next decision to the evidence-driven
-        # Supervisor while still carrying the explicit no-host condition.
+        # If discovery produces no host facts, leave the no-host condition in
+        # evidence and let the evidence-driven Supervisor choose the next
+        # remote diagnostic path.
         return None
 
     def _react_graph(self, role: Role, state: QAState, instruction: str | None = None,
@@ -525,16 +532,12 @@ class Agents:
         role_tool_names = {
             Role.VALIDATION: ("check_port", "check_dns_resolution", "ldap_bind", "smb_negotiate",
                               "http_health_check", "nxc_smb_recon", "nxc_ldap_recon",
-                              "impacket_rpc_recon", "inspect_routes",
-                              "inspect_dns_config"),
+                              "impacket_rpc_recon"),
             Role.TESTING: ("ad_domain_users", "ad_asrep_roasting", "ad_kerberoasting",
                            "ad_credential_validation", "ad_password_spray", "ad_bloodhound_collection",
                            "nxc_smb_recon", "nxc_ldap_recon", "check_port",
                            "ldap_bind", "smb_negotiate"),
-            Role.DEBUGGING: ("inspect_dns_config", "inspect_firewall", "inspect_routes", "inspect_time_sync",
-                             "inspect_os_version", "inspect_os_release", "inspect_interfaces", "inspect_open_ports",
-                             "inspect_acl", "inspect_local_users", "inspect_domain_users", "inspect_privileges",
-                             "inspect_sudo", "check_port", "check_dns_resolution", "ldap_bind", "smb_negotiate",
+            Role.DEBUGGING: ("check_port", "check_dns_resolution", "ldap_bind", "smb_negotiate",
                              "nxc_smb_recon", "nxc_ldap_recon", "impacket_rpc_recon"),
         }.get(role)
         available = [name for name in (role_tool_names or ()) if name in self.tools.tools]
@@ -749,82 +752,70 @@ class Agents:
         inner.add_edge("human", END)
         return inner.compile()
 
-    async def initial_recon(self, state: QAState) -> dict[str, Any]:
-        """Run a bounded baseline, then let the supervisor synthesize it."""
-        baseline_tools = [
-            "inspect_os_version", "inspect_os_release", "inspect_interfaces", "inspect_routes",
-            "inspect_dns_config", "inspect_open_ports", "inspect_local_users", "inspect_privileges",
-            "check_dns_resolution", "check_port",
-        ]
-        target = state.get("target", "environment")
-        available = [
-            name for name in baseline_tools
-            if name in self.tools.tools
-            # A CIDR is not a DNS name. Resolve discovered host/domain names
-            # later; never issue a meaningless `dig CIDR` probe.
-            and not (name == "check_dns_resolution" and "/" in target)
-        ]
+    @staticmethod
+    def _runner_ips_from_output(output: str) -> set[str]:
+        """Extract interface IP literals without treating them as targets."""
+        values: set[str] = set()
+        for candidate in re.findall(
+            r"(?<![\w.])(?:\d{1,3}\.){3}\d{1,3}(?![\w.])", output
+        ):
+            try:
+                address = ipaddress.ip_address(candidate)
+            except ValueError:
+                continue
+            if not address.is_loopback and not address.is_unspecified:
+                values.add(str(address))
+        return values
+
+    async def runner_identity(self, state: QAState) -> dict[str, Any]:
+        """Record only the QA runner identity before remote reconnaissance.
+
+        Kali is an execution host, not part of the cyber-range under test.
+        This bootstrap step intentionally runs one local interface query and
+        does not perform local OS, route, DNS, port, user, or privilege
+        reconnaissance.  The next graph node starts remote range discovery.
+        """
+        runner_ips = set(state.get("runner_ips", []))
+        for value in runner_ips:
+            self.tools.target_policy.mark_local(value)
+        runner_ips.update(self.tools.target_policy.local_ip_addresses())
+        available = ["inspect_interfaces"] if "inspect_interfaces" in self.tools.tools else []
         evidence: list[Evidence] = []
         observation_index = dict(state.get("observation_index", {}))
         proposal: dict[str, Any] = {
-            "phase": "initial_recon", "tools": available,
-            "deferred": ["ldap_bind", "nxc_smb_recon", "nxc_ldap_recon", "impacket_rpc_recon"],
-            "bounded": True,
+            "phase": "runner_identity", "tools": available,
+            "bounded": True, "excluded_from_recon": True,
         }
         for name in available:
             try:
-                parameters: dict[str, Any] = {}
-                if name == "check_port":
-                    # A CIDR starts with host discovery. A single authorized
-                    # host starts with a fast scan. Neither starts with the
-                    # expensive -sC/-sV probe.
-                    parameters = {"profile": "host_discovery" if "/" in target else "fast"}
-                result = await self.tools.observe(name, target, "initial_recon", parameters)
+                result = await self.tools.observe(
+                    name, LOCAL_EXECUTION_TARGET, "runner_identity", {}
+                )
                 if result.get("evidence"):
                     observed = Evidence.model_validate(result["evidence"])
                     evidence.append(observed)
-                    if name == "inspect_interfaces":
-                        # The scanner's own interface addresses are context,
-                        # never cyber-range targets to probe.
-                        for value in re.findall(
-                            r"(?<![\w.])(?:\d{1,3}\.){3}\d{1,3}(?![\w.])", observed.stdout
-                        ):
-                            self.tools.target_policy.mark_local(value)
+                    runner_ips.update(self._runner_ips_from_output(observed.stdout))
+                    for value in self._runner_ips_from_output(observed.stdout):
+                        self.tools.target_policy.mark_local(value)
                 elif not result.get("ok", False):
-                    evidence.append(Evidence(source=f"tool:{name}", action="initial_recon", target=target,
+                    evidence.append(Evidence(source=f"tool:{name}", action="runner_identity",
+                                             target=LOCAL_EXECUTION_TARGET,
                                              exit_code=-1, stderr=str(result.get("error", "tool failure")),
                                              facts={"ok": False, "tool_result": result}))
                 if result.get("signature"):
                     observation_index[result["signature"]] = {
-                        "tool": name, "target": target,
-                        "action": "initial_recon", "ok": result.get("ok", False),
+                        "tool": name, "target": LOCAL_EXECUTION_TARGET,
+                        "action": "runner_identity", "ok": result.get("ok", False),
                         "cached": result.get("cached", False),
                     }
             except Exception as exc:
-                evidence.append(Evidence(source=f"tool:{name}", action="initial_recon", target=target,
+                evidence.append(Evidence(source=f"tool:{name}", action="runner_identity",
+                                         target=LOCAL_EXECUTION_TARGET,
                                          exit_code=-1, stderr=str(exc), facts={"ok": False}))
-        # ICMP discovery can be filtered in a range. Adapt once to a fast TCP
-        # discovery scan before handing control to the Supervisor, instead of
-        # treating an empty -sn result as an empty environment.
-        if "/" in target and "check_port" in available:
-            discovered = {
-                host for item in evidence
-                for host in (item.facts.get("discovered_targets", []) if isinstance(item.facts, dict) else [])
-                if not is_local_target(str(host)) and self.tools.target_policy.allows(str(host))
-            }
-            if not discovered:
-                try:
-                    fallback = await self.tools.observe(
-                        "check_port", target, "initial_recon_fallback", {"profile": "fast"}
-                    )
-                    if fallback.get("evidence"):
-                        evidence.append(Evidence.model_validate(fallback["evidence"]))
-                except Exception as exc:
-                    evidence.append(Evidence(source="tool:check_port", action="initial_recon_fallback",
-                                             target=target, exit_code=-1, stderr=str(exc), facts={"ok": False}))
-        proposal["summary_ready"] = True
-        event = Event(type="INITIAL_RECON_COMPLETE", run_id=state["run_id"], emitted_by=Role.VALIDATION,
-                      target=target, evidence_ids=[item.id for item in evidence], payload=proposal)
+        proposal["runner_ips"] = sorted(runner_ips)
+        event = Event(type="RUNNER_IDENTIFIED", run_id=state["run_id"], emitted_by=Role.SUPERVISOR,
+                      target=LOCAL_EXECUTION_TARGET, evidence_ids=[item.id for item in evidence],
+                      payload=proposal)
         try:
             await self.events.publish(event)
         except Exception:
@@ -837,10 +828,6 @@ class Agents:
         for item in evidence:
             if not is_local_target(item.target):
                 discovered.add(item.target)
-            discovered.update(
-                str(host) for host in item.facts.get("discovered_targets", [])
-                if not is_local_target(str(host)) and self.tools.target_policy.allows(str(host))
-            )
         method_history = list(state.get("method_history", []))
         for observed in evidence:
             method_history.append({
@@ -856,11 +843,18 @@ class Agents:
             })
         return {"evidence": evidence, "events": [event], "baseline_complete": True,
                 "observation_index": observation_index, "discovered_targets": sorted(discovered),
+                "runner_ips": sorted(runner_ips),
                 "method_history": method_history[-200:],
                 **projection,
                 "needs_human": bool(proposal.get("needs_human")),
                 "human_requests": [proposal["human_request"]] if proposal.get("human_request") else [],
-                "messages": [AIMessage(content=f"Initial reconnaissance collected {len(evidence)} evidence item(s). ")]}
+                "messages": [AIMessage(content=(
+                    f"Runner identity recorded ({len(runner_ips)} IP(s)); remote reconnaissance is next."
+                ))]}
+
+    async def initial_recon(self, state: QAState) -> dict[str, Any]:
+        """Backward-compatible alias for the runner-only bootstrap step."""
+        return await self.runner_identity(state)
 
     async def supervisor(self, state: QAState) -> dict[str, Any]:
         iteration = state.get("iteration", 0) + 1
@@ -886,15 +880,6 @@ class Agents:
                 "human_directive": True,
                 "needs_human": False,
             }
-        if iteration > state.get("max_iterations", 20):
-            decision = Decision(next_agent="end", objective="stop", action="end", target="environment", justification="Iteration budget exhausted; human guidance is required to continue.")
-            return {"iteration": iteration, "phase": "human_help", "last_decision": decision,
-                    "pending_action": decision.model_dump(), "needs_human": True,
-                    "human_requests": [{
-                        "kind": "iteration_budget",
-                        "question": "自主迭代預算已用盡；請提供新的語意約束或輸入 abort。",
-                        "reason": decision.justification,
-                    }]}
         try:
             result = await self._structured_supervisor(state)
         except Exception as exc:
@@ -1006,14 +991,6 @@ class Agents:
                 justification="The selected capability was already observed; choose a materially different probe.",
             )
             capability_check["blocked"] = True
-        self.progress("supervisor_decision", agent=(decision.next_agent.value if isinstance(decision.next_agent, Role) else str(decision.next_agent)), action=decision.action,
-                      target=decision.target)
-        signature = json.dumps({
-            "capability": decision.capability,
-            "action": decision.action,
-            "target": decision.target,
-            "tool_parameters": decision.tool_parameters.model_dump(mode="json", exclude_none=True),
-        }, sort_keys=True)
         rejected_fingerprints = {
             str(item.get("rejected_fingerprint"))
             for item in state.get("human_directives", [])
@@ -1032,27 +1009,63 @@ class Agents:
                     "authorized probe or continue with the next evidence-driven path."
                 ),
             )
-            signature = json.dumps({
-                "capability": decision.capability,
-                "action": decision.action,
-                "target": decision.target,
-                "tool_parameters": decision.tool_parameters.model_dump(mode="json", exclude_none=True),
-            }, sort_keys=True)
-        history = state.get("action_history", [])
-        if history and history[-1] == signature:
-            decision = Decision(next_agent="end", objective="stop", action="end", target=decision.target,
-                                justification=(
-                                    "The same effective decision was already dispatched immediately before. "
-                                    "A changed target, credential/source, profile, or explicit operator instruction is required."
-                                ))
-            return {"iteration": iteration, "phase": "human_help", "last_decision": decision,
-                    "pending_action": decision.model_dump(), "action_history": history + [signature],
-                    "needs_human": True,
+        self.progress("supervisor_decision", agent=(decision.next_agent.value if isinstance(decision.next_agent, Role) else str(decision.next_agent)), action=decision.action,
+                      target=decision.target)
+        signature = self._effective_decision_signature(decision)
+        history = list(state.get("action_history", []))
+        legacy_signature = json.dumps({
+            "capability": decision.capability,
+            "action": decision.action,
+            "target": decision.target,
+            "tool_parameters": decision.tool_parameters.model_dump(mode="json", exclude_none=True),
+        }, sort_keys=True)
+        cached_result = None
+        try:
+            cached_result = self.tools.observations.get(signature)
+        except Exception:
+            # Planning must remain available even if an optional external
+            # observation store is unavailable; the in-state ledger still
+            # prevents a duplicate in this run.
+            cached_result = None
+        if signature in history or legacy_signature in history or cached_result is not None:
+            replan_count = state.get("replan_count", 0) + 1
+            if replan_count >= 3:
+                exhausted = Decision(
+                    next_agent="end", objective="stop", action="end", target=decision.target,
+                    justification=(
+                        "The Supervisor proposed the same effective command repeatedly and no distinct "
+                        "authorized evidence path was available after autonomous replanning."
+                    ),
+                )
+                return {
+                    "iteration": iteration, "phase": "human_help", "last_decision": exhausted,
+                    "pending_action": exhausted.model_dump(), "action_history": history,
+                    "replan_count": replan_count, "needs_human": True,
                     "human_requests": [{
                         "kind": "no_progress",
                         "question": "目前沒有新的自主證據路徑；請提供額外語意、目標/服務，或輸入 abort。",
-                        "reason": decision.justification,
-                    }]}
+                        "reason": exhausted.justification,
+                    }],
+                }
+            replan = Decision(
+                next_agent=Role.SUPERVISOR, objective=decision.objective,
+                action="replan_after_duplicate", target=decision.target,
+                justification=(
+                    "The effective command is already in the execution ledger or observation cache. "
+                    "Remain in Supervisor and choose a different unresolved target, service, profile, "
+                    "or capability; do not dispatch the cached command again."
+                ),
+                next_options=decision.next_options,
+            )
+            self.progress("supervisor_replan", agent=Role.SUPERVISOR.value,
+                          action=replan.action, target=replan.target,
+                          duplicate_signature=signature, replan_count=replan_count)
+            return {
+                "iteration": iteration, "phase": Role.SUPERVISOR,
+                "last_decision": replan, "pending_action": replan.model_dump(),
+                "action_history": history, "replan_count": replan_count,
+                "needs_human": False, "human_instruction": "",
+            }
         capability_history = state.get("capability_history", [])
         capability_history = capability_history + [{**capability_check, "iteration": iteration}]
         reused_grant = None
@@ -1076,6 +1089,7 @@ class Agents:
         return {"iteration": iteration, "phase": decision.next_agent, "last_decision": decision,
                 "pending_action": {**decision.model_dump(), "broker": capability_check},
                 "action_history": history + [signature], "capability_history": capability_history,
+                "replan_count": 0,
                 "approved_grant": reused_grant,
                 "human_instruction": ""}
 
@@ -1378,9 +1392,14 @@ class Agents:
         # stale decision and let the Supervisor interpret the full meaning of
         # the response.  A short "no" rejects the previous proposal; it does
         # not terminate the whole task or get reinterpreted as a new command.
-        patch = {"needs_human": False, "no_progress_count": 0, "action_history": [],
+        patch = {"needs_human": False, "no_progress_count": 0,
+                "action_history": list(state.get("action_history", [])),
                 "last_decision": None, "pending_action": None, "approved_grant": None,
                 "human_directive": False,
+                # Human guidance changes the planning context, not the
+                # execution ledger. Preserve prior command identities so the
+                # next Supervisor cannot unknowingly rerun an old probe.
+                "replan_count": 0,
                 "messages": [HumanMessage(content=f"Human guidance for supervisor: {safe_answer}")],
                 "human_instruction": safe_answer,
                 "human_directives": [directive_record],
@@ -1448,8 +1467,6 @@ class Agents:
         if runtime_config:
             apply_and_persist_runtime_config(runtime_config)
             patch["runtime_config"] = runtime_config
-        if not patch["aborted"] and state.get("iteration", 0) >= state.get("max_iterations", 20):
-            patch["max_iterations"] = state.get("iteration", 0) + 5
         return patch
 
     @staticmethod
@@ -1474,6 +1491,63 @@ class Agents:
         if not grant.get("allowed_tools"):
             grant["allowed_tools"] = approved_tools_for_decision(decision)
         return grant
+
+    def _effective_decision_signature(self, decision: Decision) -> str:
+        """Map a semantic decision to the registry's executable identity.
+
+        This is deliberately calculated by ``ToolRegistry`` so an action alias
+        such as ``service_enumeration`` and a direct ``check_port`` decision
+        resolve to the same reviewed argv and durable observation key.
+        """
+        planned = self._planned_tool_for_action(decision)
+        parameters: dict[str, Any] | None = None
+        tool_name: str | None = None
+        if planned:
+            tool_name, parameters = planned
+        elif decision.capability:
+            capability = get_capability(decision.capability)
+            allowed = [
+                name for name in (capability.allowed_tools if capability else [])
+                if name in self.tools.tools
+            ]
+            # A capability with one concrete adapter has one executable
+            # identity. Multi-tool capabilities remain a planner-level entry
+            # until the specialist selects the reviewed adapter.
+            if len(allowed) == 1:
+                tool_name = allowed[0]
+                parameters = normalize_capability_parameters(
+                    decision.capability, decision.tool_parameters
+                ).model_dump(mode="json", exclude_none=True)
+        elif not self.llm and isinstance(decision.next_agent, Role) and self.tools.tools:
+            # Match the deterministic offline specialist fallback. Without
+            # this mapping, a generic ``observe`` decision could repeatedly
+            # hit a cached first tool while its semantic fallback string kept
+            # changing, bypassing the effective-command ledger.
+            fallback_name = (
+                decision.next_agent.value
+                if decision.next_agent.value in self.tools.tools
+                else next(iter(self.tools.tools))
+            )
+            tool_name, parameters = fallback_name, {}
+        if tool_name and tool_name in self.tools.tools:
+            try:
+                return self.tools.command_signature(
+                    tool_name, decision.target, decision.action, parameters or {}
+                )
+            except Exception:
+                # Invalid parameters still need a stable planning identity so
+                # a malformed proposal cannot become an infinite retry.
+                pass
+        return json.dumps({
+            "decision": {
+                "capability": decision.capability,
+                "action": decision.action,
+                "target": decision.target,
+                "tool_parameters": decision.tool_parameters.model_dump(
+                    mode="json", exclude_none=True
+                ),
+            }
+        }, sort_keys=True)
 
     @staticmethod
     def _planned_tool_for_action(decision: Decision | None) -> tuple[str, dict[str, Any]] | None:

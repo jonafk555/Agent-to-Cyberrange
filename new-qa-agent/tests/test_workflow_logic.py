@@ -1,16 +1,43 @@
-from cyberqa.graph import route
-from cyberqa.models import Decision, Role
+from cyberqa.graph import entry_route, route
+from cyberqa.models import Decision, Evidence, Role
 from cyberqa.approval import approved_tools_for_decision
 from cyberqa.ad_playbooks import normalize_capability_parameters
 from cyberqa.ad_strategy import recommend as recommend_ad_method
 from cyberqa.execution_broker import CapabilityBroker
 from cyberqa.nodes import Agents
-from cyberqa.tools import build_kali_registry
+from cyberqa.tools import TargetPolicy, ToolRegistry, build_kali_registry
+
+
+class InterfaceOnlyTool:
+    name = "inspect_interfaces"
+
+    def __init__(self, calls):
+        self.calls = calls
+
+    async def observe(self, target, action, **kwargs):
+        self.calls.append((target, action))
+        return Evidence(
+            source="runner:interfaces", action=action, target=target,
+            stdout='[{"addr_info":[{"local":"10.0.0.42"}]}]',
+        )
 
 
 def test_router_accepts_literal_end_and_approval_values():
     approval = Decision(next_agent="approval", objective="x", action="x", target="t", justification="x")
     assert route({"last_decision": approval}) == "approval"
+
+
+def test_router_keeps_supervisor_replans_inside_supervisor():
+    replan = Decision(
+        next_agent=Role.SUPERVISOR, objective="recon", action="replan_after_duplicate",
+        target="10.0.0.1", justification="effective command already observed",
+    )
+    assert route({"last_decision": replan}) == "supervisor"
+
+
+def test_graph_bootstraps_runner_identity_before_supervisor():
+    assert entry_route({"baseline_complete": False}) == "runner_identity"
+    assert entry_route({"baseline_complete": True}) == "supervisor"
 
 
 def test_human_semantics_keep_compound_guidance_for_supervisor():
@@ -36,6 +63,34 @@ def test_network_transition_excludes_runner_name():
     assert decision.target == "10.0.0.1"
 
 
+def test_runner_identity_only_collects_kali_ip_before_remote_recon():
+    import asyncio
+
+    calls = []
+    policy = TargetPolicy(["10.0.0.0/24"])
+    registry = ToolRegistry(
+        tools={"inspect_interfaces": InterfaceOnlyTool(calls)},
+        target_policy=policy,
+    )
+    result = asyncio.run(Agents(tools=registry).runner_identity({
+        "run_id": "runner-test",
+        "target": "10.0.0.0/24",
+        "runner_ips": [],
+        "discovered_targets": ["10.0.0.0/24"],
+        "evidence": [],
+        "target_profiles": {},
+        "ad_knowledge": {},
+        "runtime_config": {},
+        "method_history": [],
+        "observation_index": {},
+    }))
+
+    assert calls == [("environment", "runner_identity")]
+    assert "10.0.0.42" in result["runner_ips"]
+    assert not registry.target_policy.allows("10.0.0.42")
+    assert result["discovered_targets"] == ["10.0.0.0/24"]
+
+
 def test_human_help_handles_missing_request_and_rejects_previous_decision(monkeypatch):
     monkeypatch.setenv("CYBERQA_OBSERVATION_DB", ":memory:")
     monkeypatch.setattr("cyberqa.nodes.interrupt", lambda request: "no")
@@ -47,6 +102,7 @@ def test_human_help_handles_missing_request_and_rejects_previous_decision(monkey
         "evidence": [],
         "human_requests": [],
         "human_directives": [],
+        "action_history": ["already-executed-command"],
         "last_decision": Decision(
             next_agent=Role.VALIDATION, objective="recon", action="service_enumeration",
             target="local-kali", justification="bad target",
@@ -58,6 +114,7 @@ def test_human_help_handles_missing_request_and_rejects_previous_decision(monkey
 
     assert result["last_decision"] is None
     assert result["human_directives"][0]["intent"] == "reject_previous"
+    assert result["action_history"] == ["already-executed-command"]
 
 
 def test_decision_schema_closes_nested_tool_parameters_object():

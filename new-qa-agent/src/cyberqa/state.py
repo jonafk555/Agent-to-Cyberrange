@@ -34,6 +34,9 @@ class QAState(TypedDict, total=False):
     iteration: int
     max_iterations: int
     action_history: list[str]
+    # Number of times the Supervisor had to re-plan because the proposed
+    # effective command was already present in the execution ledger.
+    replan_count: int
     method_history: list[dict[str, Any]]
     completed_goals: list[str]
     errors: list[str]
@@ -56,6 +59,9 @@ class QAState(TypedDict, total=False):
     baseline_complete: bool
     observation_index: Annotated[dict[str, Any], merge_dict]
     no_progress_count: int
+    # IPs belonging to the QA runner; these are exclusion metadata, not QA
+    # targets and must never enter recon/validation coverage.
+    runner_ips: list[str]
     discovered_targets: list[str]
     recon_coverage: Annotated[dict[str, Any], merge_dict]
     ad_knowledge: ADKnowledge

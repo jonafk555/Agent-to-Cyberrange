@@ -36,7 +36,7 @@ def route(state: QAState) -> str:
 
 
 def entry_route(state: QAState) -> str:
-    return "supervisor" if state.get("baseline_complete") else "initial_recon"
+    return "supervisor" if state.get("baseline_complete") else "runner_identity"
 
 
 def route_after_agent(state: QAState) -> str:
@@ -64,7 +64,7 @@ def build_graph(agents: Agents | None = None, checkpointer=None):
     agents = agents or Agents()
     graph = StateGraph(QAState)
     graph.add_node("supervisor", agents.supervisor)
-    graph.add_node("initial_recon", agents.initial_recon)
+    graph.add_node("runner_identity", agents.runner_identity)
 
     async def validation(s):
         return await agents.specialist(Role.VALIDATION, s)
@@ -88,9 +88,9 @@ def build_graph(agents: Agents | None = None, checkpointer=None):
     graph.add_node("reporting", reporting)
     graph.add_node("approval", agents.approval)
     graph.add_node("human_help", agents.human_help)
-    graph.add_conditional_edges(START, entry_route, {"initial_recon": "initial_recon", "supervisor": "supervisor"})
-    graph.add_conditional_edges("initial_recon", route_after_agent, {"human_help": "human_help", "supervisor": "supervisor"})
-    graph.add_conditional_edges("supervisor", route, {"validation":"validation", "testing":"testing", "debugging":"debugging", "judge":"judge", "reporting":"reporting", "approval":"approval", "human_help":"human_help", END:END})
+    graph.add_conditional_edges(START, entry_route, {"runner_identity": "runner_identity", "supervisor": "supervisor"})
+    graph.add_conditional_edges("runner_identity", route_after_agent, {"human_help": "human_help", "supervisor": "supervisor"})
+    graph.add_conditional_edges("supervisor", route, {"supervisor":"supervisor", "validation":"validation", "testing":"testing", "debugging":"debugging", "judge":"judge", "reporting":"reporting", "approval":"approval", "human_help":"human_help", END:END})
     for node in ("validation", "testing", "debugging", "judge", "reporting"):
         graph.add_conditional_edges(node, route_after_agent, {"human_help": "human_help", "supervisor": "supervisor"})
     graph.add_conditional_edges(

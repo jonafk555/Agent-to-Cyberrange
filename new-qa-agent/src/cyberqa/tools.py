@@ -25,6 +25,7 @@ LOCAL_TARGET_NAMES = frozenset({
     "environment", "local-kali", "local_kali", "local-runtime", "local_runtime",
     "local-runner", "local_runner", "runner", "kali",
 })
+RUNNER_IDENTITY_TOOL = "inspect_interfaces"
 
 
 class FactTool(Protocol):
@@ -126,6 +127,24 @@ class TargetPolicy:
 
     def snapshot(self) -> list[str]:
         return sorted(self.entries)
+
+    def local_ip_addresses(self) -> list[str]:
+        """Return IP literals known to belong to the QA runner.
+
+        These addresses are runner metadata only.  They are used to exclude
+        the Kali host from a CIDR scan; they are never returned as a remote
+        cyber-range target.
+        """
+        addresses: set[str] = set()
+        for value in self.local_hosts:
+            host = _target_host(value)
+            try:
+                address = ipaddress.ip_address(host)
+            except ValueError:
+                continue
+            if not address.is_loopback and not address.is_unspecified:
+                addresses.add(str(address))
+        return sorted(addresses)
 
 
 @dataclass
@@ -530,6 +549,21 @@ class ToolRegistry:
         )
         return self.observations.signature(name, target, signature_action, identity)
 
+    def command_signature(self, name: str, target: str, action: str,
+                          parameters: dict[str, Any] | None = None) -> str:
+        """Return the durable identity of the command a decision would run.
+
+        Supervisor decisions use semantic action names (for example,
+        ``service_enumeration``), while the registry executes a concrete
+        reviewed adapter and argv.  Exposing the registry's own signature
+        calculation lets planning consult the same execution memory instead
+        of maintaining a second, weaker notion of "duplicate".
+        """
+        parameters = parameters or {}
+        adapter = self.get(name)
+        execution_target = self._execution_target(adapter, target)
+        return self._signature(adapter, name, execution_target, action, parameters)
+
     @staticmethod
     def _execution_target(adapter: FactTool, target: str) -> str:
         """Return a target label suitable for evidence and cache events.
@@ -548,6 +582,19 @@ class ToolRegistry:
         parameters = parameters or {}
         adapter = self.get(name)
         execution_target = self._execution_target(adapter, target)
+        if name.startswith("inspect_") and not (
+            name == RUNNER_IDENTITY_TOOL and action == "runner_identity"
+        ):
+            # Kali is the QA executor, not a cyber-range asset.  Keep the
+            # interface lookup as the sole bootstrap exception; local OS,
+            # route, DNS, port, user, and privilege inspections cannot enter
+            # recon/validation through the tool boundary.
+            return {
+                "ok": False, "tool": name,
+                "error": "Local runner inspection is limited to runner_identity/inspect_interfaces",
+                "error_kind": "runner_context_only", "recoverable": False,
+                "retryable": False, "needs_human": False,
+            }
         # An approved grant freezes the target and concrete tool set for this
         # dispatch. Apply the boundary to every tool in the approved branch,
         # not only credential-material adapters.

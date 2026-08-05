@@ -33,10 +33,14 @@ def write_initial_recon_report(values: dict, scenario_id: str) -> str:
     report_dir.mkdir(parents=True, exist_ok=True)
     path = report_dir / f"{scenario_id}-initial-recon.md"
     evidence = [item for item in values.get("evidence", []) if getattr(item, "action", "") == "initial_recon"]
-    lines = [f"# Cyber Range Initial Reconnaissance — {scenario_id}", "",
+    lines = [f"# Cyber Range QA Runner Bootstrap — {scenario_id}", "",
              f"Generated: {datetime.now(timezone.utc).isoformat()}",
              f"Target: `{values.get('target', 'not specified')}`", "",
-             "This report contains observed facts from the mandatory baseline reconnaissance phase.", ""]
+             "This report contains remote cyber-range observations. The QA runner itself is execution context, not a target.", ""]
+    runner_ips = values.get("runner_ips", [])
+    lines.extend(["## QA runner identity", "", "The following IPs belong to Kali/the QA runner and are excluded from reconnaissance and validation:", ""])
+    lines.extend([f"- `{item}`" for item in runner_ips] or ["- No runner IP was reported by the interface bootstrap."])
+    lines.append("")
     expected_keys = (
         "CYBERQA_EXPECTED_LOCAL_USERS", "CYBERQA_EXPECTED_DOMAIN_USERS",
         "CYBERQA_EXPECTED_PRIVILEGED_GROUPS", "CYBERQA_EXPECTED_OPEN_PORTS",
@@ -148,7 +152,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--target", default=os.getenv("CYBERQA_TARGET", ""), help="Authorized lab network or target")
     parser.add_argument("--objective", default=os.getenv("CYBERQA_OBJECTIVE", "Validate the range and produce a QA scorecard"))
     parser.add_argument("--scenario-id", default=os.getenv("CYBERQA_SCENARIO_ID", "demo"))
-    parser.add_argument("--max-iterations", type=int, default=int(os.getenv("CYBERQA_MAX_ITERATIONS", "8")))
+    parser.add_argument(
+        "--max-iterations", type=int,
+        default=int(os.getenv("CYBERQA_MAX_ITERATIONS", "8")),
+        help="legacy telemetry hint; it does not stop autonomous Supervisor routing",
+    )
     parser.add_argument("--allowed-targets", default=None,
                         help="Comma-separated allowlist; defaults to CYBERQA_ALLOWED_TARGETS")
     parser.add_argument("--once", action="store_true",
@@ -184,11 +192,11 @@ async def run(args: argparse.Namespace | None = None) -> None:
                 interrupt_value = update["__interrupt__"]
                 continue
             for node, patch in update.items():
-                if node == "initial_recon":
+                if node == "runner_identity":
                     snapshot = await app.aget_state(task_config)
                     report_path = write_initial_recon_report(snapshot.values, snapshot.values.get("scenario_id", "scenario"))
-                    print(f"[Recon] baseline report written: {report_path}", flush=True)
-                if node in {"initial_recon", "supervisor", "validation", "testing", "debugging", "judge", "reporting"}:
+                    print(f"[Runner] identity recorded; report written: {report_path}", flush=True)
+                if node in {"runner_identity", "supervisor", "validation", "testing", "debugging", "judge", "reporting"}:
                     print(f"[Graph] {node} node completed; state updated", flush=True)
         snapshot = await app.aget_state(task_config)
         # LangGraph versions differ: some expose interrupts in stream updates,
@@ -225,6 +233,7 @@ async def run(args: argparse.Namespace | None = None) -> None:
         initial = {"run_id": str(uuid4()), "scenario_id": scenario_id, "objective": task_objective,
                    "target": target, "iteration": 0, "max_iterations": args.max_iterations,
                    "hosts": {}, "evidence": [], "events": [], "approvals": [], "action_history": [],
+                   "replan_count": 0,
                    "method_history": [],
                    "completed_goals": [], "errors": [], "memory": {}, "human_requests": [],
                    "react_steps": 0, "needs_human": False, "aborted": False,
@@ -232,6 +241,7 @@ async def run(args: argparse.Namespace | None = None) -> None:
                    "recovery_mode": False,
                    "baseline_complete": False, "approved_grant": None,
                    "no_progress_count": 0,
+                   "runner_ips": [],
                    "discovered_targets": [target], "recon_coverage": {},
                    "ad_knowledge": ADKnowledge().model_dump(), "capability_history": [],
                    "target_profiles": {}, "evidence_synthesis": {}, "runtime_config": runtime_config,
@@ -275,7 +285,7 @@ async def run(args: argparse.Namespace | None = None) -> None:
                         }],
                         "runtime_config": runtime_config,
                         "no_progress_count": 0,
-                        "action_history": [],
+                        "replan_count": 0,
                         "messages": [HumanMessage(content=f"Human guidance: {safe_answer}")],
                     }, task_config)
                 else:

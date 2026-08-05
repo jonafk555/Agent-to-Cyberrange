@@ -50,6 +50,20 @@ def test_nmap_default_and_nxc_profiles_are_reviewed_but_selectable():
     ]
 
 
+def test_semantic_probe_aliases_share_effective_command_signature(monkeypatch):
+    monkeypatch.setenv("CYBERQA_OBSERVATION_DB", ":memory:")
+    registry = build_kali_registry(allowed_targets=["10.0.0.1"])
+
+    semantic = registry.command_signature(
+        "check_port", "10.0.0.1", "service_enumeration", {"profile": "default"}
+    )
+    direct = registry.command_signature(
+        "check_port", "10.0.0.1", "nmap_service_detection", {"profile": "default"}
+    )
+
+    assert semantic == direct
+
+
 def test_nmap_and_nxc_accept_reviewed_dynamic_argv_fragments():
     registry = build_kali_registry(allowed_targets=["10.0.0.1"])
     assert registry.get("check_port").build_argv("10.0.0.1", {
@@ -122,7 +136,7 @@ def test_runner_names_are_never_remote_recon_targets():
 
 
 @pytest.mark.asyncio
-async def test_local_inspection_is_not_labeled_as_a_recon_target(monkeypatch):
+async def test_runner_interface_lookup_is_labeled_as_execution_context(monkeypatch):
     monkeypatch.setenv("CYBERQA_OBSERVATION_DB", ":memory:")
 
     async def fake_create_subprocess_exec(*argv, **kwargs):
@@ -131,10 +145,23 @@ async def test_local_inspection_is_not_labeled_as_a_recon_target(monkeypatch):
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
     registry = build_kali_registry(allowed_targets=["10.0.0.0/24"])
     result = await registry.observe(
-        "inspect_os_version", "10.0.0.0/24", "initial_recon", force_refresh=True
+        "inspect_interfaces", "10.0.0.0/24", "runner_identity", force_refresh=True
     )
 
     assert result["evidence"]["target"] == "environment"
+
+
+@pytest.mark.asyncio
+async def test_non_identity_runner_inspection_is_blocked(monkeypatch):
+    monkeypatch.setenv("CYBERQA_OBSERVATION_DB", ":memory:")
+    registry = build_kali_registry(allowed_targets=["10.0.0.0/24"])
+
+    result = await registry.observe(
+        "inspect_os_version", "10.0.0.0/24", "initial_recon", force_refresh=True
+    )
+
+    assert result["error_kind"] == "runner_context_only"
+    assert result["needs_human"] is False
 
 
 def test_empty_tool_selection_is_not_expanded_to_registry():
