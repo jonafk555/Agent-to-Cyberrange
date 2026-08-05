@@ -16,7 +16,7 @@ from dotenv import dotenv_values, load_dotenv
 from .graph import build_graph
 from .llm import build_llm
 from .nodes import Agents
-from .tools import build_kali_registry, summarize_output
+from .tools import build_kali_registry, is_local_target, summarize_output
 
 
 load_dotenv()
@@ -145,7 +145,7 @@ def print_progress(event: str, data: dict) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Cyber-range QA ReAct multi-agent")
-    parser.add_argument("--target", default=os.getenv("CYBERQA_TARGET", "127.0.0.1"), help="Authorized lab target")
+    parser.add_argument("--target", default=os.getenv("CYBERQA_TARGET", ""), help="Authorized lab network or target")
     parser.add_argument("--objective", default=os.getenv("CYBERQA_OBJECTIVE", "Validate the range and produce a QA scorecard"))
     parser.add_argument("--scenario-id", default=os.getenv("CYBERQA_SCENARIO_ID", "demo"))
     parser.add_argument("--max-iterations", type=int, default=int(os.getenv("CYBERQA_MAX_ITERATIONS", "8")))
@@ -160,6 +160,10 @@ async def run(args: argparse.Namespace | None = None) -> None:
     # This is the LLM API connection point. Without OPENAI_API_KEY the package
     # deliberately runs in offline, observe-only fallback mode.
     args = args or parse_args()
+    if not args.target:
+        raise SystemExit("--target is required; provide the authorized cyber-range network, for example 10.0.0.0/24")
+    if is_local_target(args.target):
+        raise SystemExit("Refusing localhost/loopback as --target; provide the authorized cyber-range network instead")
     if args.allowed_targets:
         configured_targets = {item.strip() for item in args.allowed_targets.split(",") if item.strip()}
     else:
@@ -222,6 +226,9 @@ async def run(args: argparse.Namespace | None = None) -> None:
                    "method_history": [],
                    "completed_goals": [], "errors": [], "memory": {}, "human_requests": [],
                    "react_steps": 0, "needs_human": False, "aborted": False,
+                   "human_directive": False,
+                   "human_instruction": "", "human_directives": [],
+                   "recovery_mode": False,
                    "baseline_complete": False, "approved_grant": None,
                    "no_progress_count": 0,
                    "discovered_targets": [target], "recon_coverage": {},
@@ -253,6 +260,9 @@ async def run(args: argparse.Namespace | None = None) -> None:
                 if request.get("synthetic"):
                     result, interrupt_value = await stream_graph({
                         "needs_human": False,
+                        "human_directive": False,
+                        "human_instruction": answer,
+                        "human_directives": [{"instruction": answer, "source": "human"}],
                         "no_progress_count": 0,
                         "action_history": [],
                         "messages": [HumanMessage(content=f"Human guidance: {answer}")],

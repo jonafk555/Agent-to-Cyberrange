@@ -40,6 +40,18 @@ class QAState(TypedDict, total=False):
     human_requests: Annotated[list[dict[str, Any]], lambda a, b: a + b]
     react_steps: int
     needs_human: bool
+    # Set when a human has supplied an explicit next action.  The supervisor
+    # must dispatch this frozen decision instead of asking the LLM to reinterpret
+    # the instruction on the next tick.
+    human_directive: bool
+    # Full operator guidance is kept as a first-class planning input.  It is
+    # not dependent on the LLM remembering a HumanMessage from an earlier
+    # checkpoint.
+    human_instruction: str
+    human_directives: Annotated[list[dict[str, Any]], lambda a, b: a + b]
+    # Allows a specialist to use the read-only recovery tool set after a
+    # recoverable command failure. It is cleared when that specialist returns.
+    recovery_mode: bool
     aborted: bool
     baseline_complete: bool
     observation_index: Annotated[dict[str, Any], merge_dict]

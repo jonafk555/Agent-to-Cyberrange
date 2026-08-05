@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from typing import Any, Annotated, Callable, TypedDict
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
@@ -22,7 +23,7 @@ from .execution_broker import CapabilityBroker
 from .models import (ADRisk, Decision, Event, Evidence, Hypothesis, Role, Scorecard, Service,
                       ServiceProtocol, ToolParameters)
 from .state import QAState
-from .tools import ToolRegistry
+from .tools import ToolRegistry, is_local_target
 
 
 AD_QA_PLAYBOOK = """For an AD range, do not stop at one domain controller. Inventory all valuable
@@ -54,6 +55,8 @@ class ReactState(TypedDict, total=False):
     tool_signatures: list[str]
     needs_human: bool
     human_request: dict[str, Any]
+    recovery_failures: list[str]
+    recovery_steps: int
 
 
 class Agents:
@@ -110,7 +113,11 @@ class Agents:
                             if f"--{name}" in argv), "default")
             return f"nxc_ldap:{profile}", "nxc_ldap"
         if "check_port" in source or "nmap" in source:
-            if "--top-ports 1000" in argv:
+            if " -sn" in f" {argv} ":
+                profile = "host_discovery"
+            elif " -F" in f" {argv} ":
+                profile = "fast"
+            elif "--top-ports 1000" in argv:
                 profile = "top1000"
             elif "--top-ports 100" in argv:
                 profile = "top100"
@@ -120,9 +127,25 @@ class Agents:
                 profile = "default"
             return f"nmap:{profile}", "nmap"
         if "ldap_bind" in source or "ldapsearch" in source:
-            return "ldap:anonymous_rootdse", "ldap"
+            if "-ZZ" in argv:
+                profile = "starttls_rootdse"
+            elif "-Y GSSAPI" in argv:
+                profile = "gssapi_rootdse"
+            elif "-s sub" in argv:
+                profile = "subtree"
+            else:
+                profile = "rootdse"
+            return f"ldap:{profile}", "ldap"
         if "smb_negotiate" in source or "smbclient" in source:
-            return "smb:anonymous_negotiate", "smb"
+            if "-m SMB2" in argv:
+                profile = "smb2"
+            elif "-m SMB3" in argv:
+                profile = "smb3"
+            elif "-p 445" in argv:
+                profile = "port445"
+            else:
+                profile = "anonymous"
+            return f"smb:{profile}", "smb"
         if "check_dns" in source or "dig" in source:
             return "dns:resolution", "dns"
         return f"{evidence.source}:{evidence.action}", "other"
@@ -229,7 +252,10 @@ class Agents:
             known.add("user enumeration")
             known.add("candidate username source")
         users_file = os.getenv("CYBERQA_AD_USERS_FILE", "")
-        if users_file and os.path.isfile(os.path.expanduser(users_file)):
+        # A path supplied by the operator is an intentional candidate source.
+        # Let the reviewed adapter report a missing/unreadable file instead of
+        # silently falling back to anonymous recon.
+        if users_file:
             known.add("candidate username source")
         if knowledge.get("credentials_validated"):
             known.add("validated domain credential")
@@ -338,6 +364,8 @@ class Agents:
                 "exit_code": evidence.exit_code,
                 "stderr": evidence.stderr[-2000:],
                 "argv": evidence.facts.get("argv") if isinstance(evidence.facts, dict) else None,
+                "error_kind": evidence.facts.get("error_kind") if isinstance(evidence.facts, dict) else None,
+                "recoverable": evidence.facts.get("recoverable", False) if isinstance(evidence.facts, dict) else False,
             }
             for evidence in state.get("evidence", [])[-20:]
             if evidence.exit_code not in (None, 0) or evidence.facts.get("ok") is False
@@ -358,9 +386,11 @@ class Agents:
             "ad_knowledge": state.get("ad_knowledge", {}),
             "target_profiles": state.get("target_profiles", {}),
             "runtime_config": state.get("runtime_config", {}),
+            "operator_instruction": state.get("human_instruction", ""),
+            "operator_instruction_history": state.get("human_directives", [])[-10:],
             "approved_tool_parameters": state.get("last_decision").tool_parameters.model_dump(mode="json") if state.get("last_decision") else {},
             "capabilities": capability_catalog(),
-            "instruction": "Read the complete evidence.stdout, evidence.stderr, facts, and output_summary fields; the CLI progress preview is not the evidence. Reason over the complete evidence synthesis, not only the last result. Advance one or more unresolved findings. Cover all discovered hosts/services and cross-forest candidates. Treat recon_coverage as authoritative: a completed semantic check is not a new task merely because the action wording changed. Never repeat an identical effective argv; a different reviewed argv/profile is allowed only when it has an explicit expected evidence gain. Treat LDAP authentication, DNS context, forest mismatch, permissions, and command syntax as different hypotheses. If domain credentials are absent and domain/DC plus a candidate username source are known, prioritize asrep_roasting_assessment immediately; AS-REP does not require a domain credential. Do not loop over empty-credential SMB/LDAP/NXC probes. If no username source exists, use only explicitly allowed anonymous enumeration or ask Human for CYBERQA_AD_USERS_FILE. For check_port choose a profile or safe argv deliberately; for NXC choose a profile or safe argv deliberately. Return one primary decision plus useful next_options and exact tool_parameters, including argv/users_file when supplied.",
+            "instruction": "Read the complete evidence.stdout, evidence.stderr, facts, and output_summary fields; the CLI progress preview is not the evidence. Reason over the complete evidence synthesis, not only the last result. Advance one or more unresolved findings. Cover all discovered hosts/services and cross-forest candidates. Treat recon_coverage as authoritative: a completed semantic check is not a new task merely because the action wording changed. Never repeat an identical effective argv; a different reviewed argv/profile is allowed only when it has an explicit expected evidence gain. Treat LDAP authentication, DNS context, forest mismatch, permissions, and command syntax as different hypotheses. If an operator instruction is present, it is a high-priority execution requirement: apply its target, username file, tool, profile, and requested next step unless the target policy, missing prerequisite, or approval gate blocks it; explain the exact blocker. If domain credentials are absent and domain/DC plus a candidate username source are known, prioritize asrep_roasting_assessment immediately; AS-REP does not require a domain credential. Do not loop over empty-credential SMB/LDAP/NXC probes. If no username source exists, use only explicitly allowed anonymous enumeration or ask Human for CYBERQA_AD_USERS_FILE. For a CIDR, host discovery must begin with nmap -sn or -F; after hosts are found, perform nmap -sC -sV (or an explicitly justified reviewed profile) against each authorized non-local host before declaring the network empty. If discovery returns no hosts, adapt with the other discovery method and inspect routing/DNS instead of stopping. For check_port choose a profile or safe argv deliberately; for NXC choose a profile or safe argv deliberately. Return one primary decision plus useful next_options and exact tool_parameters, including argv/users_file when supplied.",
         })
         self.progress("reasoning_start", agent=Role.SUPERVISOR.value)
         response = await model.ainvoke([
@@ -370,13 +400,70 @@ class Agents:
                     "diagnostic evidence: send them to debugging, do not blindly repeat them. "
                     "Select an AD capability when applicable and fill prerequisites, expected_evidence, "
                     "risk, tool_parameters, and next_options. You may propose a multi-step chain; the execution broker "
-                    "will enforce scope and approvals. "
+                    "will enforce scope and approvals. Treat the latest operator instruction as an explicit constraint, "
+                    "not optional context. "
                     "Do not execute tools. Return a Decision object."
             )),
             *self._conversation_context(state.get("messages", [])),
             HumanMessage(content=prompt),
         ])
         return response if isinstance(response, Decision) else Decision.model_validate(response)
+
+    def _network_recon_transition(self, state: QAState) -> Decision | None:
+        """Return the next staged Nmap action for an authorized network.
+
+        This is a bounded guard, not a fixed AD workflow: the LLM remains free
+        to choose identity, trust, or testing paths once each discovered host
+        has a service baseline. It only prevents the common mistake of running
+        -sC/-sV against a whole CIDR before host discovery, or stopping after
+        an ICMP-filtered -sn result.
+        """
+        network = str(state.get("target", ""))
+        if "/" not in network:
+            return None
+        coverage = state.get("recon_coverage", {}) or {}
+        network_checks = coverage.get(network, {}).get("checks", {}) if isinstance(coverage.get(network), dict) else {}
+        discovery_done = any(
+            network_checks.get(f"nmap:{profile}", {}).get("status") == "completed"
+            for profile in ("host_discovery", "fast")
+        )
+        if not discovery_done:
+            return Decision(
+                next_agent=Role.VALIDATION, objective="discover live authorized range hosts",
+                action="network_host_discovery", target=network,
+                justification="Start CIDR reconnaissance with host discovery before service detection.",
+                tool_parameters=ToolParameters(profile="host_discovery"),
+                expected_evidence=["discovered_targets"],
+            )
+        hosts = []
+        for value in state.get("discovered_targets", []):
+            host = str(value)
+            if host == network or self.tools.target_policy.is_local(host):
+                continue
+            if host not in hosts:
+                hosts.append(host)
+        for host in hosts:
+            profile = coverage.get(host, {})
+            checks = profile.get("checks", {}) if isinstance(profile, dict) else {}
+            has_service_baseline = any(
+                checks.get(f"nmap:{candidate}", {}).get("status") == "completed"
+                for candidate in ("default", "ad_tcp", "top100", "top1000")
+            )
+            if not has_service_baseline:
+                return Decision(
+                    next_agent=Role.VALIDATION, objective="enumerate services on discovered range host",
+                    action="service_enumeration", target=host,
+                    justification=(
+                        "The host was discovered in the authorized network but has no service baseline. "
+                        "Run the reviewed nmap -sC -sV probe, then adapt from the resulting services."
+                    ),
+                    tool_parameters=ToolParameters(profile="default"),
+                    expected_evidence=["open_ports", "service_inventory"],
+                )
+        # If -sn produced no host facts, the initial_recon fallback normally
+        # records fast. This leaves the next decision to the evidence-driven
+        # Supervisor while still carrying the explicit no-host condition.
+        return None
 
     def _react_graph(self, role: Role, state: QAState, instruction: str | None = None,
                      tool_names: list[str] | None = None):
@@ -421,6 +508,7 @@ class Agents:
         if authorization is None:
             selected_names = [name for name in selected_names if name not in SENSITIVE_TOOL_NAMES]
         decision = state.get("last_decision")
+        recovery_mode = bool(state.get("recovery_mode"))
         has_ad_credentials = bool(os.getenv("CYBERQA_AD_DOMAIN") and
                                   os.getenv("CYBERQA_AD_USERNAME") and
                                   os.getenv("CYBERQA_AD_PASSWORD"))
@@ -431,10 +519,10 @@ class Agents:
         allow_anonymous_nxc = bool(decision_parameters.get("allow_anonymous_nxc")) or os.getenv(
             "CYBERQA_ALLOW_ANONYMOUS_NXC", "0"
         ) == "1"
-        if not has_ad_credentials and not allow_anonymous_nxc:
+        if not recovery_mode and not has_ad_credentials and not allow_anonymous_nxc:
             selected_names = [name for name in selected_names
                               if name not in {"nxc_smb_recon", "nxc_ldap_recon"}]
-        if not has_ad_credentials and decision and decision.action not in {
+        if not recovery_mode and not has_ad_credentials and decision and decision.action not in {
             "anonymous_identity_probe", "domain_inventory"
         }:
             # Anonymous LDAP/SMB is a bounded identity-discovery phase only;
@@ -474,7 +562,12 @@ class Agents:
                 SystemMessage(content=(SYSTEM + f"\nYou are the {role.value} specialist. "
                                        "Do not choose another agent or route the workflow. "
                                        "For debugging, explain the observed tool error and choose a "
-                                       "non-duplicate diagnostic or alternate target/service.")),
+                                       "non-duplicate diagnostic or alternate target/service. "
+                                       "When a tool result has recoverable=true, inspect its complete "
+                                       "stderr/stdout and then correct the parameters, choose a different "
+                                       "reviewed tool/profile, or pivot to the next justified AD path. "
+                                       "Do not ask Human until the recovery budget is exhausted or the "
+                                       "result explicitly requires operator context.")),
                 HumanMessage(content=json.dumps({
                     "objective": state.get("objective"),
                     "target": state.get("last_decision").target if state.get("last_decision") else "environment",
@@ -483,6 +576,9 @@ class Agents:
                     "target_profiles": state.get("target_profiles", {}),
                     "runtime_config": state.get("runtime_config", {}),
                     "ad_knowledge": state.get("ad_knowledge", {}),
+                    "recovery_mode": recovery_mode,
+                    "operator_instruction": state.get("human_instruction", ""),
+                    "operator_instruction_history": state.get("human_directives", [])[-10:],
                     "capabilities": capability_catalog(),
                     "observed_signatures": list(state.get("observation_index", {}).keys())[-50:],
                     "instruction": instruction or (state.get("last_decision").justification if state.get("last_decision") else "Collect useful facts"),
@@ -498,43 +594,77 @@ class Agents:
             last = s.get("messages", [])[-1] if s.get("messages") else None
             return "tools" if getattr(last, "tool_calls", None) else "done"
 
+        def trailing_tool_messages(s: dict[str, Any]) -> list[ToolMessage]:
+            """Return every ToolMessage emitted by the latest ToolNode batch."""
+            batch: list[ToolMessage] = []
+            for message in reversed(s.get("messages", [])):
+                if not isinstance(message, ToolMessage):
+                    break
+                batch.append(message)
+            return list(reversed(batch))
+
+        def tool_payload(message: ToolMessage) -> dict[str, Any] | None:
+            try:
+                payload = json.loads(message.content) if isinstance(message.content, str) else message.content
+            except (TypeError, json.JSONDecodeError):
+                return {"needs_human": True, "tool": message.name or "unknown",
+                        "error": str(message.content)}
+            return payload if isinstance(payload, dict) else None
+
         def after_inspect(s: dict[str, Any]) -> str:
-            last = s.get("messages", [])[-1] if s.get("messages") else None
-            if isinstance(last, ToolMessage):
-                try:
-                    result = json.loads(last.content) if isinstance(last.content, str) else last.content
-                    if isinstance(result, dict) and result.get("needs_human"):
-                        # The failed result is already durable evidence. Stop
-                        # this specialist and let the outer Supervisor route
-                        # to debugging; retrying here is how identical nmap
-                        # commands used to escape the cache in practice.
-                        return "done"
-                    if isinstance(result, dict) and result.get("signature"):
-                        signatures = s.get("tool_signatures", [])
-                        current = result["signature"]
-                        # A cached/repeated observation has no new information;
-                        # stop this sub-agent rather than spending more calls.
-                        if result.get("cached") or signatures.count(current) >= 2:
-                            return "done"
-                except (TypeError, json.JSONDecodeError):
+            batch = trailing_tool_messages(s)
+            if batch:
+                payloads = [tool_payload(message) for message in batch]
+                if any(payload and payload.get("needs_human") for payload in payloads):
+                    # Missing executables, approval scope, and other
+                    # non-recoverable failures still stop for Human. The
+                    # outer specialist will preserve the whole batch.
+                    return "done"
+                recoverable = [payload for payload in payloads if payload and payload.get("recoverable")]
+                if recoverable:
+                    failures = s.get("recovery_failures", [])
+                    for payload, message in zip(payloads, batch):
+                        if payload and payload.get("recoverable"):
+                            failure_key = f"{payload.get('tool', message.name)}:{payload.get('error_kind', 'tool_failure')}"
+                            if len(failures) >= 3 or failures.count(failure_key) >= 2:
+                                return "human"
                     return "reason"
+                signatures = s.get("tool_signatures", [])
+                for payload, message in zip(payloads, batch):
+                    if payload and payload.get("signature") and (
+                        payload.get("cached") or signatures.count(payload["signature"]) >= 2
+                    ):
+                        return "human" if not payload.get("ok", True) else "done"
+                return "done"
             return "reason"
 
         def inspect_tools(s: dict[str, Any]) -> dict[str, Any]:
-            last = s.get("messages", [])[-1] if s.get("messages") else None
-            if not isinstance(last, ToolMessage):
+            batch = trailing_tool_messages(s)
+            if not batch:
                 return {}
-            try:
-                payload = json.loads(last.content) if isinstance(last.content, str) else last.content
-            except (TypeError, json.JSONDecodeError):
-                payload = {"needs_human": True, "tool": last.name or "unknown", "error": str(last.content)}
-            if isinstance(payload, dict) and payload.get("needs_human"):
-                signature = f"{payload.get('tool', last.name or 'unknown')}:{payload.get('error', 'unknown tool failure')}"
-                patch = {"failed_tool_signatures": s.get("failed_tool_signatures", []) + [signature]}
-            else:
-                patch = {}
-            if isinstance(payload, dict) and payload.get("signature"):
-                patch["tool_signatures"] = s.get("tool_signatures", []) + [payload["signature"]]
+            patch: dict[str, Any] = {}
+            failed_signatures = list(s.get("failed_tool_signatures", []))
+            recovery_failures = list(s.get("recovery_failures", []))
+            tool_signatures = list(s.get("tool_signatures", []))
+            for message in batch:
+                payload = tool_payload(message)
+                if not payload:
+                    continue
+                if payload.get("needs_human") or payload.get("recoverable"):
+                    failure_key = f"{payload.get('tool', message.name or 'unknown')}:{payload.get('error_kind', 'tool_failure')}"
+                    failed_signatures.append(failure_key)
+                    recovery_failures.append(failure_key)
+                if payload.get("signature"):
+                    tool_signatures.append(payload["signature"])
+            if failed_signatures != s.get("failed_tool_signatures", []):
+                patch["failed_tool_signatures"] = failed_signatures
+            if recovery_failures != s.get("recovery_failures", []):
+                patch["recovery_failures"] = recovery_failures
+                patch["recovery_steps"] = s.get("recovery_steps", 0) + len(
+                    recovery_failures
+                ) - len(s.get("recovery_failures", []))
+            if tool_signatures != s.get("tool_signatures", []):
+                patch["tool_signatures"] = tool_signatures
             return patch
 
         async def human(s: dict[str, Any]) -> dict[str, Any]:
@@ -573,7 +703,13 @@ class Agents:
             "check_dns_resolution", "check_port",
         ]
         target = state.get("target", "environment")
-        available = [name for name in baseline_tools if name in self.tools.tools]
+        available = [
+            name for name in baseline_tools
+            if name in self.tools.tools
+            # A CIDR is not a DNS name. Resolve discovered host/domain names
+            # later; never issue a meaningless `dig CIDR` probe.
+            and not (name == "check_dns_resolution" and "/" in target)
+        ]
         evidence: list[Evidence] = []
         observation_index = dict(state.get("observation_index", {}))
         proposal: dict[str, Any] = {
@@ -583,10 +719,23 @@ class Agents:
         }
         for name in available:
             try:
-                result = await self.tools.observe(name, target, "initial_recon")
+                parameters: dict[str, Any] = {}
+                if name == "check_port":
+                    # A CIDR starts with host discovery. A single authorized
+                    # host starts with a fast scan. Neither starts with the
+                    # expensive -sC/-sV probe.
+                    parameters = {"profile": "host_discovery" if "/" in target else "fast"}
+                result = await self.tools.observe(name, target, "initial_recon", parameters)
                 if result.get("evidence"):
                     observed = Evidence.model_validate(result["evidence"])
                     evidence.append(observed)
+                    if name == "inspect_interfaces":
+                        # The scanner's own interface addresses are context,
+                        # never cyber-range targets to probe.
+                        for value in re.findall(
+                            r"(?<![\w.])(?:\d{1,3}\.){3}\d{1,3}(?![\w.])", observed.stdout
+                        ):
+                            self.tools.target_policy.mark_local(value)
                 elif not result.get("ok", False):
                     evidence.append(Evidence(source=f"tool:{name}", action="initial_recon", target=target,
                                              exit_code=-1, stderr=str(result.get("error", "tool failure")),
@@ -600,6 +749,25 @@ class Agents:
             except Exception as exc:
                 evidence.append(Evidence(source=f"tool:{name}", action="initial_recon", target=target,
                                          exit_code=-1, stderr=str(exc), facts={"ok": False}))
+        # ICMP discovery can be filtered in a range. Adapt once to a fast TCP
+        # discovery scan before handing control to the Supervisor, instead of
+        # treating an empty -sn result as an empty environment.
+        if "/" in target and "check_port" in available:
+            discovered = {
+                host for item in evidence
+                for host in (item.facts.get("discovered_targets", []) if isinstance(item.facts, dict) else [])
+                if not self.tools.target_policy.is_local(str(host))
+            }
+            if not discovered:
+                try:
+                    fallback = await self.tools.observe(
+                        "check_port", target, "initial_recon_fallback", {"profile": "fast"}
+                    )
+                    if fallback.get("evidence"):
+                        evidence.append(Evidence.model_validate(fallback["evidence"]))
+                except Exception as exc:
+                    evidence.append(Evidence(source="tool:check_port", action="initial_recon_fallback",
+                                             target=target, exit_code=-1, stderr=str(exc), facts={"ok": False}))
         proposal["summary_ready"] = True
         event = Event(type="INITIAL_RECON_COMPLETE", run_id=state["run_id"], emitted_by=Role.VALIDATION,
                       target=target, evidence_ids=[item.id for item in evidence], payload=proposal)
@@ -635,6 +803,28 @@ class Agents:
 
     async def supervisor(self, state: QAState) -> dict[str, Any]:
         iteration = state.get("iteration", 0) + 1
+        # Human guidance is an executable control input, not merely chat
+        # context.  Preserve the frozen decision and its one-shot grant so a
+        # subsequent LLM call cannot silently reinterpret "approve AS-REP" as
+        # another reconnaissance suggestion.
+        if state.get("human_directive") and state.get("last_decision"):
+            decision = state["last_decision"]
+            self.progress("supervisor_decision",
+                          agent=(decision.next_agent.value if isinstance(decision.next_agent, Role) else str(decision.next_agent)),
+                          action=decision.action, target=decision.target,
+                          source="human_directive")
+            return {
+                "iteration": iteration,
+                "phase": decision.next_agent,
+                "last_decision": decision,
+                "pending_action": decision.model_dump(),
+                "approved_grant": state.get("approved_grant"),
+                "human_instruction": "",
+                # Keep this marker for the one specialist dispatch. The
+                # specialist consumes it after executing the operator command.
+                "human_directive": True,
+                "needs_human": False,
+            }
         if state.get("no_progress_count", 0) >= 2:
             decision = Decision(next_agent="end", objective="human_help", action="end",
                                 target=state.get("target", "environment"),
@@ -658,6 +848,12 @@ class Agents:
         # stronger conclusion, but it cannot select empty-credential loops or
         # skip an available unauthenticated AS-REP branch.
         result = recommend_ad_method(state) or result
+        network_transition = self._network_recon_transition(state)
+        if network_transition:
+            # Complete the bounded host/service baseline before automatic AD
+            # capability selection. A human explicit directive is handled
+            # above and bypasses this guard intentionally.
+            result = network_transition
         if result.next_agent == "end" and result.objective == "human_help":
             return {"iteration": iteration, "phase": "human_help", "last_decision": result,
                     "pending_action": result.model_dump(), "needs_human": True}
@@ -767,7 +963,8 @@ class Agents:
         return {"iteration": iteration, "phase": decision.next_agent, "last_decision": decision,
                 "pending_action": {**decision.model_dump(), "broker": capability_check},
                 "action_history": history + [signature], "capability_history": capability_history,
-                "approved_grant": reused_grant}
+                "approved_grant": reused_grant,
+                "human_instruction": ""}
 
     @staticmethod
     def _target_has_completed_recon(profile: Any) -> bool:
@@ -785,16 +982,16 @@ class Agents:
         parameters = decision.tool_parameters.model_dump(mode="json", exclude_none=True)
         category = None
         profile = str(parameters.get("profile") or "default")
-        if "nmap" in text or "port" in text:
+        if "nmap" in text or "port" in text or "service_enumeration" in text or "service_detection" in text:
             category = "nmap"
         elif "nxc" in text and "ldap" in text:
             category, profile = "nxc_ldap", profile or "users"
         elif "nxc" in text or "smb" in text:
             category, profile = "nxc_smb", profile or "shares"
         elif "ldap" in text:
-            category = "ldap"
+            category, profile = "ldap", profile if profile != "default" else "rootdse"
         elif "smb" in text:
-            category = "smb"
+            category, profile = "smb", profile if profile != "default" else "anonymous"
         if not category:
             return False
         target_profile = state.get("recon_coverage", {}).get(decision.target, {})
@@ -820,6 +1017,194 @@ class Agents:
             "tool_parameters": ToolParameters(),
         })
 
+    @staticmethod
+    def _human_asrep_decision(state: QAState, answer: str) -> tuple[Decision | None, bool, str | None]:
+        """Turn an explicit human AS-REP instruction into a frozen decision.
+
+        Returning a Decision here is important: a plain HumanMessage is not a
+        command and the next supervisor prompt is free to ignore it.
+        """
+        text = answer.strip().lower().replace("–", "-")
+        is_asrep = any(marker in text for marker in ("as-rep", "asrep", "as_rep", "getnpusers"))
+        if not is_asrep:
+            return None, False, None
+        approved = any(marker in text for marker in (
+            "approve", "approved", "allow", "run", "execute", "proceed", "核准", "允許", "執行",
+        ))
+        target = os.getenv("CYBERQA_AD_DC") or state.get("target", "environment")
+        prior = state.get("last_decision")
+        if prior and prior.target and prior.target != "environment":
+            target = prior.target
+        if "/" in str(target):
+            # GetNPUsers needs one DC address, not a CIDR. Prefer the runtime
+            # discovered DC, then the first non-local discovered host.
+            for candidate, profile in (state.get("target_profiles", {}) or {}).items():
+                if (not is_local_target(str(candidate)) and "/" not in str(candidate)
+                        and (profile.get("domain") or profile.get("connectivity") == "reachable")):
+                    target = str(candidate)
+                    break
+            else:
+                for candidate in state.get("discovered_targets", []):
+                    if "/" not in str(candidate) and not is_local_target(str(candidate)):
+                        target = str(candidate)
+                        break
+        knowledge = state.get("ad_knowledge") or {}
+        if hasattr(knowledge, "model_dump"):
+            knowledge = knowledge.model_dump(mode="json")
+        parameters: dict[str, Any] = {}
+        users_file = Agents._human_users_file(answer) or os.getenv("CYBERQA_AD_USERS_FILE")
+        if users_file:
+            parameters["users_file"] = users_file
+        elif knowledge.get("asrep_candidates"):
+            parameters["users"] = list(knowledge["asrep_candidates"][:500])
+        elif knowledge.get("users"):
+            parameters["users"] = list(knowledge["users"][:500])
+        elif prior:
+            parameters = prior.tool_parameters.model_dump(mode="json", exclude_none=True)
+        if not parameters.get("users") and not parameters.get("users_file"):
+            return None, approved, (
+                "AS-REP roasting requires a candidate username source. Set CYBERQA_AD_USERS_FILE "
+                "or provide a username list in the human response before approving."
+            )
+        decision = Decision(
+            next_agent=Role.TESTING,
+            objective=state.get("objective", "Assess authorized AS-REP roasting path"),
+            action="asrep_roasting_assessment",
+            target=target,
+            justification="Human explicitly directed the agent to assess the authorized AS-REP path.",
+            approval_required=not approved,
+            capability="asrep_roasting_assessment",
+            expected_evidence=["asrep_candidates", "ticket_obtained_or_blocked", "credential_validation_status"],
+            risk=ADRisk.CREDENTIAL_MATERIAL,
+            tool_parameters=ToolParameters.model_validate(parameters),
+        )
+        return decision, approved, None
+
+    @staticmethod
+    def _human_users_file(answer: str) -> str | None:
+        """Extract a Linux username-list path from ordinary operator text."""
+        patterns = (
+            r"(?:cyberqa_ad_users_file|users?_file|username[_ -]?file|username[_ -]?list|使用者清單|帳號清單)"
+            r"\s*(?:is|為|是|=|:)?\s*[\"']?([~/][^\s,;\"']+)",
+            r"--users-file\s+[\"']?([~/][^\s,;\"']+)",
+        )
+        for pattern in patterns:
+            match = re.search(pattern, answer, re.IGNORECASE)
+            if match:
+                return match.group(1).rstrip(".,，。)")
+        return None
+
+    @staticmethod
+    def _human_target(state: QAState, answer: str) -> str:
+        """Use an explicitly mentioned authorized target, never localhost."""
+        matches = re.findall(
+            r"(?<![\w.])(?:\d{1,3}\.){3}\d{1,3}(?:/\d{1,2})?(?![\w.])", answer
+        )
+        for candidate in matches:
+            if not is_local_target(candidate):
+                return candidate
+        prior = state.get("last_decision")
+        if prior and prior.target and prior.target != "environment" and not is_local_target(prior.target):
+            return prior.target
+        return state.get("target", "environment")
+
+    @staticmethod
+    def _apply_human_config(answer: str) -> tuple[dict[str, str], str]:
+        """Apply safe operator-provided runtime values for this process.
+
+        Only explicitly supported CyberQA settings are accepted. Passwords
+        affect the current process but are never put into runtime_config or
+        the conversation history in clear text.
+        """
+        allowed = {
+            "CYBERQA_AD_DOMAIN", "CYBERQA_AD_DC", "CYBERQA_AD_BASE_DN",
+            "CYBERQA_AD_USERS_FILE", "CYBERQA_AD_USERNAME", "CYBERQA_AD_PASSWORD",
+            "CYBERQA_AD_COLLECTION", "CYBERQA_ALLOW_ANONYMOUS_NXC",
+        }
+        safe: dict[str, str] = {}
+        for key, value in re.findall(r"\b(CYBERQA_[A-Z0-9_]+)\s*=\s*([^\s,;]+)", answer):
+            if key not in allowed:
+                continue
+            value = value.strip("'\"")
+            os.environ[key] = value
+            if key != "CYBERQA_AD_PASSWORD":
+                safe[key] = value
+        users_file = Agents._human_users_file(answer)
+        if users_file:
+            os.environ["CYBERQA_AD_USERS_FILE"] = users_file
+            safe["CYBERQA_AD_USERS_FILE"] = users_file
+        redacted = answer
+        for key in ("CYBERQA_AD_PASSWORD", "AD_PASSWORD"):
+            redacted = re.sub(
+                rf"({re.escape(key)}\s*=\s*)[^\s,;]+", r"\1***REDACTED***", redacted,
+                flags=re.IGNORECASE,
+            )
+        return safe, redacted
+
+    @classmethod
+    def _human_explicit_decision(cls, state: QAState, answer: str) -> Decision | None:
+        """Map common explicit operator tool instructions to a Decision.
+
+        Unknown natural language remains in ``human_instruction`` and is sent
+        to the structured Supervisor. Known reviewed tools are frozen here so
+        a later model call cannot discard a direct operator command.
+        """
+        text = answer.lower().replace("–", "-")
+        target = cls._human_target(state, answer)
+        if is_local_target(target):
+            return None
+        role = Role.VALIDATION
+        action = ""
+        capability = None
+        params: dict[str, Any] = {}
+        if "nmap" in text:
+            if "-sn" in text or "host discovery" in text or "主機發現" in text:
+                action, params = "network_host_discovery", {"profile": "host_discovery"}
+            elif re.search(r"(^|\s)-f(\s|$)", text) or "fast scan" in text:
+                action, params = "network_fast_discovery", {"profile": "fast"}
+            else:
+                action, params = "service_enumeration", {"profile": "default"}
+        elif "nxc" in text or "netexec" in text:
+            role = Role.TESTING
+            if "ldap" in text:
+                action = "nxc_ldap_recon"
+                params = {"profile": "users" if "user" in text else "groups" if "group" in text else "users",
+                          "allow_anonymous_nxc": True}
+            else:
+                action = "nxc_smb_recon"
+                params = {"profile": next((name for name in ("shares", "users", "groups", "sessions", "pass-pol")
+                                            if name in text), "shares"),
+                          "allow_anonymous_nxc": True}
+        elif "bloodhound" in text or "sharphound" in text:
+            role, action, capability = Role.TESTING, "bloodhound_collection", "bloodhound_collection"
+        elif "impacket" in text or "rpcdump" in text:
+            action = "impacket_rpc_recon"
+        elif "ldap" in text:
+            action = "ldap_bind_probe"
+        elif "smb" in text:
+            action = "smb_negotiate_probe"
+        elif "dns" in text and ("resolve" in text or "解析" in text):
+            action = "check_dns_resolution"
+        elif "http" in text or "curl" in text:
+            action = "http_health_check"
+        if not action:
+            return None
+        if role == Role.TESTING and capability:
+            spec = get_capability(capability)
+            requires_approval = bool(spec and spec.requires_approval) or capability == "bloodhound_collection"
+        else:
+            requires_approval = False
+        return Decision(
+            next_agent=role,
+            objective=state.get("objective", "Follow the operator instruction"),
+            action=action,
+            target=target,
+            justification=f"Human explicitly instructed: {answer.strip()}",
+            approval_required=requires_approval,
+            capability=capability,
+            tool_parameters=ToolParameters.model_validate(params),
+        )
+
     async def human_help(self, state: QAState) -> dict[str, Any]:
         """Pause the outer workflow when the supervisor detects no progress."""
         decision = state.get("last_decision")
@@ -839,14 +1224,81 @@ class Agents:
             "evidence_summary": "; ".join(problem.splitlines()[-2:]),
         })
         answer = interrupt(request)
-        guidance = str(answer).lower()
+        answer_text = str(answer).strip()
+        guidance = answer_text.lower()
+        runtime_config, safe_answer = self._apply_human_config(answer_text)
         # A human response is a deliberate change of direction.  Clear the
         # guard that caused this pause, otherwise the supervisor immediately
         # interrupts again before it can evaluate the guidance.
         patch = {"needs_human": False, "no_progress_count": 0, "action_history": [],
-                "messages": [HumanMessage(content=f"Human guidance for supervisor: {answer}")],
+                "human_directive": False,
+                "messages": [HumanMessage(content=f"Human guidance for supervisor: {safe_answer}")],
+                "human_instruction": safe_answer,
+                "human_directives": [{"instruction": safe_answer, "source": "human"}],
                 "errors": [] if guidance != "abort" else ["Human aborted after no progress"],
                 "aborted": guidance == "abort"}
+        human_decision, approved, directive_error = self._human_asrep_decision(state, answer_text)
+        if directive_error:
+            patch.update({
+                "needs_human": True,
+                "human_directive": False,
+                "human_requests": [{
+                    "kind": "human_help",
+                    "question": directive_error,
+                    "options": ["set CYBERQA_AD_USERS_FILE", "provide usernames", "abort"],
+                    "reason": directive_error,
+                }],
+            })
+        elif human_decision:
+            grant = None
+            if approved:
+                grant = {
+                    "decision_fingerprint": decision_fingerprint(human_decision),
+                    "target": human_decision.target,
+                    "action": human_decision.action,
+                    "capability": human_decision.capability,
+                    "allowed_tools": approved_tools_for_decision(human_decision),
+                    "tool_parameters": human_decision.tool_parameters.model_dump(mode="json", exclude_none=True),
+                }
+                human_decision = human_decision.model_copy(update={"approval_required": False})
+            patch.update({
+                "last_decision": human_decision,
+                "pending_action": human_decision.model_dump(),
+                "approved_grant": grant,
+                "human_directive": True,
+                "needs_human": False,
+            })
+        else:
+            generic_decision = self._human_explicit_decision(state, answer_text)
+            if generic_decision:
+                human_approved = any(marker in guidance for marker in (
+                    "approve", "approved", "allow", "run", "execute", "proceed", "核准", "允許", "執行",
+                ))
+                grant = None
+                if human_approved and generic_decision.approval_required:
+                    grant = {
+                        "decision_fingerprint": decision_fingerprint(generic_decision),
+                        "target": generic_decision.target,
+                        "action": generic_decision.action,
+                        "capability": generic_decision.capability,
+                        "allowed_tools": approved_tools_for_decision(generic_decision),
+                        "tool_parameters": generic_decision.tool_parameters.model_dump(mode="json", exclude_none=True),
+                    }
+                    generic_decision = generic_decision.model_copy(update={"approval_required": False})
+                patch.update({
+                    "last_decision": generic_decision,
+                    "pending_action": generic_decision.model_dump(),
+                    "approved_grant": grant,
+                    "human_directive": True,
+                    "needs_human": False,
+                    "human_directives": [{
+                        "instruction": safe_answer, "source": "human",
+                        "action": generic_decision.action, "target": generic_decision.target,
+                    }],
+                })
+        if runtime_config:
+            apply_and_persist_runtime_config(runtime_config)
+            patch["runtime_config"] = runtime_config
         if not patch["aborted"] and state.get("iteration", 0) >= state.get("max_iterations", 20):
             patch["max_iterations"] = state.get("iteration", 0) + 5
         return patch
@@ -886,10 +1338,16 @@ class Agents:
             return None
         text = decision.action.lower().replace("-", "_")
         params = decision.tool_parameters.model_dump(mode="json", exclude_none=True)
-        if "nmap" in text or "check_port" in text or "port_probe" in text:
+        if ("nmap" in text or "check_port" in text or "port_probe" in text
+                or "service_enumeration" in text or "service_detection" in text
+                or "network_host_discovery" in text or "network_fast_discovery" in text):
             return "check_port", {
-                key: params[key] for key in ("profile", "argv")
-                if params.get(key)
+                "profile": params.get(
+                    "profile",
+                    "host_discovery" if "host_discovery" in text else
+                    "fast" if "fast_discovery" in text else "default",
+                ),
+                **({"argv": params["argv"]} if params.get("argv") else {}),
             }
         if "nxc" in text and "ldap" in text:
             return "nxc_ldap_recon", {
@@ -904,12 +1362,45 @@ class Agents:
                 "allow_anonymous_nxc": params.get("allow_anonymous_nxc", False),
             }
         if "ldap_bind" in text or text in {"ldap", "ldap_probe"}:
-            return "ldap_bind", {}
+            return "ldap_bind", {
+                "profile": params.get("profile", "rootdse"),
+                "argv": params.get("argv", []),
+            }
         if "smb_negotiate" in text or text in {"smb", "smb_probe"}:
-            return "smb_negotiate", {}
+            return "smb_negotiate", {
+                "profile": params.get("profile", "anonymous"),
+                "argv": params.get("argv", []),
+            }
         if "dns" in text and "resolution" in text:
             return "check_dns_resolution", ({"name": params["name"]} if params.get("name") else {})
         return None
+
+    async def _run_react_loop(self, role: Role, state: QAState,
+                              instruction: str | None = None) -> tuple[list[Any], dict[str, Any] | None, str | None]:
+        """Stream one specialist ReAct loop and return its messages/request.
+
+        Planned capability probes use this same path after a recoverable
+        failure, with the failed Evidence already inserted into ``state``.
+        That makes repair reasoning see the exact command output instead of a
+        prose-only error summary.
+        """
+        react_messages: list[Any] = []
+        human_request: dict[str, Any] | None = None
+        error: str | None = None
+        try:
+            async for update in self._react_graph(role, state, instruction=instruction).astream(
+                {"messages": self._conversation_context(state.get("messages", []))},
+                stream_mode="updates",
+            ):
+                for patch in update.values() if isinstance(update, dict) else ():
+                    if isinstance(patch, dict):
+                        react_messages.extend(patch.get("messages", []))
+                        if patch.get("needs_human"):
+                            human_request = patch.get("human_request")
+        except Exception as exc:
+            error = str(exc)
+            self.progress("agent_error", agent=role.value, error=error)
+        return react_messages, human_request, error
 
     async def specialist(self, role: Role, state: QAState) -> dict[str, Any]:
         decision = state.get("last_decision")
@@ -919,6 +1410,9 @@ class Agents:
         new_observation = False
         inner_needs_human = False
         inner_human_request: dict[str, Any] | None = None
+        repair_context: str | None = None
+        react_messages: list[Any] = []
+        react_error: str | None = None
         observation_index = dict(state.get("observation_index", {}))
         decision_grant = self._grant_for_decision(state, decision)
         # A selected capability is an executable workflow obligation, not a
@@ -972,7 +1466,9 @@ class Agents:
                 no_credentials = not bool(os.getenv("CYBERQA_AD_USERNAME") and os.getenv("CYBERQA_AD_PASSWORD"))
                 anonymous_tool = action_tool[0] in {"ldap_bind", "smb_negotiate",
                                                     "nxc_smb_recon", "nxc_ldap_recon"}
-                if no_credentials and anonymous_tool and action not in {
+                explicit_human_path = bool(state.get("human_directive"))
+                explicit_nxc_anonymous = bool(action_tool[1].get("allow_anonymous_nxc"))
+                if no_credentials and anonymous_tool and not explicit_human_path and not explicit_nxc_anonymous and action not in {
                     "anonymous_identity_probe", "domain_inventory"
                 }:
                     blocked_action = True
@@ -1007,6 +1503,8 @@ class Agents:
                                 "action": observed.action, "ok": result.get("ok", False),
                                 "cached": result.get("cached", False),
                                 "exit_code": observed.exit_code,
+                                "error_kind": result.get("error_kind"),
+                                "recoverable": result.get("recoverable", False),
                             }
                     if result.get("needs_human") and action == "anonymous_identity_probe":
                         # Independent anonymous paths are allowed to fail
@@ -1015,6 +1513,36 @@ class Agents:
                         # username source.
                         proposal.setdefault("failures", []).append({
                             "tool": planned_tool, "error": result.get("error", "tool failure")
+                        })
+                        continue
+                    if result.get("recoverable") and not result.get("needs_human"):
+                        # Keep the failed command as evidence, then let the
+                        # specialist's ReAct loop select corrected parameters,
+                        # another reviewed adapter, or a different AD path.
+                        if not result.get("evidence"):
+                            evidence.append(Evidence(
+                                source=f"tool:{planned_tool}", action=action, target=target,
+                                exit_code=-1, stderr=str(result.get("error", "tool failure")),
+                                facts={
+                                    "ok": False, "recoverable": True,
+                                    "error_kind": result.get("error_kind", "tool_failure"),
+                                    "parameters": parameters,
+                                    "tool_result": result,
+                                },
+                            ))
+                            new_observation = True
+                        repair_context = (
+                            f"The planned {planned_tool} call failed but is recoverable. "
+                            f"error_kind={result.get('error_kind')}; error={result.get('error', '')}. "
+                            "Read the complete failed evidence and choose one materially different "
+                            "repair: corrected parameters, an alternate LDAP/SMB/NXC method, "
+                            "or the next justified attack-path assessment. Do not repeat the same "
+                            "effective command."
+                        )
+                        proposal.update({
+                            "recoverable_failure": True,
+                            "error_kind": result.get("error_kind"),
+                            "error": result.get("error"),
                         })
                         continue
                     if result.get("needs_human"):
@@ -1052,9 +1580,34 @@ class Agents:
                         "question": "請修正目前工具/參數或停止；不會自動重複同一身份探測。",
                     }
                     break
-        elif blocked_action:
+        # A planned LDAP/SMB/NXC call is executed first so that the repair
+        # loop starts with the exact stderr/stdout and argv that failed.  The
+        # failed result is deliberately added to a projected state instead of
+        # being reduced to a prose error string.
+        if repair_context and self.llm and not inner_needs_human:
+            repair_state = dict(state)
+            repair_state["evidence"] = [*state.get("evidence", []), *evidence]
+            repair_state.update(self._project_observations(state, evidence))
+            repair_state["observation_index"] = observation_index
+            repair_state["recovery_mode"] = True
+            repair_messages, repair_human_request, react_error = await self._run_react_loop(
+                role, repair_state, instruction=repair_context
+            )
+            react_messages.extend(repair_messages)
+            if repair_human_request:
+                inner_needs_human = True
+                inner_human_request = repair_human_request
+        elif repair_context and not self.llm:
+            inner_needs_human = True
+            proposal["needs_human"] = True
+            inner_human_request = {
+                "kind": "analysis_engine_unavailable", "agent": role.value,
+                "target": target,
+                "question": "工具結果可由 Agent 修復，但目前沒有可用的 LLM；請設定模型、提供修正指示，或停止。",
+            }
+        elif not planned_calls and blocked_action:
             pass
-        elif action == "anonymous_identity_probe":
+        elif not planned_calls and action == "anonymous_identity_probe":
             proposal = {"planned_phase": action, "phase_complete": True}
             inner_needs_human = True
             inner_human_request = {
@@ -1062,88 +1615,112 @@ class Agents:
                 "target": target,
                 "question": "匿名身份探測沒有可執行的新工具；請提供 username source、修正工具環境，或停止。",
             }
-        elif self.llm and self.tools.tools:
-            react_messages: list[Any] = []
-            try:
-                async for update in self._react_graph(role, state).astream(
-                    {"messages": self._conversation_context(state.get("messages", []))},
-                    stream_mode="updates",
-                ):
-                    for patch in update.values() if isinstance(update, dict) else ():
-                        if isinstance(patch, dict):
-                            react_messages.extend(patch.get("messages", []))
-                            if patch.get("needs_human"):
-                                inner_needs_human = True
-                                inner_human_request = patch.get("human_request")
-            except Exception as exc:
-                self.progress("agent_error", agent=role.value, error=str(exc))
-                proposal["error"] = str(exc)
-                proposal["needs_human"] = True
-                evidence.append(Evidence(source=f"agent:{role.value}", action=action, target=target,
-                                         exit_code=-1, stderr=str(exc),
-                                         facts={"ok": False, "agent_error": True}))
-            for message in react_messages:
-                if isinstance(message, ToolMessage):
-                    try:
-                        payload = json.loads(message.content) if isinstance(message.content, str) else message.content
-                        if not isinstance(payload, dict):
-                            continue
-                        if payload.get("evidence"):
-                            observed = Evidence.model_validate(payload["evidence"])
-                            evidence.append(observed)
-                            new_observation = new_observation or self._evidence_is_novel(
-                                state, observed, bool(payload.get("cached", False))
-                            )
-                            if payload.get("signature"):
-                                observation_index[payload["signature"]] = {
-                                    "tool": payload.get("tool", message.name),
-                                    "target": observed.target,
-                                    "action": observed.action,
-                                    "ok": payload.get("ok", True),
-                                    "cached": payload.get("cached", False),
-                                    "exit_code": observed.exit_code,
-                                }
-                            if payload.get("needs_human") or observed.exit_code not in (None, 0):
-                                inner_needs_human = True
-                                proposal["needs_human"] = True
-                                inner_human_request = {
-                                    "kind": "tool_failure", "agent": role.value,
-                                    "tool": payload.get("tool", message.name),
-                                    "target": observed.target,
-                                    "error": payload.get("error") or observed.stderr or "tool failed",
-                                    "question": "請指定修正方向或停止；不會自動重複失敗的偵察。",
-                                }
-                        elif payload.get("needs_human"):
-                            evidence.append(Evidence(
-                                source=f"tool:{payload.get('tool', message.name or 'unknown')}",
-                                action=action, target=target, exit_code=-1,
-                                stderr=str(payload.get("error", "tool failure")),
-                                facts={"ok": False, "needs_human": True, "tool_result": payload},
-                            ))
-                            new_observation = new_observation or not payload.get("cached", False)
-                            inner_needs_human = True
-                            proposal["needs_human"] = True
-                            inner_human_request = {
-                                "kind": "tool_failure", "agent": role.value,
+        elif not planned_calls and self.llm and self.tools.tools:
+            react_messages, inner_human_request, react_error = await self._run_react_loop(role, state)
+            if inner_human_request:
+                inner_needs_human = True
+
+        # Consume both normal ReAct results and repair-loop results in one
+        # place.  A non-zero exit is not automatically Human: the registry's
+        # recoverable flag is the contract that lets the model inspect the
+        # failure and attempt a corrected parameter, alternate adapter, or
+        # different attack path first.
+        if react_error:
+            proposal["error"] = react_error
+            proposal["needs_human"] = True
+            inner_needs_human = True
+            evidence.append(Evidence(
+                source=f"agent:{role.value}", action=action, target=target,
+                exit_code=-1, stderr=react_error,
+                facts={"ok": False, "agent_error": True},
+            ))
+
+        for message in react_messages:
+            if isinstance(message, ToolMessage):
+                try:
+                    payload = json.loads(message.content) if isinstance(message.content, str) else message.content
+                    if not isinstance(payload, dict):
+                        continue
+                    observed = None
+                    if payload.get("evidence"):
+                        observed = Evidence.model_validate(payload["evidence"])
+                        evidence.append(observed)
+                        new_observation = new_observation or self._evidence_is_novel(
+                            state, observed, bool(payload.get("cached", False))
+                        )
+                        if payload.get("signature"):
+                            observation_index[payload["signature"]] = {
                                 "tool": payload.get("tool", message.name),
-                                "target": target,
-                                "error": payload.get("error", "tool failure"),
-                                "question": "請指定修正方向或停止；不會自動重複失敗的偵察。",
+                                "target": observed.target,
+                                "action": observed.action,
+                                "ok": payload.get("ok", True),
+                                "cached": payload.get("cached", False),
+                                "exit_code": observed.exit_code,
+                                "error_kind": payload.get("error_kind"),
+                                "recoverable": payload.get("recoverable", False),
                             }
-                            if payload.get("signature"):
-                                observation_index[payload["signature"]] = {
-                                    "tool": payload.get("tool", message.name),
-                                    "target": target,
-                                    "action": action,
-                                    "ok": False,
-                                    "cached": payload.get("cached", False),
-                                    "error": payload.get("error", "tool failure"),
-                                }
-                    except (TypeError, ValueError, json.JSONDecodeError):
-                        pass
-                if isinstance(message, AIMessage) and message.content:
-                    proposal["summary"] = message.content
-        elif self.tools.tools and not (action in {
+
+                    failed = bool(payload.get("needs_human")) or bool(
+                        observed is not None and observed.exit_code not in (None, 0)
+                    )
+                    recoverable = bool(payload.get("recoverable")) and not bool(payload.get("needs_human"))
+                    if failed and recoverable:
+                        proposal.update({
+                            "recoverable_failure": True,
+                            "error_kind": payload.get("error_kind"),
+                            "error": payload.get("error") or (
+                                observed.stderr if observed is not None else "tool failed"
+                            ),
+                        })
+                    elif failed:
+                        inner_needs_human = True
+                        proposal["needs_human"] = True
+                        inner_human_request = {
+                            "kind": "tool_failure", "agent": role.value,
+                            "tool": payload.get("tool", message.name),
+                            "target": observed.target if observed is not None else target,
+                            "error": payload.get("error") or (
+                                observed.stderr if observed is not None else "tool failed"
+                            ),
+                            "question": "請指定修正方向或停止；自動修復預算已用盡或工具需要操作員權限。",
+                        }
+                    elif payload.get("recoverable"):
+                        # Invalid-argument failures may not have an Evidence
+                        # object, but they must still be durable context for
+                        # the outer Supervisor.
+                        tool_name = payload.get("tool", message.name or "unknown")
+                        synthetic = Evidence(
+                            source=f"tool:{tool_name}", action=action, target=target,
+                            exit_code=-1, stderr=str(payload.get("error", "tool failure")),
+                            facts={
+                                "ok": False, "recoverable": True,
+                                "error_kind": payload.get("error_kind", "tool_failure"),
+                                "tool_result": payload,
+                            },
+                        )
+                        evidence.append(synthetic)
+                        new_observation = new_observation or not payload.get("cached", False)
+                        proposal.update({
+                            "recoverable_failure": True,
+                            "error_kind": payload.get("error_kind"),
+                            "error": payload.get("error", "tool failure"),
+                        })
+                    if payload.get("signature") and payload.get("signature") not in observation_index:
+                        observation_index[payload["signature"]] = {
+                            "tool": payload.get("tool", message.name),
+                            "target": observed.target if observed is not None else target,
+                            "action": action,
+                            "ok": payload.get("ok", False),
+                            "cached": payload.get("cached", False),
+                            "error": payload.get("error", "tool failure"),
+                            "error_kind": payload.get("error_kind"),
+                            "recoverable": payload.get("recoverable", False),
+                        }
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    pass
+            if isinstance(message, AIMessage) and message.content:
+                proposal["summary"] = message.content
+        if not planned_calls and not react_messages and self.tools.tools and not (action in {
             "analyze_existing_evidence", "summarize_evidence", "evaluate_ad_evidence"
         } or role in {Role.JUDGE, Role.REPORTING}):
             # Offline mode remains deterministic, but uses the same allow-listed adapter boundary.
@@ -1241,6 +1818,7 @@ class Agents:
             **projection,
             "needs_human": inner_needs_human or bool(proposal.get("needs_human")),
             "human_requests": [inner_human_request] if inner_human_request else [],
+            "human_directive": False,
         }
         if role == Role.DEBUGGING and action == "generate_hypotheses":
             patch["hypotheses"] = [Hypothesis(statement=x, likelihood=.5) for x in proposal.get("hypotheses", [])]
@@ -1258,7 +1836,28 @@ class Agents:
         request.decision_fingerprint = fingerprint
         answer = interrupt({"kind": "approval", "request": request.model_dump(mode="json"),
                             "question": "Approve this action? Reply approve or reject."})
-        request.status = "approved" if str(answer).strip().lower() in {"approve", "approved", "yes"} else "rejected"
+        answer_text = str(answer).strip()
+        request.status = "approved" if answer_text.lower() in {"approve", "approved", "yes"} else "rejected"
+        # Also accept an explicit combined instruction at an approval prompt,
+        # e.g. "approve to as-rep roasting".  This changes the frozen
+        # executable decision before the grant is created; it is not left as
+        # unstructured chat for the supervisor to reinterpret.
+        requested_decision, requested_approved, directive_error = self._human_asrep_decision(state, answer_text)
+        if not requested_decision and not directive_error:
+            requested_decision = self._human_explicit_decision(state, answer_text)
+            requested_approved = requested_decision is not None and any(marker in answer_text.lower() for marker in (
+                "approve", "approved", "allow", "run", "execute", "proceed", "核准", "允許", "執行",
+            ))
+        if requested_decision and requested_approved:
+            decision = requested_decision
+            fingerprint = decision_fingerprint(decision)
+            request.action = decision.action
+            request.target = decision.target
+            request.reason = decision.justification
+            request.decision_fingerprint = fingerprint
+            request.status = "approved"
+        elif directive_error:
+            request.status = "rejected"
         event = Event(type="APPROVAL_DECIDED", run_id=state["run_id"], emitted_by=Role.SUPERVISOR,
                       target=decision.target, payload=request.model_dump())
         try:

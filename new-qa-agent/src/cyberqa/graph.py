@@ -52,6 +52,12 @@ def route_after_approval(state: QAState) -> str:
     return decision.next_agent.value
 
 
+def route_after_human(state: QAState) -> str:
+    # A malformed/incomplete human instruction should ask the human again,
+    # rather than going through the LLM with a stale no-progress state.
+    return "human_help" if state.get("needs_human") else "supervisor"
+
+
 def build_graph(agents: Agents | None = None, checkpointer=None):
     agents = agents or Agents()
     graph = StateGraph(QAState)
@@ -90,5 +96,6 @@ def build_graph(agents: Agents | None = None, checkpointer=None):
         {"validation": "validation", "testing": "testing", "debugging": "debugging",
          "judge": "judge", "reporting": "reporting", "human_help": "human_help", END: END},
     )
-    graph.add_edge("human_help", "supervisor")
+    graph.add_conditional_edges("human_help", route_after_human,
+                               {"human_help": "human_help", "supervisor": "supervisor"})
     return graph.compile(checkpointer=checkpointer or _memory_saver())

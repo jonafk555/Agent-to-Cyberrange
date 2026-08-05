@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any
 
 from .models import Decision, Role, ToolParameters
@@ -84,7 +83,10 @@ def derive_context(state: dict[str, Any]) -> ADContext:
     knowledge = _knowledge(state)
     users = tuple(sorted({str(user) for user in knowledge.get("users", [])}))
     users_file = os.getenv("CYBERQA_AD_USERS_FILE", "")
-    file_available = bool(users_file and Path(users_file).expanduser().is_file())
+    # A configured path is an operator-provided source even before the file is
+    # opened. The capability adapter performs the concrete existence/type/size
+    # validation and records the exact failure as evidence.
+    file_available = bool(users_file)
     decision = state.get("last_decision")
     if decision:
         params = decision.tool_parameters.model_dump(mode="json", exclude_none=True)

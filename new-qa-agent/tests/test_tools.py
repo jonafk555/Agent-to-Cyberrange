@@ -60,6 +60,42 @@ def test_nmap_and_nxc_accept_reviewed_dynamic_argv_fragments():
     }) == ["nxc", "ldap", "10.0.0.1", "--users", "--groups", "--threads", "4"]
 
 
+def test_ldap_and_smb_expose_only_reviewed_repair_profiles():
+    registry = build_kali_registry(allowed_targets=["10.0.0.1"])
+    assert registry.get("ldap_bind").build_argv("10.0.0.1", {
+        "profile": "starttls_rootdse",
+    }) == ["ldapsearch", "-H", "ldap://10.0.0.1", "-x", "-ZZ", "-s", "base", "-b", ""]
+    assert registry.get("smb_negotiate").build_argv("10.0.0.1", {
+        "profile": "smb3",
+    }) == ["smbclient", "-L", "//10.0.0.1", "-N", "-m", "SMB3"]
+    with pytest.raises(ValueError, match="ldap argv"):
+        registry.get("ldap_bind").build_argv("10.0.0.1", {"argv": ["-H", "10.0.0.2"]})
+
+
+@pytest.mark.asyncio
+async def test_recoverable_nonzero_result_is_evidence_before_human(monkeypatch):
+    monkeypatch.setenv("CYBERQA_OBSERVATION_DB", ":memory:")
+
+    class FailureProcess:
+        returncode = 1
+
+        async def communicate(self):
+            return b"", b"Can't contact LDAP server"
+
+    async def fake_create_subprocess_exec(*argv, **kwargs):
+        return FailureProcess()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+    registry = build_kali_registry(allowed_targets=["10.0.0.1"])
+    result = await registry.observe("ldap_bind", "10.0.0.1", "anonymous_identity_probe")
+
+    assert result["ok"] is False
+    assert result["error_kind"] == "nonzero_exit"
+    assert result["recoverable"] is True
+    assert result["needs_human"] is False
+    assert result["evidence"]["facts"]["recoverable"] is True
+
+
 def test_dynamic_argv_cannot_inject_a_command_or_target():
     registry = build_kali_registry(allowed_targets=["10.0.0.1"])
     with pytest.raises(ValueError, match="Unsupported nmap argv option"):

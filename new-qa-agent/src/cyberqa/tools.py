@@ -6,6 +6,7 @@ import os
 import re
 import shlex
 import shutil
+import socket
 from urllib.parse import urlsplit
 from dataclasses import dataclass
 from typing import Any, Callable, Protocol
@@ -49,12 +50,52 @@ class TargetPolicy:
 
     def __init__(self, entries: list[str] | tuple[str, ...] | None = None):
         configured = entries or [item.strip() for item in os.getenv(
-            "CYBERQA_ALLOWED_TARGETS", "127.0.0.1,localhost,::1"
+            "CYBERQA_ALLOWED_TARGETS", ""
         ).split(",") if item.strip()]
         self.entries: set[str] = set(configured)
+        self.local_hosts: set[str] = {"localhost", "127.0.0.1", "::1"}
+        self.local_hosts.update(item.strip() for item in os.getenv(
+            "CYBERQA_LOCAL_IPS", ""
+        ).split(",") if item.strip())
+        # Resolve only the local runner's own hostname. These addresses are
+        # excluded when a supplied CIDR also contains the Kali interface.
+        try:
+            self.local_hosts.update(
+                info[4][0] for info in socket.getaddrinfo(socket.gethostname(), None)
+                if info[4] and info[4][0]
+            )
+        except OSError:
+            pass
+
+    def mark_local(self, target: str) -> None:
+        host = _target_host(target)
+        if host:
+            self.local_hosts.add(host)
+
+    def is_local(self, target: str) -> bool:
+        host = _target_host(target)
+        if host in self.local_hosts:
+            return True
+        if "/" in host:
+            try:
+                network = ipaddress.ip_network(host, strict=False)
+                if network.is_loopback or network.is_unspecified:
+                    return True
+                if network.num_addresses == 1:
+                    return self.is_local(str(network.network_address))
+                return False
+            except ValueError:
+                return False
+        try:
+            address = ipaddress.ip_address(host)
+            return address.is_loopback or address.is_unspecified
+        except ValueError:
+            return host.lower() in {"localhost", "localhost.localdomain"}
 
     def allows(self, target: str) -> bool:
         host = _target_host(target)
+        if self.is_local(target):
+            return False
         if target in self.entries or host in self.entries:
             return True
         try:
@@ -65,7 +106,9 @@ class TargetPolicy:
             return False
 
     def add(self, target: str) -> bool:
-        if target and target not in self.entries:
+        # Discovery may expand an authorized CIDR, but it may not expand the
+        # policy to an unrelated address or to the scanner itself.
+        if target and not self.is_local(target) and self.allows(target) and target not in self.entries:
             self.entries.add(target)
             return True
         return False
@@ -152,6 +195,7 @@ class KaliTool:
     def build_argv(self, target: str, parameters: dict[str, Any] | None = None) -> list[str]:
         """Build the reviewed argv used both for execution and cache identity."""
         parameters = parameters or {}
+        policy = self.target_policy or TargetPolicy()
         if self.name in {"check_port", "nxc_smb_recon", "nxc_ldap_recon"}:
             supported = {"profile"}
             if self.name.startswith("nxc_"):
@@ -159,6 +203,11 @@ class KaliTool:
             supported.add("argv")
         elif self.name == "check_dns_resolution":
             supported = {"name"}
+        elif self.name in {"ldap_bind", "smb_negotiate"}:
+            # These are intentionally narrow correction surfaces. The model
+            # may change protocol/profile flags, but it never supplies the
+            # executable, URL, SMB service path, or an arbitrary shell string.
+            supported = {"profile", "argv"}
         else:
             supported = set()
         unknown = set(parameters) - supported
@@ -171,8 +220,60 @@ class KaliTool:
         if self.name == "check_dns_resolution":
             query = str(parameters.get("name") or target)
             return [executable, "+short", query, *self.tail_args]
+        if self.name == "ldap_bind":
+            profiles = {
+                "rootdse": ("-x", "-s", "base", "-b", ""),
+                "subtree": ("-x", "-s", "sub", "-b", ""),
+                "starttls_rootdse": ("-x", "-ZZ", "-s", "base", "-b", ""),
+                "gssapi_rootdse": ("-Y", "GSSAPI", "-s", "base", "-b", ""),
+            }
+            profile = str(parameters.get("profile", "rootdse"))
+            if profile not in profiles:
+                raise ValueError(f"Unsupported ldap_bind profile: {profile}")
+            custom_argv = parameters.get("argv") or []
+            selected = tuple(_validated_option_argv(
+                custom_argv,
+                flags={"-x", "-LLL", "-v", "-ZZ", "-Z"},
+                value_flags={"-b", "-d", "-E", "-o", "-s", "-Y"},
+                label="ldap",
+            )) if custom_argv else profiles[profile]
+            # Always force the target through -H. A model can select a base,
+            # scope, StartTLS, or SASL mode, but cannot smuggle another host.
+            if "-H" in selected:
+                raise ValueError("ldap argv cannot override the reviewed target")
+            if "-x" not in selected and "-Y" not in selected:
+                selected = ("-x", *selected)
+            return [executable, "-H", f"ldap://{target}", *selected]
+        if self.name == "smb_negotiate":
+            profiles = {
+                "anonymous": ("-L", "-N"),
+                "smb2": ("-L", "-N", "-m", "SMB2"),
+                "smb3": ("-L", "-N", "-m", "SMB3"),
+                "port445": ("-L", "-N", "-p", "445"),
+            }
+            profile = str(parameters.get("profile", "anonymous"))
+            if profile not in profiles:
+                raise ValueError(f"Unsupported smb_negotiate profile: {profile}")
+            custom_argv = parameters.get("argv") or []
+            selected = tuple(_validated_option_argv(
+                custom_argv,
+                flags={"-L", "-N", "-g"},
+                value_flags={"-m", "-p", "-W"},
+                label="smb",
+            )) if custom_argv else profiles[profile]
+            if "-L" not in selected:
+                selected = ("-L", *selected)
+            # smbclient requires the server immediately after -L. Insert the
+            # reviewed target there regardless of the model's flag ordering.
+            list_args = list(selected)
+            list_args.insert(list_args.index("-L") + 1, f"//{target}")
+            return [executable, *list_args]
         if self.name == "check_port":
             profiles = {
+                # Network reconnaissance starts with host discovery/fast
+                # discovery. Full service detection is a later adaptive step.
+                "host_discovery": ("-sn",),
+                "fast": ("-F",),
                 "default": ("-sC", "-sV"),
                 "top100": ("-Pn", "-T3", "--top-ports", "100"),
                 "top1000": ("-Pn", "-T3", "--top-ports", "1000"),
@@ -183,6 +284,13 @@ class KaliTool:
             if profile not in profiles:
                 raise ValueError(f"Unsupported check_port profile: {profile}")
             custom_argv = parameters.get("argv") or []
+            if "/" in target and profile == "default":
+                # Service/version scripts against a whole CIDR are not the
+                # first step. Keep the tool adaptive and safe even if a model
+                # accidentally requests the default profile too early.
+                profile = "host_discovery"
+            if "/" in target and custom_argv and any(flag in custom_argv for flag in ("-sC", "-sV")):
+                raise ValueError("Run nmap -sn or -F against a CIDR first; use -sC/-sV on a discovered host")
             fixed_args = (
                 tuple(_validated_option_argv(
                     custom_argv,
@@ -228,6 +336,28 @@ class KaliTool:
             argv.insert(self_target_index + 1, f"{self.target_prefix}{target}")
             argv.extend(self.tail_args)
             return argv
+        if self.name == "check_port" and "/" in target:
+            # The supplied CIDR may contain the Kali runner's own interface.
+            # Exclude those addresses in the Nmap command itself; merely
+            # omitting them from the discovered-target list would still scan
+            # the local machine.
+            try:
+                network = ipaddress.ip_network(_target_host(target), strict=False)
+                excluded = []
+                for host in policy.local_hosts:
+                    if not host or "/" in host:
+                        continue
+                    try:
+                        address = ipaddress.ip_address(_target_host(host))
+                    except ValueError:
+                        continue
+                    if address in network:
+                        excluded.append(str(address))
+                excluded.sort()
+            except ValueError:
+                excluded = []
+            if excluded:
+                fixed_args = (*fixed_args, "--exclude", ",".join(excluded))
         argv = [executable, *fixed_args]
         if self.target_arg:
             target_arg = f"{self.target_prefix}{target}"
@@ -291,6 +421,11 @@ def _target_host(target: str) -> str:
         if port.isdigit():
             return host
     return value
+
+
+def is_local_target(target: str) -> bool:
+    """Return true for loopback/unspecified/local-runner target values."""
+    return TargetPolicy().is_local(target)
 
 
 def _validated_option_argv(
@@ -432,8 +567,10 @@ class ToolRegistry:
             signature = self.observations.signature(
                 name, target, "invalid-command", {"parameters": parameters, "error": str(exc)}
             )
+            recoverable = _recoverable_tool_error(name, "invalid_arguments", str(exc))
             result = {"ok": False, "tool": name, "error": str(exc),
-                      "error_kind": "invalid_arguments", "needs_human": True}
+                      "error_kind": "invalid_arguments", "recoverable": recoverable,
+                      "retryable": recoverable, "needs_human": not recoverable}
             self.observations.put(signature, result)
             return {**result, "signature": signature, "cached": False}
         cached = None if force_refresh else self.observations.get(signature)
@@ -442,7 +579,7 @@ class ToolRegistry:
             if on_event:
                 on_event("tool_cached", {"tool": name, "target": target,
                                           "signature": signature})
-            return self._cache_hit(cached, signature, action)
+            return self._cache_hit(cached, signature, action, name)
         lock = self._observation_locks.setdefault(signature, asyncio.Lock())
         async with lock:
             cached = None if force_refresh else self.observations.get(signature)
@@ -451,31 +588,60 @@ class ToolRegistry:
                 if on_event:
                     on_event("tool_cached", {"tool": name, "target": target,
                                               "signature": signature})
-                return self._cache_hit(cached, signature, action)
+                return self._cache_hit(cached, signature, action, name)
             try:
                 evidence = await adapter.observe(target, action, **parameters)
                 evidence_data = evidence.model_dump(mode="json")
                 if evidence.exit_code not in (None, 0):
+                    error_kind = _tool_error_kind(evidence)
+                    recoverable = _recoverable_tool_error(
+                        name, error_kind, f"{evidence.stderr}\n{evidence.stdout}"
+                    )
+                    # Keep the classification beside the raw command facts.
+                    # Specialists later receive Evidence rather than the
+                    # transient registry result, so without this metadata a
+                    # future Supervisor turn could not distinguish a
+                    # recoverable LDAP/SMB/NXC failure from an exhausted one.
+                    evidence_data["facts"] = {
+                        **(evidence_data.get("facts") or {}),
+                        "error_kind": error_kind,
+                        "recoverable": recoverable,
+                    }
                     result = {
                         "ok": False, "tool": name,
                         "error": _tool_error_message(evidence),
-                        "error_kind": _tool_error_kind(evidence),
-                        "needs_human": True, "evidence": evidence_data,
+                        "error_kind": error_kind,
+                        "recoverable": recoverable,
+                        "retryable": recoverable,
+                        "needs_human": not recoverable, "evidence": evidence_data,
                     }
                 else:
                     result = {"ok": True, "tool": name, "evidence": evidence_data}
             except Exception as exc:
                 result = {"ok": False, "tool": name, "error": str(exc),
-                          "error_kind": type(exc).__name__, "needs_human": True}
+                          "error_kind": type(exc).__name__, "recoverable": False,
+                          "retryable": False, "needs_human": True}
             self.observations.put(signature, result)
             return {**result, "signature": signature, "cached": False}
 
     @staticmethod
-    def _cache_hit(cached: dict[str, Any], signature: str, action: str) -> dict[str, Any]:
+    def _cache_hit(cached: dict[str, Any], signature: str, action: str,
+                   tool_name: str | None = None) -> dict[str, Any]:
         result = {**cached, "signature": signature, "cached": True}
+        if not result.get("ok", True) and "recoverable" not in result:
+            recoverable = _recoverable_tool_error(
+                tool_name or str(result.get("tool", "")),
+                str(result.get("error_kind", "nonzero_exit")),
+                str(result.get("error", "")),
+            )
+            result.update({"recoverable": recoverable, "retryable": recoverable,
+                           "needs_human": not recoverable})
         if isinstance(cached.get("evidence"), dict):
             evidence = dict(cached["evidence"])
             facts = dict(evidence.get("facts") or {})
+            if not result.get("ok", True):
+                facts.setdefault("error_kind", result.get("error_kind", "nonzero_exit"))
+                facts.setdefault("recoverable", result.get("recoverable", False))
             facts["cache_hit"] = True
             facts["original_action"] = evidence.get("action")
             evidence["action"] = action
@@ -534,6 +700,35 @@ def _tool_error_message(evidence: Evidence) -> str:
     detail = (evidence.stderr or evidence.stdout or "tool exited with a non-zero status").strip()
     argv = evidence.facts.get("argv") if isinstance(evidence.facts, dict) else None
     return f"exit={evidence.exit_code}; argv={argv}; {detail[-2000:]}"
+
+
+def _recoverable_tool_error(tool_name: str, error_kind: str, detail: str = "") -> bool:
+    """Classify failures that a read-only ReAct specialist can repair.
+
+    The command result remains evidence in every case. Recoverable failures
+    are returned to the model as normal tool results; non-recoverable failures
+    retain the Human-in-the-loop boundary.
+    """
+    name = str(tool_name).lower()
+    read_only = name in {
+        "ldap_bind", "smb_negotiate", "nxc_smb_recon", "nxc_ldap_recon", "check_port",
+        "check_dns_resolution", "http_health_check", "impacket_rpc_recon",
+    } or name.startswith("inspect_")
+    if not read_only:
+        return False
+    if error_kind in {"approval_scope", "approval_required", "PermissionError", "RuntimeError",
+                      "FileNotFoundError", "invalid_arguments"}:
+        # Invalid reviewed arguments are exactly what the ReAct model can
+        # correct. Runtime/executable/approval failures need operator context.
+        return error_kind == "invalid_arguments"
+    if error_kind in {"connectivity", "timeout", "permission_denied", "nonzero_exit"}:
+        return True
+    lowered = detail.lower()
+    return any(marker in lowered for marker in (
+        "can't contact ldap", "operations error", "stronger authentication",
+        "not enough", "logon failure", "connection refused", "timed out",
+        "no route to host", "unrecognized argument", "usage:",
+    ))
 
 
 SENSITIVE_TOOL_NAMES = frozenset({
