@@ -24,12 +24,14 @@ The supervisor receives current evidence, unresolved goals, prior action signatu
 
 ## AD decision contract
 
-AD method selection has a deterministic prerequisite guard between the model and the broker. The model may interpret evidence and propose an objective, but the guard owns the transitions that must not be ambiguous:
+AD method selection has a deterministic prerequisite/completion guard between the model and the broker. The model remains the Supervisor and may choose any concrete safe non-terminal path; the guard only prevents unsafe prerequisites, premature terminal transitions, and repeated no-op planning:
 
 ```text
 domain/DC + username source + no credential
     -> one approved AS-REP assessment
-    -> evidence judge/report (no automatic rerun)
+    -> remaining bounded identity/recon evidence
+    -> Supervisor chooses the next unresolved path
+    -> judge/report only after the completion gate
 domain/DC + no credential + no username source
     -> one bounded anonymous LDAP/SMB/NXC-LDAP identity phase
     -> username source found: AS-REP

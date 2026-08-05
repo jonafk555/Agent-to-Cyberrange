@@ -2,6 +2,7 @@ import asyncio
 
 import pytest
 
+from cyberqa.memory import ObservationStore
 from cyberqa.tools import KaliTool, TargetPolicy, build_kali_registry, summarize_output
 
 
@@ -62,6 +63,18 @@ def test_semantic_probe_aliases_share_effective_command_signature(monkeypatch):
     )
 
     assert semantic == direct
+
+
+def test_observation_store_can_clear_durable_entries():
+    store = ObservationStore(":memory:")
+    store.put("one", {"ok": True})
+    store.put("two", {"ok": False})
+
+    assert store.clear("one") == 1
+    assert store.get("one") is None
+    assert store.get("two") is not None
+    assert store.clear() == 1
+    assert store.get("two") is None
 
 
 def test_nmap_and_nxc_accept_reviewed_dynamic_argv_fragments():

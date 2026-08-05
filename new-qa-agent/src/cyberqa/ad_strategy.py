@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from .models import Decision, Role, ToolParameters
@@ -23,6 +24,7 @@ class ADContext:
     credential_validation_attempted: bool
     credentials_validated: bool
     username_source: bool
+    username_file: str | None
     users: tuple[str, ...]
     ldap_bound: bool
     identity_attempted: bool
@@ -83,19 +85,32 @@ def _target(state: dict[str, Any], domain: str | None) -> str:
     return fallback if not is_local_target(str(fallback)) else "environment"
 
 
+def _valid_users_file(value: object) -> str | None:
+    """Return a usable username-file path, ignoring stale runtime config."""
+
+    if not isinstance(value, str) or not value.strip():
+        return None
+    candidate = Path(value).expanduser()
+    if not candidate.is_file():
+        return None
+    return str(candidate)
+
+
 def derive_context(state: dict[str, Any]) -> ADContext:
     knowledge = _knowledge(state)
     users = tuple(sorted({str(user) for user in knowledge.get("users", [])}))
-    users_file = os.getenv("CYBERQA_AD_USERS_FILE", "")
-    # A configured path is an operator-provided source even before the file is
-    # opened. The capability adapter performs the concrete existence/type/size
-    # validation and records the exact failure as evidence.
+    users_file = _valid_users_file(os.getenv("CYBERQA_AD_USERS_FILE", ""))
+    # A persisted path is a candidate source only when it still exists. This
+    # prevents stale runtime configuration from forcing AS-REP on every task;
+    # the capability adapter still performs the concrete type/size validation.
     file_available = bool(users_file)
     decision = state.get("last_decision")
     if decision:
         params = decision.tool_parameters.model_dump(mode="json", exclude_none=True)
         users = tuple(sorted(set(users) | {str(user) for user in params.get("users", [])}))
-        file_available = file_available or bool(params.get("users_file"))
+        decision_file = _valid_users_file(params.get("users_file"))
+        users_file = users_file or decision_file
+        file_available = file_available or bool(decision_file)
     domain = knowledge.get("domain") or os.getenv("CYBERQA_AD_DOMAIN")
     credentials = bool(os.getenv("CYBERQA_AD_USERNAME") and os.getenv("CYBERQA_AD_PASSWORD"))
     credential_items = _items(state, "ad_credential_validation")
@@ -129,6 +144,7 @@ def derive_context(state: dict[str, Any]) -> ADContext:
         credential_validation_attempted=credential_validation_attempted,
         credentials_validated=credential_validated,
         username_source=bool(users or file_available),
+        username_file=users_file,
         users=users,
         ldap_bound=ldap_bound,
         identity_attempted=identity_attempted,
@@ -149,7 +165,7 @@ def recommend(state: dict[str, Any]) -> Decision | None:
     no stronger fact-based transition and the model may select a read-only
     discovery/reporting step. It does not mean arbitrary tools are exposed.
     """
-    if state.get("scorecard"):
+    if state.get("scorecard") and state.get("scorecard_authorized"):
         return Decision(
             next_agent="end", objective="complete", action="end",
             target=state.get("target", "environment"),
@@ -162,7 +178,7 @@ def recommend(state: dict[str, Any]) -> Decision | None:
     if not context.has_credentials and not context.credentials_validated:
         if context.username_source and not context.asrep_attempted:
             params = {"users": list(context.users[:500])} if context.users else {}
-            configured_file = os.getenv("CYBERQA_AD_USERS_FILE")
+            configured_file = context.username_file
             if configured_file:
                 params = {"users_file": configured_file}
             return Decision(
@@ -200,18 +216,22 @@ def recommend(state: dict[str, Any]) -> Decision | None:
                     "Provide CYBERQA_AD_USERS_FILE or explicit range-issued usernames; the agent will not guess accounts."
                 ),
             )
-        # A completed AS-REP branch is now an evidence-review transition, not
-        # a reason to fall back to nmap, SMB, and LDAP in a loop. A non-zero
-        # adapter result is intercepted by the specialist and routed to the
-        # operator with its concrete error before this transition is reached.
-        if context.asrep_attempted:
+        # AS-REP is one evidence source, not a completion condition. If the
+        # bounded identity phase is still incomplete, collect its remaining
+        # read-only evidence before letting the Supervisor choose the next
+        # method. This prevents AS-REP -> Judge -> END short-circuiting.
+        if context.asrep_attempted and not context.identity_complete:
             return Decision(
-                next_agent=Role.JUDGE, objective="evaluate AD evidence", action="evaluate_ad_evidence",
+                next_agent=Role.VALIDATION,
+                objective="collect remaining unauthenticated AD identity evidence",
+                action="anonymous_identity_probe",
                 target=context.target,
                 justification=(
-                    "The unauthenticated AS-REP branch has already been executed. Evaluate its redacted result "
-                    "and record whether ticket material was observed or the branch was blocked; do not rerun it."
+                    "AS-REP has completed, but the bounded remote identity phase is not complete. "
+                    "Continue unused identity probes once, then return to the Supervisor for evidence-driven planning."
                 ),
+                expected_evidence=["domain_name", "users", "anonymous_access_or_blocked"],
+                tool_parameters=ToolParameters(allow_anonymous_nxc=True),
             )
 
     if context.has_credentials and not context.credentials_validated:

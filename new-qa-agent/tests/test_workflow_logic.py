@@ -234,7 +234,7 @@ def test_ad_strategy_retries_asrep_after_stale_approval_scope_rejection():
     assert decision.capability == "asrep_roasting_assessment"
 
 
-def test_ad_strategy_sends_completed_asrep_to_evidence_judge():
+def test_ad_strategy_continues_identity_after_completed_asrep():
     from cyberqa.models import Evidence
 
     decision = recommend_ad_method({
@@ -252,5 +252,112 @@ def test_ad_strategy_sends_completed_asrep_to_evidence_judge():
         "target_profiles": {},
     })
     assert decision is not None
-    assert decision.next_agent == Role.JUDGE
-    assert decision.action == "evaluate_ad_evidence"
+    assert decision.next_agent == Role.VALIDATION
+    assert decision.action == "anonymous_identity_probe"
+
+
+def test_ad_strategy_does_not_use_missing_username_file(monkeypatch):
+    monkeypatch.setenv("CYBERQA_AD_DOMAIN", "corp.local")
+    monkeypatch.setenv("CYBERQA_AD_USERS_FILE", "/definitely/missing/users.txt")
+    decision = recommend_ad_method({
+        "target": "10.0.0.1",
+        "ad_knowledge": {"domain": "corp.local", "users": []},
+        "evidence": [], "method_history": [], "target_profiles": {},
+    })
+    assert decision is not None
+    assert decision.action == "anonymous_identity_probe"
+
+
+def test_completion_gate_requires_identity_after_asrep():
+    from cyberqa.models import Evidence
+
+    agents = Agents(tools=build_kali_registry(allowed_targets=["10.0.0.1"]))
+    base = {
+        "target": "10.0.0.1",
+        "recon_coverage": {"10.0.0.1": {"checks": {"nmap:default": {"status": "completed"}}}},
+        "ad_knowledge": {"domain": "corp.local", "users": ["alice"]},
+        "evidence": [Evidence(
+            source="ad-capability:ad_asrep_roasting", action="asrep_roasting_assessment",
+            target="10.0.0.1", exit_code=1,
+        )],
+        "method_history": [{"tool": "ad-capability:ad_asrep_roasting", "action": "asrep_roasting_assessment"}],
+    }
+    assert not agents._completion_gate_open(base)
+    base["evidence"].extend([
+        Evidence(source="kali:ldap_bind", action="anonymous_identity_probe", target="10.0.0.1", exit_code=1),
+        Evidence(source="kali:smb_negotiate", action="anonymous_identity_probe", target="10.0.0.1", exit_code=1),
+        Evidence(source="kali:nxc_ldap_recon", action="anonymous_identity_probe", target="10.0.0.1", exit_code=1),
+    ])
+    assert agents._completion_gate_open(base)
+
+
+def test_judge_only_creates_scorecard_after_supervisor_authorization():
+    import asyncio
+
+    state = {
+        "run_id": "judge-test",
+        "target": "10.0.0.1",
+        "last_decision": Decision(
+            next_agent=Role.JUDGE,
+            objective="evaluate",
+            action="evaluate_ad_evidence",
+            target="10.0.0.1",
+            justification="evaluate accumulated evidence",
+        ),
+        "evidence": [], "events": [], "method_history": [], "observation_index": {},
+        "ad_knowledge": {}, "discovered_targets": [], "target_profiles": {},
+        "recon_coverage": {}, "messages": [], "judge_authorized": False,
+    }
+    agents = Agents(tools=ToolRegistry(target_policy=TargetPolicy(["10.0.0.1"])))
+    result = asyncio.run(agents.specialist(Role.JUDGE, state))
+    assert "scorecard" not in result
+
+    state["judge_authorized"] = True
+    result = asyncio.run(agents.specialist(Role.JUDGE, state))
+    assert result["scorecard_authorized"] is True
+
+
+def test_ad_guard_does_not_replace_a_safe_supervisor_path():
+    safe = Decision(
+        next_agent=Role.VALIDATION, objective="remote recon", action="service_enumeration",
+        target="10.0.0.1", justification="inspect a newly discovered remote host",
+    )
+    guard = Decision(
+        next_agent=Role.TESTING, objective="assess AD", action="asrep_roasting_assessment",
+        target="10.0.0.1", justification="candidate username source is available",
+    )
+    terminal = safe.model_copy(update={"next_agent": Role.JUDGE, "action": "evaluate_ad_evidence"})
+    assert Agents._should_apply_ad_guard(safe, guard) is False
+    assert Agents._should_apply_ad_guard(terminal, guard) is True
+
+
+def test_supervisor_replans_when_model_stops_without_a_blocker():
+    import asyncio
+
+    class StopModel:
+        def with_structured_output(self, *args, **kwargs):
+            return self
+
+        async def ainvoke(self, messages):
+            return Decision(
+                next_agent="end", objective="human_help", action="end",
+                target="10.0.0.1", justification="no pipeline found",
+            )
+
+    state = {
+        "target": "10.0.0.1", "objective": "continue QA", "iteration": 0,
+        "evidence": [], "method_history": [], "target_profiles": {},
+        "recon_coverage": {}, "discovered_targets": ["10.0.0.1"],
+        "runner_ips": [], "ad_knowledge": {}, "runtime_config": {},
+        "human_directives": [], "messages": [], "observation_index": {},
+        "action_history": [], "replan_count": 0,
+        "autonomous_replan_count": 0, "autonomous_continuation_required": False,
+    }
+    agents = Agents(
+        llm=StopModel(),
+        tools=ToolRegistry(target_policy=TargetPolicy(["10.0.0.1"])),
+    )
+    result = asyncio.run(agents.supervisor(state))
+    assert result["phase"] == Role.SUPERVISOR
+    assert result["autonomous_replan_count"] == 1
+    assert result["needs_human"] is False

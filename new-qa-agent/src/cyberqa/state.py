@@ -24,6 +24,11 @@ class QAState(TypedDict, total=False):
     hypotheses: list[Hypothesis]
     approvals: Annotated[list[ApprovalRequest], lambda a, b: a + b]
     scorecard: Scorecard | None
+    # A scorecard is terminal state only when the Supervisor's completion gate
+    # explicitly authorized the Judge to create it. This also makes old
+    # checkpoints with an unguarded scorecard recoverable.
+    scorecard_authorized: bool
+    judge_authorized: bool
     memory: Annotated[dict[str, Any], merge_dict]
     messages: Annotated[list[Any], add_messages]
     last_decision: Decision | None
@@ -37,6 +42,11 @@ class QAState(TypedDict, total=False):
     # Number of times the Supervisor had to re-plan because the proposed
     # effective command was already present in the execution ledger.
     replan_count: int
+    # Automatic continuation turns after a model tried to stop without a
+    # concrete blocker. This is not an iteration limit; it is a bounded guard
+    # against an LLM repeatedly refusing to choose a next path.
+    autonomous_replan_count: int
+    autonomous_continuation_required: bool
     method_history: list[dict[str, Any]]
     completed_goals: list[str]
     errors: list[str]

@@ -65,6 +65,18 @@ class ObservationStore:
         )
         self.connection.commit()
 
+    def clear(self, signature: str | None = None) -> int:
+        """Delete cached observations and return the number of removed rows."""
+
+        if signature:
+            cursor = self.connection.execute(
+                "DELETE FROM observations WHERE signature = ?", (signature,)
+            )
+        else:
+            cursor = self.connection.execute("DELETE FROM observations")
+        self.connection.commit()
+        return int(cursor.rowcount)
+
     def close(self) -> None:
         self.connection.close()
 

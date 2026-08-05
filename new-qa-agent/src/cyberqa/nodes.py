@@ -4,6 +4,7 @@ import json
 import ipaddress
 import os
 import re
+from pathlib import Path
 from typing import Any, Annotated, Callable, TypedDict
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
@@ -16,7 +17,7 @@ from langgraph.types import interrupt
 from .approval import ApprovalPolicy, approved_tools_for_decision, decision_fingerprint
 from .ad_playbooks import (capability_catalog, get_capability,
                            normalize_capability_parameters)
-from .ad_strategy import recommend as recommend_ad_method
+from .ad_strategy import derive_context, recommend as recommend_ad_method
 from .discovery import (apply_and_persist_runtime_config, build_target_profiles,
                          derive_runtime_config, synthesize_evidence)
 from .events import EventBus
@@ -299,10 +300,11 @@ class Agents:
             known.add("user enumeration")
             known.add("candidate username source")
         users_file = os.getenv("CYBERQA_AD_USERS_FILE", "")
-        # A path supplied by the operator is an intentional candidate source.
-        # Let the reviewed adapter report a missing/unreadable file instead of
-        # silently falling back to anonymous recon.
-        if users_file:
+        # Stale/missing paths are not prerequisites. An explicit human
+        # directive can still dispatch the adapter and receive its concrete
+        # file error, but automatic planning must not be driven by a dead
+        # runtime path.
+        if users_file and Path(users_file).expanduser().is_file():
             known.add("candidate username source")
         if knowledge.get("credentials_validated"):
             known.add("validated domain credential")
@@ -445,9 +447,11 @@ class Agents:
             ],
             "iteration": state.get("iteration", 0),
             "replan_count": state.get("replan_count", 0),
+            "autonomous_replan_count": state.get("autonomous_replan_count", 0),
+            "autonomous_continuation_required": state.get("autonomous_continuation_required", False),
             "approved_tool_parameters": state.get("last_decision").tool_parameters.model_dump(mode="json") if state.get("last_decision") else {},
             "capabilities": capability_catalog(),
-            "instruction": "Read the complete evidence.stdout, evidence.stderr, facts, and output_summary fields; the CLI progress preview is not the evidence. Reason over the complete evidence synthesis, not only the last result. Advance one or more unresolved findings. Cover all discovered hosts/services and cross-forest candidates. The runner_ips list contains Kali/QA-runner addresses only: it is exclusion metadata, never a recon, validation, or testing target. `environment` is execution context, not a cyber-range host. Treat recon_coverage as authoritative: a completed semantic check is not a new task merely because the action wording changed. Never repeat an identical effective argv; a different reviewed argv/profile is allowed only when it has an explicit expected evidence gain. The execution ledger and observation cache are authoritative memory: if the effective command is already present, re-plan to a different unresolved target/service/capability instead of emitting it again. Treat LDAP authentication, DNS context, forest mismatch, permissions, and command syntax as different hypotheses. The latest operator instruction is semantic, high-priority execution guidance, not a single fixed command: extract all requested goals, constraints, exclusions, ordering, target changes, username sources, and requested continuation, then combine them with the autonomous plan. Do not discard later clauses after recognizing one tool name. If the operator rejected the previous proposal, never reproduce that action/target/parameters; choose the next justified autonomous alternative. If domain credentials are absent and domain/DC plus a candidate username source are known, prioritize asrep_roasting_assessment immediately; AS-REP does not require a domain credential. Do not loop over empty-credential SMB/LDAP/NXC probes. If no username source exists, use only explicitly allowed anonymous enumeration or ask Human for CYBERQA_AD_USERS_FILE. For a CIDR, host discovery must begin with nmap -sn or -F; after hosts are found, perform nmap -sC -sV (or an explicitly justified reviewed profile) against each authorized non-local host before declaring the network empty. If discovery returns no hosts, adapt with the other discovery method and inspect routing/DNS instead of stopping. For check_port choose a profile or safe argv deliberately; for NXC choose a profile or safe argv deliberately. `iteration` is telemetry, not a stop condition; keep the Supervisor making decisions until the objective is complete, no authorized unresolved path remains, or the model/tool boundary genuinely needs Human. Return one primary decision plus useful next_options and exact tool_parameters, including argv/users_file when supplied.",
+            "instruction": "Read the complete evidence.stdout, evidence.stderr, facts, and output_summary fields; the CLI progress preview is not the evidence. Reason over the complete evidence synthesis, not only the last result. Advance one or more unresolved findings. Cover all discovered hosts/services and cross-forest candidates. The runner_ips list contains Kali/QA-runner addresses only: it is exclusion metadata, never a recon, validation, or testing target. `environment` is execution context, not a cyber-range host. Treat recon_coverage as authoritative: a completed semantic check is not a new task merely because the action wording changed. Never repeat an identical effective argv; a different reviewed argv/profile is allowed only when it has an explicit expected evidence gain. The execution ledger and observation cache are authoritative memory: if the effective command is already present, re-plan to a different unresolved target/service/capability instead of emitting it again. Treat LDAP authentication, DNS context, forest mismatch, permissions, and command syntax as different hypotheses. The latest operator instruction is semantic, high-priority execution guidance, not a single fixed command: extract all requested goals, constraints, exclusions, ordering, target changes, username sources, and requested continuation, then combine them with the autonomous plan. Do not discard later clauses after recognizing one tool name. If the operator rejected the previous proposal, never reproduce that action/target/parameters; choose the next justified autonomous alternative. If `autonomous_continuation_required` is true, the previous stop request had no concrete blocker: choose the next distinct authorized path now and do not return `end/human_help`. If domain credentials are absent and domain/DC plus a candidate username source are known, treat asrep_roasting_assessment as one prioritized evidence path; it is not completion and must return to Supervisor planning afterward. Do not loop over empty-credential SMB/LDAP/NXC probes. If no username source exists, use only explicitly allowed anonymous enumeration or ask Human for CYBERQA_AD_USERS_FILE. For a CIDR, host discovery must begin with nmap -sn or -F; after hosts are found, perform nmap -sC -sV (or an explicitly justified reviewed profile) against each authorized non-local host before declaring the network empty. If discovery returns no hosts, adapt with the other discovery method and inspect routing/DNS instead of stopping. For check_port choose a profile or safe argv deliberately; for NXC choose a profile or safe argv deliberately. `iteration` is telemetry, not a stop condition; keep the Supervisor making decisions until the objective is complete, no authorized unresolved path remains, or the model/tool boundary genuinely needs Human. Return one primary decision plus useful next_options and exact tool_parameters, including argv/users_file when supplied.",
         })
         self.progress("reasoning_start", agent=Role.SUPERVISOR.value)
         response = await model.ainvoke([
@@ -525,6 +529,110 @@ class Agents:
         # evidence and let the evidence-driven Supervisor choose the next
         # remote diagnostic path.
         return None
+
+    def _remote_recon_complete(self, state: QAState) -> bool:
+        """Return whether the bounded remote network baseline is complete.
+
+        This is deliberately separate from ``iteration`` and from the Judge.
+        It only answers whether known remote targets have had their required
+        discovery/service baseline; the Supervisor still decides the next AD,
+        trust, ACL, or reporting path afterward.
+        """
+
+        target = str(state.get("target", ""))
+        if not target or is_local_target(target):
+            return False
+        coverage = state.get("recon_coverage", {}) or {}
+        if "/" in target:
+            network_profile = coverage.get(target, {})
+            checks = network_profile.get("checks", {}) if isinstance(network_profile, dict) else {}
+            discovery_done = any(
+                checks.get(f"nmap:{profile}", {}).get("status") == "completed"
+                for profile in ("host_discovery", "fast")
+            )
+            if not discovery_done:
+                return False
+            hosts = {
+                str(value) for value in state.get("discovered_targets", [])
+                if "/" not in str(value)
+                and not is_local_target(str(value))
+                and self.tools.target_policy.allows(str(value))
+            }
+            for host in hosts:
+                host_profile = coverage.get(host, {})
+                host_checks = host_profile.get("checks", {}) if isinstance(host_profile, dict) else {}
+                if not any(
+                    host_checks.get(f"nmap:{profile}", {}).get("status") == "completed"
+                    for profile in ("default", "ad_tcp", "top100", "top1000")
+                ):
+                    return False
+            return True
+        profile = coverage.get(target, {})
+        checks = profile.get("checks", {}) if isinstance(profile, dict) else {}
+        return any(
+            item.get("status") == "completed"
+            for item in checks.values()
+            if isinstance(item, dict)
+        )
+
+    def _completion_gate_open(self, state: QAState) -> bool:
+        """Guard Judge/END without disabling Supervisor planning.
+
+        The gate requires remote baseline coverage and, when AD context is
+        known, completion of the bounded identity/capability prerequisites.
+        It does not decide the next action; it only rejects premature terminal
+        transitions so the Supervisor can continue planning.
+        """
+
+        if state.get("scorecard_authorized"):
+            return True
+        if not self._remote_recon_complete(state):
+            return False
+        context = derive_context(state)
+        if not context.domain:
+            return True
+        if context.credentials_validated:
+            if not context.domain_users_attempted:
+                return False
+            if context.spns and not context.kerberoast_attempted:
+                return False
+            return context.bloodhound_attempted
+        if context.has_credentials:
+            return False
+        # With no credential, AS-REP and the bounded identity probes are the
+        # known prerequisites. Once these are complete, the model can still
+        # choose another justified read-only path before proposing Judge.
+        return context.asrep_attempted and context.identity_complete
+
+    @staticmethod
+    def _should_apply_ad_guard(model_decision: Decision, guard: Decision) -> bool:
+        """Apply only safety/completion guards, preserving safe model choices.
+
+        The deterministic AD strategy is a prerequisite oracle, not a second
+        Supervisor. A concrete, authorized non-terminal decision from the
+        model remains in control; the oracle takes over only for a terminal
+        request, a placeholder/no-op, or a completion marker.
+        """
+
+        if guard.action == "end" and guard.objective == "complete":
+            return True
+        if model_decision.next_agent in {Role.JUDGE, "end"}:
+            return True
+        model_text = f"{model_decision.capability or ''} {model_decision.action}".lower()
+        if guard.action == "anonymous_identity_probe" and any(
+            marker in model_text for marker in ("ldap", "smb", "nxc", "domain_users", "kerberoast")
+        ):
+            return True
+        if guard.action == "asrep_roasting_assessment" and any(
+            marker in model_text for marker in (
+                "domain_users", "enumerate_domain_users", "kerberoast",
+                "bloodhound", "password_spray",
+            )
+        ):
+            return True
+        return model_decision.action in {
+            "", "observe", "evaluate_ad_evidence", "analyze_existing_evidence",
+        }
 
     def _react_graph(self, role: Role, state: QAState, instruction: str | None = None,
                      tool_names: list[str] | None = None):
@@ -893,20 +1001,118 @@ class Agents:
                         "question": "Supervisor 無法產生下一步；請提供額外語意或輸入 abort。",
                         "reason": decision.justification,
                     }]}
-        # Hard AD prerequisites outrank a free-form model proposal. The model
-        # still plans all transitions where the deterministic guard has no
-        # stronger conclusion, but it cannot select empty-credential loops or
-        # skip an available unauthenticated AS-REP branch.
-        result = recommend_ad_method(state) or result
+        # AD safety/completion guards constrain only unsafe or terminal model
+        # proposals. A concrete safe non-terminal decision remains the
+        # Supervisor's choice, so adding another execution path does not get
+        # collapsed into one fixed AD command.
+        ad_guard = recommend_ad_method(state)
+        if ad_guard and self._should_apply_ad_guard(result, ad_guard):
+            result = ad_guard
         network_transition = self._network_recon_transition(state)
         if network_transition:
             # Complete the bounded host/service baseline before automatic AD
             # capability selection. A human explicit directive is handled
             # above and bypasses this guard intentionally.
             result = network_transition
+        terminal_request = (
+            result.next_agent == Role.JUDGE
+            or (result.next_agent == "end" and result.objective != "human_help")
+        )
+        if terminal_request and not self._completion_gate_open(state):
+            # Keep the Supervisor as the decision-maker. Prefer a concrete
+            # deterministic prerequisite (for example the remaining identity
+            # probes after AS-REP); otherwise give the Supervisor a distinct
+            # replan turn instead of silently converting it into END.
+            follow_up = recommend_ad_method(state)
+            if follow_up and (
+                follow_up.next_agent not in {Role.JUDGE, "end"}
+                or follow_up.objective == "human_help"
+            ):
+                result = follow_up
+            else:
+                result = Decision(
+                    next_agent=Role.SUPERVISOR,
+                    objective=result.objective or state.get("objective", "QA"),
+                    action="replan_before_completion",
+                    target=result.target or state.get("target", "environment"),
+                    justification=(
+                        "The proposed Judge/END transition is premature: unresolved remote coverage or "
+                        "bounded AD evidence remains. Supervisor must select the next distinct authorized "
+                        "path before evaluating completion."
+                    ),
+                    next_options=result.next_options,
+                )
         if result.next_agent == "end" and result.objective == "human_help":
+            # A model saying "there is no pipeline" is not itself a blocker.
+            # Keep planning autonomously unless the deterministic AD strategy
+            # identified a real missing prerequisite (for example, an absent
+            # username source) or the analysis engine is unavailable.
+            real_human_boundary = bool(
+                ad_guard
+                and ad_guard.objective == "human_help"
+                and ad_guard.action == result.action
+            )
+            if not real_human_boundary and self.llm:
+                continuation_count = state.get("autonomous_replan_count", 0) + 1
+                if continuation_count >= 3:
+                    exhausted = result.model_copy(update={
+                        "justification": (
+                            "The Supervisor declined to select a next path three times without a concrete "
+                            "tool, scope, approval, or missing-input blocker. Human input is now required "
+                            "to resolve the planning boundary."
+                        )
+                    })
+                    return {
+                        "iteration": iteration, "phase": "human_help", "last_decision": exhausted,
+                        "pending_action": exhausted.model_dump(),
+                        "autonomous_replan_count": continuation_count,
+                        "autonomous_continuation_required": False,
+                        "needs_human": True,
+                        "human_requests": [{
+                            "kind": "autonomous_path_exhausted",
+                            "question": "Agent 已連續三次未選擇下一個可執行路徑；請提供方向或輸入 abort。",
+                            "reason": exhausted.justification,
+                        }],
+                    }
+                replan = Decision(
+                    next_agent=Role.SUPERVISOR,
+                    objective=result.objective or state.get("objective", "QA"),
+                    action="autonomous_replan_after_stop",
+                    target=result.target or state.get("target", "environment"),
+                    justification=(
+                        "The model attempted to stop without a concrete blocker. Continue autonomously: "
+                        "inspect all evidence, choose a distinct authorized target/service/capability, "
+                        "and reserve Human for an actual missing input, approval, or unrecoverable failure."
+                    ),
+                    next_options=result.next_options,
+                )
+                return {
+                    "iteration": iteration, "phase": Role.SUPERVISOR,
+                    "last_decision": replan, "pending_action": replan.model_dump(),
+                    "autonomous_replan_count": continuation_count,
+                    "autonomous_continuation_required": True,
+                    "needs_human": False, "human_instruction": "",
+                }
             return {"iteration": iteration, "phase": "human_help", "last_decision": result,
                     "pending_action": result.model_dump(), "needs_human": True}
+        if (
+            result.next_agent == "end"
+            and result.objective == "complete"
+            and not state.get("scorecard_authorized")
+        ):
+            # A model cannot skip the final evidence evaluation by emitting a
+            # bare END. Once the completion gate is open, route through Judge
+            # so the scorecard is produced from the accumulated evidence.
+            result = Decision(
+                next_agent=Role.JUDGE,
+                objective="evaluate accumulated QA evidence",
+                action="evaluate_ad_evidence",
+                target=result.target or state.get("target", "environment"),
+                justification=(
+                    "Remote and bounded method coverage is complete, but the final evidence evaluation "
+                    "has not been authorized yet. Send the accumulated evidence to Judge before END."
+                ),
+            )
         result = self._redirect_completed_recon(state, result)
         agent = result.next_agent
         action = result.action
@@ -1090,6 +1296,11 @@ class Agents:
                 "pending_action": {**decision.model_dump(), "broker": capability_check},
                 "action_history": history + [signature], "capability_history": capability_history,
                 "replan_count": 0,
+                "autonomous_replan_count": 0,
+                "autonomous_continuation_required": False,
+                "judge_authorized": bool(
+                    decision.next_agent == Role.JUDGE and self._completion_gate_open(state)
+                ),
                 "approved_grant": reused_grant,
                 "human_instruction": ""}
 
@@ -1400,6 +1611,8 @@ class Agents:
                 # execution ledger. Preserve prior command identities so the
                 # next Supervisor cannot unknowingly rerun an old probe.
                 "replan_count": 0,
+                "autonomous_replan_count": 0,
+                "autonomous_continuation_required": False,
                 "messages": [HumanMessage(content=f"Human guidance for supervisor: {safe_answer}")],
                 "human_instruction": safe_answer,
                 "human_directives": [directive_record],
@@ -2049,11 +2262,19 @@ class Agents:
             "needs_human": inner_needs_human or bool(proposal.get("needs_human")),
             "human_requests": [inner_human_request] if inner_human_request else [],
             "human_directive": False,
+            "judge_authorized": False,
         }
         if role == Role.DEBUGGING and action == "generate_hypotheses":
             patch["hypotheses"] = [Hypothesis(statement=x, likelihood=.5) for x in proposal.get("hypotheses", [])]
-        if role == Role.JUDGE:
-            patch["scorecard"] = Scorecard(solvable=True, difficulty="appropriate", scenario_status="evaluated", score=proposal.get("score", 80), findings=proposal.get("findings", []))
+        if role == Role.JUDGE and state.get("judge_authorized"):
+            patch["scorecard"] = Scorecard(
+                solvable=True,
+                difficulty="appropriate",
+                scenario_status="evaluated",
+                score=proposal.get("score", 80),
+                findings=proposal.get("findings", []),
+            )
+            patch["scorecard_authorized"] = True
         return patch
 
     async def approval(self, state: QAState) -> dict[str, Any]:

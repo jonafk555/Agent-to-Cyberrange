@@ -161,6 +161,10 @@ def parse_args() -> argparse.Namespace:
                         help="Comma-separated allowlist; defaults to CYBERQA_ALLOWED_TARGETS")
     parser.add_argument("--once", action="store_true",
                         help="Run one task and exit instead of opening an interactive session")
+    parser.add_argument(
+        "--clear-observation-cache", action="store_true",
+        help="Clear the durable effective-command observation cache before this run",
+    )
     return parser.parse_args()
 
 
@@ -180,7 +184,11 @@ async def run(args: argparse.Namespace | None = None) -> None:
     # configured ranges, but never make the selected target fail its own policy.
     configured_targets.add(args.target)
     os.environ["CYBERQA_ALLOWED_TARGETS"] = ",".join(sorted(configured_targets))
-    app = build_graph(Agents(llm=build_llm(), tools=build_kali_registry(on_event=print_progress),
+    registry = build_kali_registry(on_event=print_progress)
+    if args.clear_observation_cache:
+        removed = registry.observations.clear()
+        print(f"[Cache] cleared observations={removed}", flush=True)
+    app = build_graph(Agents(llm=build_llm(), tools=registry,
                              on_progress=print_progress))
     async def stream_graph(input_state, task_config):
         """Stream graph updates while the LLM remains the decision-maker."""
@@ -234,6 +242,8 @@ async def run(args: argparse.Namespace | None = None) -> None:
                    "target": target, "iteration": 0, "max_iterations": args.max_iterations,
                    "hosts": {}, "evidence": [], "events": [], "approvals": [], "action_history": [],
                    "replan_count": 0,
+                   "autonomous_replan_count": 0, "autonomous_continuation_required": False,
+                   "scorecard": None, "scorecard_authorized": False, "judge_authorized": False,
                    "method_history": [],
                    "completed_goals": [], "errors": [], "memory": {}, "human_requests": [],
                    "react_steps": 0, "needs_human": False, "aborted": False,
