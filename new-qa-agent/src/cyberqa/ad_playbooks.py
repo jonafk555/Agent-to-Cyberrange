@@ -6,7 +6,7 @@ NetExec, Impacket, ldapsearch, BloodHound, PowerShell, or range-specific APIs.
 """
 from __future__ import annotations
 
-from .models import ADRisk, CapabilitySpec
+from .models import ADRisk, CapabilitySpec, ToolParameters
 
 
 AD_CAPABILITIES: tuple[CapabilitySpec, ...] = (
@@ -83,6 +83,34 @@ AD_CAPABILITIES: tuple[CapabilitySpec, ...] = (
 )
 
 CAPABILITY_INDEX = {item.name: item for item in AD_CAPABILITIES}
+
+# These adapters do not accept arbitrary command-line arguments. Keep their
+# executable parameter contract separate from the generic Nmap/NXC contract.
+CAPABILITY_PARAMETER_FIELDS: dict[str, frozenset[str]] = {
+    "enumerate_domain_users": frozenset(),
+    "asrep_roasting_assessment": frozenset({"users", "users_file"}),
+    "kerberoasting_assessment": frozenset(),
+    "credential_validation": frozenset(),
+    "controlled_password_spray_assessment": frozenset(),
+    "bloodhound_collection": frozenset(),
+}
+
+
+def normalize_capability_parameters(
+    capability: str | None,
+    parameters: ToolParameters | dict | None,
+) -> ToolParameters:
+    """Strip generic planner fields unsupported by a concrete AD adapter."""
+    if parameters is None:
+        raw: dict = {}
+    elif hasattr(parameters, "model_dump"):
+        raw = parameters.model_dump(mode="json", exclude_none=True)
+    else:
+        raw = dict(parameters)
+    allowed = CAPABILITY_PARAMETER_FIELDS.get(capability or "")
+    if allowed is not None:
+        raw = {key: value for key, value in raw.items() if key in allowed}
+    return ToolParameters.model_validate(raw)
 
 
 def capability_catalog() -> list[dict]:

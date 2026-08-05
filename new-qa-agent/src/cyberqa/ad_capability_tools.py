@@ -15,6 +15,38 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 from .models import Evidence
+from .ad_playbooks import CAPABILITY_PARAMETER_FIELDS
+
+
+def summarize_output(text: str, max_lines: int = 24, max_chars: int = 3200) -> str:
+    """Create a useful preview without replacing the stored full stream."""
+    lines = [line.rstrip() for line in str(text or "").splitlines() if line.strip()]
+    if not lines:
+        return ""
+    useful_markers = (
+        "[+]", "[-]", "[*]", "open", "domain", "user", "group", "spn", "signing",
+        "status", "error", "failed", "success", "warning", "port", "service", "kerberos",
+        "ldap", "smb", "dns", "anonymous", "access", "permission",
+    )
+    selected = [line for line in lines if any(marker in line.lower() for marker in useful_markers)] or lines
+    if len(selected) > max_lines:
+        selected = selected[: max_lines // 2] + [
+            f"... {len(lines) - max_lines} more output lines stored in evidence ..."
+        ] + selected[-max_lines // 2:]
+    preview = "\n".join(selected)
+    if len(preview) > max_chars:
+        preview = preview[:max_chars] + "\n... preview truncated; full output remains in evidence ..."
+    return preview
+
+
+def output_facts(stdout: str, stderr: str) -> dict[str, Any]:
+    """Record output size and useful previews while retaining full streams."""
+    return {
+        "stdout_lines": len([line for line in stdout.splitlines() if line.strip()]),
+        "stderr_lines": len([line for line in stderr.splitlines() if line.strip()]),
+        "stdout_summary": summarize_output(stdout),
+        "stderr_summary": summarize_output(stderr),
+    }
 
 
 def _first_available(names: tuple[str, ...]) -> str:
@@ -157,8 +189,8 @@ class ADCapabilityTool:
                     os.unlink(temporary_users_file)
                 except FileNotFoundError:
                     pass
-        stdout_text = _redact(stdout.decode(errors="replace")[-12000:])
-        stderr_text = _redact(stderr.decode(errors="replace")[-12000:])
+        stdout_text = _redact(stdout.decode(errors="replace"))
+        stderr_text = _redact(stderr.decode(errors="replace"))
         raw_output = f"{stdout.decode(errors='replace')}\n{stderr.decode(errors='replace')}"
         self._emit("tool_result", {"tool": self.name, "exit_code": process.returncode,
                                     "stdout": stdout_text, "stderr": stderr_text})
@@ -166,6 +198,7 @@ class ADCapabilityTool:
             "capability": self.capability,
             "argv": self._safe_argv(argv),
             "returncode": process.returncode,
+            **output_facts(stdout_text, stderr_text),
             **_capability_facts(
                 self.capability, raw_output, process.returncode,
                 os.getenv("CYBERQA_AD_DOMAIN", ""), os.getenv("CYBERQA_AD_USERNAME", ""),
@@ -182,14 +215,7 @@ class ADCapabilityTool:
             key: value for key, value in parameters.items()
             if value not in (None, "", [], False)
         }
-        allowed_parameters = {
-            "enumerate_domain_users": set(),
-            "asrep_roasting_assessment": {"users", "users_file"},
-            "kerberoasting_assessment": set(),
-            "credential_validation": set(),
-            "controlled_password_spray_assessment": set(),
-            "bloodhound_collection": set(),
-        }.get(self.capability, set())
+        allowed_parameters = CAPABILITY_PARAMETER_FIELDS.get(self.capability, frozenset())
         unknown = set(meaningful) - allowed_parameters
         if unknown:
             raise ValueError(

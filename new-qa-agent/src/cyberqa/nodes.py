@@ -12,7 +12,8 @@ from langgraph.prebuilt import ToolNode
 from langgraph.types import interrupt
 
 from .approval import ApprovalPolicy, approved_tools_for_decision, decision_fingerprint
-from .ad_playbooks import capability_catalog, get_capability
+from .ad_playbooks import (capability_catalog, get_capability,
+                           normalize_capability_parameters)
 from .ad_strategy import recommend as recommend_ad_method
 from .discovery import (apply_and_persist_runtime_config, build_target_profiles,
                          derive_runtime_config, synthesize_evidence)
@@ -359,7 +360,7 @@ class Agents:
             "runtime_config": state.get("runtime_config", {}),
             "approved_tool_parameters": state.get("last_decision").tool_parameters.model_dump(mode="json") if state.get("last_decision") else {},
             "capabilities": capability_catalog(),
-            "instruction": "Reason over the complete evidence synthesis, not only the last result. Advance one or more unresolved findings. Cover all discovered hosts/services and cross-forest candidates. Treat recon_coverage as authoritative: a completed semantic check is not a new task merely because the action wording changed. Never repeat an identical effective argv; a different reviewed argv/profile is allowed only when it has an explicit expected evidence gain. Treat LDAP authentication, DNS context, forest mismatch, permissions, and command syntax as different hypotheses. If domain credentials are absent and domain/DC plus a candidate username source are known, prioritize asrep_roasting_assessment immediately; AS-REP does not require a domain credential. Do not loop over empty-credential SMB/LDAP/NXC probes. If no username source exists, use only explicitly allowed anonymous enumeration or ask Human for CYBERQA_AD_USERS_FILE. For check_port choose a profile or safe argv deliberately; for NXC choose a profile or safe argv deliberately. Return one primary decision plus useful next_options and exact tool_parameters, including argv/users_file when supplied.",
+            "instruction": "Read the complete evidence.stdout, evidence.stderr, facts, and output_summary fields; the CLI progress preview is not the evidence. Reason over the complete evidence synthesis, not only the last result. Advance one or more unresolved findings. Cover all discovered hosts/services and cross-forest candidates. Treat recon_coverage as authoritative: a completed semantic check is not a new task merely because the action wording changed. Never repeat an identical effective argv; a different reviewed argv/profile is allowed only when it has an explicit expected evidence gain. Treat LDAP authentication, DNS context, forest mismatch, permissions, and command syntax as different hypotheses. If domain credentials are absent and domain/DC plus a candidate username source are known, prioritize asrep_roasting_assessment immediately; AS-REP does not require a domain credential. Do not loop over empty-credential SMB/LDAP/NXC probes. If no username source exists, use only explicitly allowed anonymous enumeration or ask Human for CYBERQA_AD_USERS_FILE. For check_port choose a profile or safe argv deliberately; for NXC choose a profile or safe argv deliberately. Return one primary decision plus useful next_options and exact tool_parameters, including argv/users_file when supplied.",
         })
         self.progress("reasoning_start", agent=Role.SUPERVISOR.value)
         response = await model.ainvoke([
@@ -696,6 +697,12 @@ class Agents:
                 "risk": ADRisk.CREDENTIAL_MATERIAL,
                 "approval_required": True,
             })
+        if decision.capability:
+            decision = decision.model_copy(update={
+                "tool_parameters": normalize_capability_parameters(
+                    decision.capability, decision.tool_parameters
+                )
+            })
         capability_check = self.broker.validate(
             decision, target,
             {item.get("signature") for item in state.get("capability_history", [])},
@@ -860,6 +867,9 @@ class Agents:
         grant.setdefault("target", decision.target)
         grant.setdefault("action", decision.action)
         grant.setdefault("capability", decision.capability)
+        grant["tool_parameters"] = normalize_capability_parameters(
+            decision.capability, grant.get("tool_parameters", {})
+        ).model_dump(mode="json", exclude_none=True)
         if not grant.get("allowed_tools"):
             grant["allowed_tools"] = approved_tools_for_decision(decision)
         return grant
@@ -933,9 +943,12 @@ class Agents:
         planned_calls: list[tuple[str, dict[str, Any], dict[str, Any] | None]] = []
         blocked_action = False
         if capability_tool:
+            capability_parameters = normalize_capability_parameters(
+                decision.capability, decision.tool_parameters
+            ).model_dump(mode="json", exclude_none=True)
             planned_calls.append((
                 capability_tool,
-                decision.tool_parameters.model_dump(mode="json", exclude_none=True),
+                capability_parameters,
                 decision_grant,
             ))
         elif action == "anonymous_identity_probe":
@@ -1066,7 +1079,6 @@ class Agents:
                 self.progress("agent_error", agent=role.value, error=str(exc))
                 proposal["error"] = str(exc)
                 proposal["needs_human"] = True
-                from .models import Evidence
                 evidence.append(Evidence(source=f"agent:{role.value}", action=action, target=target,
                                          exit_code=-1, stderr=str(exc),
                                          facts={"ok": False, "agent_error": True}))
@@ -1077,7 +1089,6 @@ class Agents:
                         if not isinstance(payload, dict):
                             continue
                         if payload.get("evidence"):
-                            from .models import Evidence
                             observed = Evidence.model_validate(payload["evidence"])
                             evidence.append(observed)
                             new_observation = new_observation or self._evidence_is_novel(
@@ -1103,7 +1114,6 @@ class Agents:
                                     "question": "請指定修正方向或停止；不會自動重複失敗的偵察。",
                                 }
                         elif payload.get("needs_human"):
-                            from .models import Evidence
                             evidence.append(Evidence(
                                 source=f"tool:{payload.get('tool', message.name or 'unknown')}",
                                 action=action, target=target, exit_code=-1,

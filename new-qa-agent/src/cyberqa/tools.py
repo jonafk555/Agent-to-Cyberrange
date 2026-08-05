@@ -12,7 +12,7 @@ from typing import Any, Callable, Protocol
 
 from langchain_core.tools import BaseTool, tool
 
-from .ad_capability_tools import build_ad_capability_tools
+from .ad_capability_tools import build_ad_capability_tools, output_facts, summarize_output
 from .memory import ObservationStore
 from .models import Evidence
 
@@ -124,11 +124,13 @@ class KaliTool:
                 self.on_event("tool_result", {"tool": self.name, "exit_code": -1,
                                                "stderr": str(exc), "stdout": ""})
             raise TimeoutError(f"{self.name} timed out after {self.timeout}s") from exc
+        stdout_text = stdout.decode(errors="replace")
+        stderr_text = stderr.decode(errors="replace")
         evidence = Evidence(
             source=f"kali:{self.name}", action=action, target=target,
-            exit_code=process.returncode, stdout=stdout.decode(errors="replace")[-12000:],
-            stderr=stderr.decode(errors="replace")[-12000:],
-            facts={"argv": [shlex.quote(x) for x in safe_argv], "returncode": process.returncode},
+            exit_code=process.returncode, stdout=stdout_text, stderr=stderr_text,
+            facts={"argv": [shlex.quote(x) for x in safe_argv], "returncode": process.returncode,
+                   **output_facts(stdout_text, stderr_text)},
         )
         if self.executable == "nmap":
             evidence.facts["discovered_targets"] = sorted(_discover_ip_addresses(evidence.stdout))

@@ -2,7 +2,7 @@ import asyncio
 
 import pytest
 
-from cyberqa.tools import KaliTool, TargetPolicy, build_kali_registry
+from cyberqa.tools import KaliTool, TargetPolicy, build_kali_registry, summarize_output
 
 
 class FakeProcess:
@@ -80,3 +80,29 @@ def test_probe_parameter_shapes_and_host_port_allowlist():
 def test_empty_tool_selection_is_not_expanded_to_registry():
     registry = build_kali_registry(allowed_targets=["10.0.0.1"])
     assert registry.langchain_tools([]) == []
+
+
+@pytest.mark.asyncio
+async def test_evidence_keeps_full_output_and_adds_summary(monkeypatch):
+    output = "\n".join([
+        "noise line 1", "53/tcp open domain", "noise line 3",
+        "445/tcp open microsoft-ds", "domain: corp.local",
+    ])
+
+    class OutputProcess:
+        returncode = 0
+
+        async def communicate(self):
+            return output.encode(), b""
+
+    async def fake_create_subprocess_exec(*argv, **kwargs):
+        return OutputProcess()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+    tool = KaliTool("check_port", "nmap", target_policy=TargetPolicy(["10.0.0.1"]))
+    evidence = await tool.observe("10.0.0.1", "recon")
+
+    assert evidence.stdout == output
+    assert evidence.facts["stdout_lines"] == 5
+    assert "53/tcp open domain" in evidence.facts["stdout_summary"]
+    assert "domain: corp.local" in summarize_output(output)

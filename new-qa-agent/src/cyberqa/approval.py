@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 
-from .ad_playbooks import get_capability
+from .ad_playbooks import get_capability, normalize_capability_parameters
 from .models import Decision
 from .models import ApprovalRequest
 
@@ -38,7 +38,9 @@ def decision_fingerprint(decision: Decision) -> str:
         "target": decision.target,
         "capability": decision.capability,
         "risk": decision.risk.value,
-        "tool_parameters": decision.tool_parameters.model_dump(mode="json", exclude_none=True),
+        "tool_parameters": normalize_capability_parameters(
+            decision.capability, decision.tool_parameters
+        ).model_dump(mode="json", exclude_none=True),
         "allowed_tools": approved_tools_for_decision(decision),
     }
     raw = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)

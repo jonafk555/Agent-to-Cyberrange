@@ -16,7 +16,7 @@ from dotenv import dotenv_values, load_dotenv
 from .graph import build_graph
 from .llm import build_llm
 from .nodes import Agents
-from .tools import build_kali_registry
+from .tools import build_kali_registry, summarize_output
 
 
 load_dotenv()
@@ -68,12 +68,12 @@ def write_initial_recon_report(values: dict, scenario_id: str) -> str:
             "",
             "### stdout",
             "```text",
-            (item.stdout or "")[-8000:],
+            item.stdout or "",
             "```",
             "",
             "### stderr",
             "```text",
-            (item.stderr or "")[-4000:],
+            item.stderr or "",
             "```",
             "",
         ])
@@ -122,8 +122,14 @@ def print_progress(event: str, data: dict) -> None:
     elif event == "tool_start":
         print(f"[Tool] 執行：{' '.join(shlex.quote(x) for x in data['argv'])}", flush=True)
     elif event == "tool_result":
-        output = (data.get("stdout") or data.get("stderr") or "").strip().replace("\n", " ")
-        print(f"[Tool] 結果 exit={data['exit_code']} | {output[:240]}", flush=True)
+        raw = "\n".join(
+            value for value in (data.get("stdout", ""), data.get("stderr", "")) if value
+        )
+        preview = summarize_output(raw, max_lines=16, max_chars=2400)
+        line_count = len([line for line in raw.splitlines() if line.strip()])
+        print(f"[Tool] 結果 exit={data['exit_code']} | lines={line_count}", flush=True)
+        if preview:
+            print(preview, flush=True)
     elif event == "tool_cached":
         print(f"[Tool] 快取命中：{data['tool']} target={data['target']} "
               f"signature={data['signature']}", flush=True)

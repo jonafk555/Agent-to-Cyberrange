@@ -1,6 +1,7 @@
 from cyberqa.graph import route
 from cyberqa.models import Decision, Role
 from cyberqa.approval import approved_tools_for_decision
+from cyberqa.ad_playbooks import normalize_capability_parameters
 from cyberqa.ad_strategy import recommend as recommend_ad_method
 from cyberqa.execution_broker import CapabilityBroker
 
@@ -57,6 +58,16 @@ def test_asrep_action_without_capability_maps_to_reviewed_tool():
         target="10.0.0.1", justification="approved lab assessment",
     )
     assert approved_tools_for_decision(decision) == ["ad_asrep_roasting"]
+
+
+def test_asrep_parameters_drop_generic_nmap_fields_before_execution():
+    normalized = normalize_capability_parameters(
+        "asrep_roasting_assessment",
+        {"profile": "ad_tcp", "argv": ["-Pn"], "users_file": "/tmp/users.txt"},
+    )
+    assert normalized.profile is None
+    assert normalized.argv == []
+    assert normalized.users_file == "/tmp/users.txt"
 
 
 def test_ad_strategy_prioritizes_asrep_when_source_exists(monkeypatch):
