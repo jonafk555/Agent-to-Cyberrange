@@ -39,6 +39,19 @@ AD_CAPABILITIES: tuple[CapabilitySpec, ...] = (
         notes="Do not claim a password or crack result without evidence; protect ticket material.",
     ),
     CapabilitySpec(
+        name="hash_cracking_assessment",
+        purpose="Assess recovered AS-REP ticket material against an explicitly scoped local wordlist.",
+        prerequisites=["domain_inventory", "AS-REP hash material", "approved cracking wordlist"],
+        expected_evidence=["crack_status", "cracked_account_or_not_found"],
+        allowed_tools=["ad_hash_cracking"],
+        risk=ADRisk.CREDENTIAL_MATERIAL,
+        requires_approval=True,
+        notes=(
+            "Only crack hashes produced by the authorized range assessment. Never store plaintext "
+            "passwords in evidence, reports, prompts, or the observation cache."
+        ),
+    ),
+    CapabilitySpec(
         name="kerberoasting_assessment",
         purpose="Identify service accounts with SPNs and assess ticket exposure under the range policy.",
         prerequisites=["domain_inventory", "user enumeration", "authorized identity or approved anonymous path"],
@@ -89,6 +102,7 @@ CAPABILITY_INDEX = {item.name: item for item in AD_CAPABILITIES}
 CAPABILITY_PARAMETER_FIELDS: dict[str, frozenset[str]] = {
     "enumerate_domain_users": frozenset(),
     "asrep_roasting_assessment": frozenset({"users", "users_file"}),
+    "hash_cracking_assessment": frozenset({"hash_file", "wordlist"}),
     "kerberoasting_assessment": frozenset(),
     "credential_validation": frozenset(),
     "controlled_password_spray_assessment": frozenset(),

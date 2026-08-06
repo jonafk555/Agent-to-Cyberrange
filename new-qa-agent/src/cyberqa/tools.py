@@ -7,6 +7,7 @@ import re
 import shlex
 import shutil
 import socket
+from uuid import uuid4
 from urllib.parse import urlsplit
 from dataclasses import dataclass
 from typing import Any, Callable, Protocol
@@ -16,6 +17,7 @@ from langchain_core.tools import BaseTool, tool
 from .ad_capability_tools import build_ad_capability_tools, output_facts, summarize_output
 from .memory import ObservationStore
 from .models import Evidence
+from .security import redact_facts, redact_output
 
 
 # These values describe the runner, not an authorized cyber-range host.  They
@@ -198,8 +200,8 @@ class KaliTool:
                 self.on_event("tool_result", {"tool": self.name, "exit_code": -1,
                                                "stderr": str(exc), "stdout": ""})
             raise TimeoutError(f"{self.name} timed out after {self.timeout}s") from exc
-        stdout_text = stdout.decode(errors="replace")
-        stderr_text = stderr.decode(errors="replace")
+        stdout_text = redact_output(stdout.decode(errors="replace"))
+        stderr_text = redact_output(stderr.decode(errors="replace"))
         evidence = Evidence(
             source=f"kali:{self.name}", action=action, target=target,
             exit_code=process.returncode, stdout=stdout_text, stderr=stderr_text,
@@ -424,10 +426,23 @@ class KaliTool:
     def _redact_argv(argv: list[str]) -> list[str]:
         secrets = {value for name in ("CYBERQA_AD_PASSWORD", "AD_PASSWORD")
                    if (value := os.getenv(name))}
-        return [
-            next((item.replace(secret, "***REDACTED***") for secret in secrets if secret in item), item)
-            for item in argv
-        ]
+        result: list[str] = []
+        redact_next = False
+        secret_flags = {"-p", "-P", "-w", "-W", "--password", "--pass", "--secret", "/password"}
+        for item in argv:
+            if redact_next:
+                result.append("***REDACTED***")
+                redact_next = False
+                continue
+            if item in secret_flags:
+                result.append(item)
+                redact_next = True
+                continue
+            result.append(next(
+                (item.replace(secret, "***REDACTED***") for secret in secrets if secret in item),
+                item,
+            ))
+        return result
 
 
 def _discover_ip_addresses(output: str) -> set[str]:
@@ -523,6 +538,16 @@ class ToolRegistry:
         self.tools = tools or {}
         self.target_policy = target_policy or TargetPolicy()
         self.observations = ObservationStore()
+        # A durable database is useful, but a default global namespace makes
+        # old tasks masquerade as current evidence. Main assigns a fresh
+        # run/scenario namespace for every task; tests and API callers can do
+        # the same through set_cache_namespace().
+        self.cache_namespace = os.getenv(
+            "CYBERQA_CACHE_NAMESPACE", f"process:{os.getpid()}:{uuid4().hex}"
+        )
+        self._run_id: str | None = None
+        self._tool_calls = 0
+        self._max_tool_calls = int(os.getenv("CYBERQA_MAX_TOOL_CALLS", "240"))
         # ToolNode may schedule identical tool calls concurrently.  A cache
         # lookup alone is not enough in that case: both calls can miss before
         # either result is stored.  One lock per signature makes each probe a
@@ -531,6 +556,23 @@ class ToolRegistry:
 
     def register(self, tool: FactTool) -> None:
         self.tools[tool.name] = tool
+
+    def set_cache_namespace(self, namespace: str) -> None:
+        self.cache_namespace = namespace or self.cache_namespace
+
+    def begin_run(self, run_id: str, max_tool_calls: int | None = None) -> None:
+        self._run_id = run_id
+        self._tool_calls = 0
+        if max_tool_calls is not None:
+            self._max_tool_calls = max_tool_calls
+
+    def _tool_budget_available(self) -> bool:
+        if not self._run_id or self._max_tool_calls <= 0:
+            return True
+        if self._tool_calls >= self._max_tool_calls:
+            return False
+        self._tool_calls += 1
+        return True
 
     def get(self, name: str) -> FactTool:
         if name not in self.tools:
@@ -547,7 +589,9 @@ class ToolRegistry:
             adapter.command_identity(target, parameters)  # type: ignore[attr-defined]
             if hasattr(adapter, "command_identity") else parameters
         )
-        return self.observations.signature(name, target, signature_action, identity)
+        return self.observations.signature(
+            name, target, signature_action, identity, namespace=self.cache_namespace
+        )
 
     def command_signature(self, name: str, target: str, action: str,
                           parameters: dict[str, Any] | None = None) -> str:
@@ -595,6 +639,13 @@ class ToolRegistry:
                 "error_kind": "runner_context_only", "recoverable": False,
                 "retryable": False, "needs_human": False,
             }
+        if not self._tool_budget_available():
+            return {
+                "ok": False, "tool": name, "target": execution_target,
+                "error": f"Per-task tool-call budget exhausted ({self._max_tool_calls})",
+                "error_kind": "resource_budget", "recoverable": False,
+                "retryable": False, "needs_human": True,
+            }
         # An approved grant freezes the target and concrete tool set for this
         # dispatch. Apply the boundary to every tool in the approved branch,
         # not only credential-material adapters.
@@ -635,7 +686,9 @@ class ToolRegistry:
             # evidence; they must not escape ToolNode as an uncaught graph
             # exception or be retried forever.
             signature = self.observations.signature(
-                name, execution_target, "invalid-command", {"parameters": parameters, "error": str(exc)}
+                name, execution_target, "invalid-command",
+                {"parameters": parameters, "error": str(exc)},
+                namespace=self.cache_namespace,
             )
             recoverable = _recoverable_tool_error(name, "invalid_arguments", str(exc))
             result = {"ok": False, "tool": name, "error": str(exc),
@@ -661,8 +714,36 @@ class ToolRegistry:
                 return self._cache_hit(cached, signature, action, name, execution_target)
             try:
                 evidence = await adapter.observe(execution_target, action, **parameters)
+                # Every adapter, including CommandTool and third-party-like
+                # FactTool implementations, crosses the same redaction gate.
+                evidence.stdout = redact_output(evidence.stdout)
+                evidence.stderr = redact_output(evidence.stderr)
+                evidence.facts = redact_facts(evidence.facts)
+                evidence.redacted = True
                 evidence_data = evidence.model_dump(mode="json")
                 if evidence.exit_code not in (None, 0):
+                    facts = evidence_data.get("facts") or {}
+                    # Hashcat uses exit status 1 for an exhausted dictionary
+                    # / no-match result. That is a valid security finding,
+                    # not a missing operator input or a reason to stop the
+                    # Supervisor. Preserve the result and let planning move
+                    # to another evidence-backed path.
+                    expected_no_match = (
+                        name == "ad_hash_cracking"
+                        and facts.get("hash_cracking_attempted") is True
+                        and facts.get("crack_status") == "not_found"
+                        and evidence.exit_code == 1
+                    )
+                    if expected_no_match:
+                        facts["expected_result"] = "hash_not_found"
+                        evidence_data["facts"] = facts
+                        result = {
+                            "ok": True, "tool": name,
+                            "expected_result": "hash_not_found",
+                            "evidence": evidence_data,
+                        }
+                        self.observations.put(signature, result)
+                        return {**result, "signature": signature, "cached": False}
                     error_kind = _tool_error_kind(evidence)
                     recoverable = _recoverable_tool_error(
                         name, error_kind, f"{evidence.stderr}\n{evidence.stdout}"
@@ -814,7 +895,7 @@ def _recoverable_tool_error(tool_name: str, error_kind: str, detail: str = "") -
 
 
 SENSITIVE_TOOL_NAMES = frozenset({
-    "ad_asrep_roasting", "ad_kerberoasting", "ad_credential_validation",
+    "ad_asrep_roasting", "ad_hash_cracking", "ad_kerberoasting", "ad_credential_validation",
     "ad_password_spray", "ad_bloodhound_collection", "bloodhound_recon",
 })
 

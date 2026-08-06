@@ -6,7 +6,7 @@ from cyberqa.models import ADRisk, Decision, Role
 def test_ad_playbook_exposes_multi_step_capabilities():
     names = {item["name"] for item in capability_catalog()}
     assert {"asrep_roasting_assessment", "kerberoasting_assessment",
-            "enumerate_domain_users", "bloodhound_collection"} <= names
+            "hash_cracking_assessment", "enumerate_domain_users", "bloodhound_collection"} <= names
 
 
 def test_password_spray_requires_approval_and_scope_prerequisites():

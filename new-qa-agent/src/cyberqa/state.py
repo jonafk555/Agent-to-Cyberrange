@@ -11,12 +11,28 @@ def merge_dict(left: dict[str, Any], right: dict[str, Any]) -> dict[str, Any]:
     return {**left, **right}
 
 
+def merge_evidence_analyses(left: list[dict[str, Any]], right: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Keep planning memory bounded while retaining the newest analyses."""
+    return [*left, *right][-200:]
+
+
+def merge_evidence_opportunities(left: list[dict[str, Any]], right: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Keep evidence-backed next-step candidates bounded and recent."""
+    return [*left, *right][-300:]
+
+
 class QAState(TypedDict, total=False):
     run_id: str
     scenario_id: str
     objective: str
     target: str
     phase: str
+    visibility_mode: str
+    specification_available: bool
+    specification_reference: str | None
+    environment_model: Annotated[dict[str, Any], merge_dict]
+    qa_assertions: list[dict[str, Any]]
+    evidence_sufficiency: list[dict[str, Any]]
     hosts: Annotated[dict[str, Host], merge_dict]
     evidence: Annotated[list[Evidence], lambda a, b: a + b]
     events: Annotated[list[Event], lambda a, b: a + b]
@@ -62,6 +78,10 @@ class QAState(TypedDict, total=False):
     # checkpoint.
     human_instruction: str
     human_directives: Annotated[list[dict[str, Any]], lambda a, b: a + b]
+    # Structured operator constraints. The raw text remains for context, but
+    # execution must follow this projection for ordering/exclusions/argv.
+    human_intent: dict[str, Any]
+    task_plan: dict[str, Any]
     # Allows a specialist to use the read-only recovery tool set after a
     # recoverable command failure. It is cleared when that specialist returns.
     recovery_mode: bool
@@ -78,4 +98,15 @@ class QAState(TypedDict, total=False):
     capability_history: list[dict[str, Any]]
     target_profiles: Annotated[dict[str, Any], merge_dict]
     evidence_synthesis: dict[str, Any]
+    # One safe, compact interpretation per new tool result.  The raw stdout,
+    # stderr, and facts remain in ``evidence``; this list is the explicit
+    # planning memory that tells the next Supervisor what the result makes
+    # possible without forcing a fixed pipeline.
+    evidence_analyses: Annotated[list[dict[str, Any]], merge_evidence_analyses]
+    evidence_opportunities: Annotated[list[dict[str, Any]], merge_evidence_opportunities]
     runtime_config: Annotated[dict[str, str], merge_dict]
+    model_calls: int
+    tool_calls: int
+    max_model_calls: int
+    max_tool_calls: int
+    max_context_chars: int

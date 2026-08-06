@@ -22,13 +22,35 @@ The compiled graph is intentionally small because the behavior is not encoded in
 
 The supervisor receives current evidence, unresolved goals, prior action signatures, hypotheses, repair history, and the scenario objective. It returns exactly one `Decision`. A specialist can collect facts and emit a proposal, but cannot choose the next node. The `route` function only interprets the supervisor's decision.
 
+## Assertion and evidence sufficiency control
+
+The Supervisor is not driven by a fixed attack chain. A task contains `QAAssertion` records with a visibility mode and required evidence threshold. `EvidenceSufficiency` compares the assertion against durable evidence and exposes the least-invasive remaining methods:
+
+```text
+QA objective/specification
+        ↓
+QAAssertion (what must be answered, target, required C-level)
+        ↓
+Evidence + EvidenceOpportunity memory
+        ↓
+EvidenceSufficiency (current level, missing facts, next methods)
+        ↓
+Supervisor selects one distinct authorized Decision
+        ↓
+Tool Gateway / approval / audit
+```
+
+The levels are C0 Unknown, C1 Inferred, C2 Enumerated, C3 Functionally Verified, C4 Exploitability Verified, and C5 End-to-End Verified. The completion gate uses these thresholds for new tasks: an assertion that only needs configuration evidence can finish at C2, while an explicitly requested end-to-end attack-path assertion remains open until C5. This prevents an available credential-material or exploit tool from becoming an automatic escalation.
+
 ## AD decision contract
 
 AD method selection has a deterministic prerequisite/completion guard between the model and the broker. The model remains the Supervisor and may choose any concrete safe non-terminal path; the guard only prevents unsafe prerequisites, premature terminal transitions, and repeated no-op planning:
 
 ```text
 domain/DC + username source + no credential
-    -> one approved AS-REP assessment
+    -> Supervisor analyzes each result and ranks available capabilities
+    -> AS-REP, local hash cracking, credential validation, or another justified path
+       (only when its evidence and prerequisites support it)
     -> remaining bounded identity/recon evidence
     -> Supervisor chooses the next unresolved path
     -> judge/report only after the completion gate
@@ -46,6 +68,8 @@ validated credential
 Each capability is mapped to one primary reviewed adapter. An approval grant freezes the target, action, capability, parameters, and allowed adapter set for one specialist dispatch. The grant is consumed when that dispatch returns. A cached observation is evidence that the method was already attempted; it is not permission to silently retry it.
 
 `method_history` records the effective tool, target, outcome, argv, and evidence id. The supervisor receives this ledger and the deterministic guard rejects an immediately repeated decision. Failure categories remain distinct: authentication/bind failure, missing username source, invalid arguments, connectivity failure, and tool/runtime failure each produce a different operator-facing next step.
+
+Each fresh tool result also passes through a post-tool evidence analysis. The analysis is intentionally compact and safe: it records usable content, unresolved questions, candidate reviewed tools, and an evidence-backed suggested next action. It is shown to the operator and stored in `evidence_analyses` for the Supervisor, but remains advisory so the Supervisor can reason across capabilities instead of following a hard-coded pipeline. Cache hits reuse prior evidence without another analysis/model call.
 
 In production, bind `Agents._reason` to a structured-output model (`with_structured_output(Decision, method="function_calling")` for the supervisor and role-specific proposal models for specialists). The fallback is intentionally conservative and only observes.
 

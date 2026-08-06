@@ -98,7 +98,7 @@ def synthesize_evidence(evidence_items: Iterable[Evidence], target_profiles: dic
         bucket["successful" if evidence.exit_code in (None, 0) else "failed"] += 1
         bucket["sources"] = sorted(set(bucket["sources"]) | {evidence.source})
         facts = evidence.facts if isinstance(evidence.facts, dict) else {}
-        for service in facts.get("open_ports", []):
+        for service in facts.get("open_ports") or []:
             if service not in bucket["open_services"]:
                 bucket["open_services"].append(service)
         if evidence.exit_code not in (None, 0):
@@ -111,7 +111,7 @@ def synthesize_evidence(evidence_items: Iterable[Evidence], target_profiles: dic
                   if profile.get("domain_relation") == "unknown_domain"
                   or profile.get("connectivity") == "unknown"]
     all_users = sorted({str(user) for item in items
-                        for user in (item.facts.get("users", []) if isinstance(item.facts, dict) else [])})
+                        for user in ((item.facts.get("users") or []) if isinstance(item.facts, dict) else [])})
     has_domain = bool(target_profiles and any(profile.get("domain") for profile in target_profiles.values()))
     has_credential = bool(os.getenv("CYBERQA_AD_USERNAME") and os.getenv("CYBERQA_AD_PASSWORD")) or any(
         bool(item.facts.get("credentials_validated"))
@@ -158,7 +158,7 @@ def derive_runtime_config(evidence_items: Iterable[Evidence], target_profiles: d
         for match in re.findall(r"^nameserver\s+(\S+)", evidence.stdout, re.MULTILINE):
             nameservers.add(match)
         facts = evidence.facts if isinstance(evidence.facts, dict) else {}
-        for target in facts.get("discovered_targets", []):
+        for target in facts.get("discovered_targets") or []:
             if _is_ip(target):
                 networks.add(str(ipaddress.ip_network(f"{target}/24", strict=False)))
     if nameservers:

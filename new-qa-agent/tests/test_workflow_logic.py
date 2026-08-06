@@ -5,6 +5,7 @@ from cyberqa.ad_playbooks import normalize_capability_parameters
 from cyberqa.ad_strategy import recommend as recommend_ad_method
 from cyberqa.execution_broker import CapabilityBroker
 from cyberqa.nodes import Agents
+from cyberqa.intent import parse_human_intent
 from cyberqa.tools import TargetPolicy, ToolRegistry, build_kali_registry
 
 
@@ -40,12 +41,113 @@ def test_graph_bootstraps_runner_identity_before_supervisor():
     assert entry_route({"baseline_complete": True}) == "supervisor"
 
 
+def test_post_tool_analysis_surfaces_usable_content_without_secret_material():
+    evidence = Evidence(
+        source="ad-capability:ad_asrep_roasting",
+        action="asrep_roasting_assessment",
+        target="10.0.0.1",
+        stdout="$krb5asrep$23$alice@corp.local:ticket-material password=PlainSecret",
+        facts={"users": ["alice"], "asrep_hash_count": 1, "asrep_hash_file": "/safe/artifact.hash"},
+    )
+    analysis = Agents._fallback_evidence_analysis(
+        {"evidence": [], "target": "10.0.0.1"}, evidence,
+        ["ad_asrep_roasting", "ad_hash_cracking", "ad_credential_validation"],
+    )
+    rendered = str(analysis.model_dump())
+    assert "ad_hash_cracking" in analysis.candidate_tools
+    assert "PlainSecret" not in rendered
+    assert "ticket-material" not in rendered
+
+
 def test_human_semantics_keep_compound_guidance_for_supervisor():
     assert Agents._human_users_file("gain domain cred by ~/Desktop/username.txt") == "~/Desktop/username.txt"
     assert Agents._human_explicit_decision(
         {"target": "10.0.0.0/24"},
         "nmap 10.0.0.1, then inspect SMB and continue with the next host",
     ) is None
+
+
+def test_human_intent_preserves_negation_and_replacement_tool():
+    intent = parse_human_intent(
+        "不要執行 nmap，改用 SMB 檢查 10.0.0.1",
+        {"target": "10.0.0.1"},
+    )
+
+    assert intent.forbidden_tools == ["check_port"]
+    assert intent.ordered_steps == ["smb_negotiate"]
+    assert Agents._human_explicit_decision(
+        {"target": "10.0.0.1"},
+        "不要執行 nmap，改用 SMB 檢查 10.0.0.1",
+    ) is None
+
+
+def test_human_intent_preserves_exact_reviewed_nmap_argv():
+    intent = parse_human_intent(
+        "請執行 nmap -sC -sV -p 53,88,389 10.0.0.1",
+        {"target": "10.0.0.1"},
+    )
+
+    assert intent.step_parameters["check_port"]["argv"] == [
+        "-sC", "-sV", "-p", "53,88,389"
+    ]
+    decision = Agents._human_explicit_decision(
+        {"target": "10.0.0.1"},
+        "請執行 nmap -sC -sV -p 53,88,389 10.0.0.1",
+    )
+    assert decision is not None
+    assert decision.tool_parameters.argv == ["-sC", "-sV", "-p", "53,88,389"]
+
+
+def test_human_intent_keeps_ordered_recon_and_asrep_steps_separate():
+    intent = parse_human_intent(
+        "nxc ldap 10.0.0.1 --users，取得帳號後繼續 AS-REP 評估",
+        {"target": "10.0.0.1"},
+    )
+
+    assert intent.ordered_steps == ["nxc_ldap_recon", "ad_asrep_roasting"]
+    assert intent.current_step == 0
+    assert Agents._human_explicit_decision(
+        {"target": "10.0.0.1"},
+        "nxc ldap 10.0.0.1 --users，取得帳號後繼續 AS-REP 評估",
+    ) is None
+
+
+def test_supervisor_dispatches_current_human_intent_step_before_next_step():
+    intent = parse_human_intent(
+        "nxc ldap 10.0.0.1 --users，取得帳號後繼續 AS-REP 評估",
+        {"target": "10.0.0.1"},
+    )
+    decision = Agents._intent_decision(
+        {"target": "10.0.0.1", "discovered_targets": ["10.0.0.1"]}, intent
+    )
+
+    assert decision is not None
+    assert decision.action == "nxc_ldap_recon"
+    assert decision.tool_parameters.profile == "users"
+
+
+def test_prompt_evidence_is_bounded_for_noisy_tool_output():
+    state = {
+        "max_context_chars": 20_000,
+        "evidence": [Evidence(
+            source="probe", action="probe", target="10.0.0.1", stdout="A" * 500_000,
+        )],
+    }
+
+    projection = Agents._prompt_evidence(state)
+    assert len(projection) == 1
+    assert len(projection[0]["stdout"]) == 10_000
+
+
+def test_human_intent_splits_host_discovery_from_service_enumeration():
+    intent = parse_human_intent(
+        "先對 10.0.0.1 做主機發現，完成後再做服務枚舉",
+        {"target": "10.0.0.1"},
+    )
+
+    assert intent.ordered_steps == ["network_host_discovery", "service_enumeration"]
+    assert intent.step_parameters["network_host_discovery"] == {"profile": "host_discovery"}
+    assert intent.step_parameters["service_enumeration"] == {"profile": "default"}
 
 
 def test_network_transition_excludes_runner_name():
@@ -188,6 +290,31 @@ def test_ad_strategy_prioritizes_asrep_when_source_exists(monkeypatch):
     assert decision is not None
     assert decision.capability == "asrep_roasting_assessment"
     assert decision.tool_parameters.users == ["alice"]
+
+
+def test_ad_strategy_connects_asrep_hash_to_hash_cracking(tmp_path, monkeypatch):
+    from cyberqa.models import Evidence
+
+    wordlist = tmp_path / "wordlist.txt"
+    wordlist.write_text("candidate\n", encoding="utf-8")
+    hash_file = tmp_path / "asrep.hash"
+    hash_file.write_text("redacted-artifact\n", encoding="utf-8")
+    monkeypatch.setenv("CYBERQA_AD_DOMAIN", "corp.local")
+    monkeypatch.setenv("CYBERQA_AD_WORDLIST", str(wordlist))
+    decision = recommend_ad_method({
+        "target": "10.0.0.1",
+        "ad_knowledge": {"domain": "corp.local", "asrep_hash_file": str(hash_file)},
+        "evidence": [Evidence(
+            source="ad-capability:ad_asrep_roasting", action="asrep_roasting_assessment",
+            target="10.0.0.1", exit_code=0,
+            facts={"asrep_hash_file": str(hash_file), "asrep_hash_count": 1},
+        )],
+        "method_history": [], "target_profiles": {},
+    })
+    assert decision is not None
+    assert decision.capability == "hash_cracking_assessment"
+    assert decision.tool_parameters.hash_file == str(hash_file)
+    assert decision.tool_parameters.wordlist == str(wordlist)
 
 
 def test_ad_strategy_stops_after_bounded_identity_phase():

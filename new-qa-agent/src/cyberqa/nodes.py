@@ -20,34 +20,43 @@ from .ad_playbooks import (capability_catalog, get_capability,
 from .ad_strategy import derive_context, recommend as recommend_ad_method
 from .discovery import (apply_and_persist_runtime_config, build_target_profiles,
                          derive_runtime_config, synthesize_evidence)
+from .evidence_planning import derive_evidence_opportunities
 from .events import EventBus
 from .execution_broker import CapabilityBroker
-from .models import (ADRisk, Decision, Event, Evidence, Hypothesis, Role, Scorecard, Service,
-                      ServiceProtocol, ToolParameters)
+from .models import (ADRisk, Decision, Event, Evidence, EvidenceAnalysis, EvidenceOpportunity,
+                      Hypothesis, HumanIntent, Role, Scorecard, ToolParameters)
+from .qa_assessment import refresh_assessment
 from .state import QAState
 from .tools import LOCAL_EXECUTION_TARGET, ToolRegistry, is_local_target
+from .intent import parse_human_intent
 
 
-AD_QA_PLAYBOOK = """For an AD range, do not stop at one domain controller. Inventory all valuable
-authorized targets and services: domain controllers, DNS, LDAP/LDAPS, Kerberos, SMB/file servers,
-member servers, workstations, web/IIS, WinRM, MSSQL, AD CS/CA, backup and management systems, trusts,
-and high-value shares. Track host/service coverage and do not call the task complete after DC recon.
-
-Use evidence-driven, read-only QA checks for applicable abuse classes: anonymous LDAP, SMB signing and
-share access, Kerberoasting/SPNs, AS-REP roasting, NTLM relay prerequisites, delegation, privileged
-group and ACL edges, LAPS/GPO exposure, AD CS enrollment weaknesses, DNS/trust misconfiguration,
-stale principals, and excessive local-admin paths. Never invent credentials or claim exploitability;
-enumerate prerequisites and state what is proven, blocked, or unknown. Prefer a different target/service
-or diagnostic probe over repeating a cached command.
+AD_QA_PLAYBOOK = """For an AD range, derive the QA assertions from the operator objective and any
+available specification. Do not assume every range requires the same domain-controller inventory or a
+complete attack chain. Start with the least-invasive evidence that can answer the current assertion:
+domain, DNS, LDAP, Kerberos, SMB, SPNs, delegation, ACL, AD CS, trust, endpoint, or attack-path facts
+are separate questions, not a mandatory sequence. Stop escalation when the assertion's required evidence
+level is met. Use controlled exploit or end-to-end validation only when the assertion explicitly requires
+it. Never invent credentials or claim exploitability; label facts as proven, blocked, unknown, or
+insufficient. Prefer a different target/service or diagnostic probe over repeating a cached command.
 """
 
 SYSTEM = AD_QA_PLAYBOOK + """You are a cyber-range QA specialist operating only on authorized targets. Use OODA:
 observe facts, orient against the objective and prior evidence, decide one justified action, and act
-through the supplied fact-only tools. Inspect every tool result before selecting the next tool. Continue
-until the objective is complete. Never invent facts, credentials, vulnerabilities, or successful attacks.
+through the supplied fact-only tools. Inspect every tool result before selecting the next tool and expose
+the usable content, unresolved questions, and candidate reviewed tools in a compact evidence analysis.
+Treat each result as a possible state transition, not as a label for a prewritten exploit chain: derive
+what the new service, identity, artifact, relationship, or failure makes possible, compare alternative
+reviewed capabilities, and continue with the highest-information distinct path. Continue until the objective
+is complete. Never invent facts, credentials, vulnerabilities, or successful attacks.
 Build a compact evidence summary after each probe. If no domain credentials exist, do not repeat empty-
 credential SMB/LDAP/NXC probes; pivot to domain discovery, supplied username-file AS-REP assessment,
-anonymous access only when evidence supports it, or another justified path."""
+anonymous access only when evidence supports it, or another justified path. If AS-REP hash material is
+observed, record it as protected usable content and consider the reviewed local hash-cracking and
+credential-validation tools when their prerequisites are met; this is one possible branch, not the
+workflow definition. Do not assume a fixed next step, and never treat a hash as a password. If the
+current assertion is already sufficiently evidenced at C2 or C3, do not escalate to C4/C5 merely because
+an attack tool is available."""
 
 
 def _is_abort_instruction(text: str) -> bool:
@@ -74,6 +83,15 @@ def _is_multi_step_instruction(text: str) -> bool:
     ))
 
 
+def _fact_values(value: Any) -> list[Any]:
+    """Normalize optional tool facts without letting malformed output crash the graph."""
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple, set)):
+        return list(value)
+    return [value]
+
+
 class ReactState(TypedDict, total=False):
     """Small private state contract used by each specialist ReAct subgraph."""
     messages: Annotated[list[Any], add_messages]
@@ -92,10 +110,242 @@ class Agents:
         self.llm, self.tools, self.events, self.policy = llm, tools or ToolRegistry(), events or EventBus(), policy or ApprovalPolicy()
         self.on_progress = on_progress
         self.broker = CapabilityBroker()
+        self._budget_run_id: str | None = None
+        self._model_calls = 0
+        self._max_model_calls = int(os.getenv("CYBERQA_MAX_MODEL_CALLS", "120"))
+
+    def begin_run(self, run_id: str, max_model_calls: int | None = None) -> None:
+        self._budget_run_id = run_id
+        self._model_calls = 0
+        if max_model_calls is not None:
+            self._max_model_calls = max_model_calls
+
+    def _model_budget_available(self) -> bool:
+        if not self._budget_run_id or self._max_model_calls <= 0:
+            return True
+        if self._model_calls >= self._max_model_calls:
+            self.progress("resource_budget", kind="model_calls", limit=self._max_model_calls)
+            return False
+        self._model_calls += 1
+        return True
 
     def progress(self, event: str, **data: Any) -> None:
         if self.on_progress:
             self.on_progress(event, data)
+
+    @staticmethod
+    def _redact_analysis_text(value: Any, limit: int = 20000) -> str:
+        """Keep the evidence analyst useful without exposing credential data."""
+        text = str(value or "")
+        # Hashes and password-like assignments are useful as *categories* but
+        # not as model or terminal content.  The protected artifact reference
+        # is carried separately in facts as a non-secret path/count.
+        text = re.sub(r"\$(?:krb5asrep|krb5tgs)\$[^\s]+", "[credential material redacted]", text,
+                      flags=re.IGNORECASE)
+        text = re.sub(
+            r"(?i)(password|passwd|pass|secret|plaintext|ntlmhash|hash)\s*[:=]\s*[^\s,;]+",
+            r"\1=[redacted]",
+            text,
+        )
+        if len(text) > limit:
+            return text[:limit] + "\n[analysis input truncated; complete evidence remains in durable evidence]"
+        return text
+
+    @classmethod
+    def _safe_analysis_facts(cls, facts: Any) -> dict[str, Any]:
+        """Project facts for the analyst, excluding nested/raw result payloads."""
+        if not isinstance(facts, dict):
+            return {}
+        safe: dict[str, Any] = {}
+        sensitive_names = {"password", "passwd", "secret", "plaintext", "credential_material"}
+        for key, value in facts.items():
+            key_text = str(key)
+            normalized = key_text.lower()
+            if key_text == "tool_result" or any(name in normalized for name in sensitive_names):
+                # Keep the existence of protected material visible through
+                # explicit count/status fields, never the nested payload.
+                continue
+            if isinstance(value, dict):
+                safe[key_text] = cls._safe_analysis_facts(value)
+            elif isinstance(value, list):
+                safe[key_text] = [
+                    cls._redact_analysis_text(item, limit=2000) if isinstance(item, str)
+                    else item
+                    for item in value[:200]
+                ]
+            elif isinstance(value, str):
+                safe[key_text] = cls._redact_analysis_text(value, limit=4000)
+            else:
+                safe[key_text] = value
+        return safe
+
+    @classmethod
+    def _analysis_input(cls, evidence: Evidence) -> dict[str, Any]:
+        return {
+            "id": evidence.id,
+            "source": evidence.source,
+            "action": evidence.action,
+            "target": evidence.target,
+            "exit_code": evidence.exit_code,
+            "stdout": cls._redact_analysis_text(evidence.stdout),
+            "stderr": cls._redact_analysis_text(evidence.stderr),
+            "facts": cls._safe_analysis_facts(evidence.facts),
+        }
+
+    @staticmethod
+    def _fallback_evidence_analysis(state: QAState, evidence: Evidence,
+                                    available_tools: list[str]) -> EvidenceAnalysis:
+        """Produce an explicit non-LLM analysis for offline/test mode."""
+        facts = evidence.facts if isinstance(evidence.facts, dict) else {}
+        useful: list[str] = []
+        unresolved: list[str] = []
+
+        # Project every safe structured fact instead of recognizing only one
+        # named attack chain. New tool adapters therefore become useful to the
+        # Supervisor as soon as they emit meaningful facts, while sensitive
+        # nested payloads remain excluded by _safe_analysis_facts().
+        for key, value in Agents._safe_analysis_facts(facts).items():
+            if value in (None, "", [], {}, False, 0):
+                continue
+            label = str(key).replace("_", " ").strip().capitalize()
+            useful.append(f"{label}：{Agents._redact_analysis_text(value, limit=1200)}")
+
+        if evidence.exit_code not in (None, 0):
+            error_kind = facts.get("error_kind") or evidence.stderr.strip() or "工具非零回傳"
+            unresolved.append(f"工具執行失敗，需根據錯誤選擇修正或替代路徑：{Agents._redact_analysis_text(error_kind, 800)}")
+        if not useful:
+            useful.append("此結果沒有解析出新的結構化內容；仍保留完整 stdout/stderr 供 Supervisor 判斷。")
+
+        opportunities = derive_evidence_opportunities(state, evidence, available_tools)
+        candidates = list(dict.fromkeys(item.tool for item in opportunities))
+
+        next_action = None
+        if candidates:
+            next_action = candidates[0]
+        elif evidence.exit_code not in (None, 0) and facts.get("recoverable"):
+            next_action = "repair_or_alternate_path"
+        reason = (
+            "可用內容只作為下一步候選；Supervisor 仍需結合累積 evidence、授權範圍與已執行指令決策。"
+        )
+        return EvidenceAnalysis(
+            evidence_id=evidence.id,
+            source=evidence.source,
+            target=evidence.target,
+            useful_content=useful[:12],
+            unresolved_questions=unresolved[:8],
+            candidate_tools=candidates[:12],
+            opportunities=opportunities[:24],
+            recommended_action=next_action,
+            recommended_target=(opportunities[0].target if opportunities else None),
+            reason=reason,
+            no_new_information=not Agents._evidence_is_novel(state, evidence, cached=False),
+        )
+
+    async def _analyze_evidence(self, state: QAState, evidence: Evidence) -> dict[str, Any]:
+        """Analyze one fresh result before the specialist returns to Supervisor.
+
+        The result is advisory memory.  It does not dispatch a command and it
+        does not constrain the Supervisor to a pipeline.  A bounded, separate
+        call makes the transition visible and prevents the planning model from
+        seeing only a terse terminal preview.
+        """
+        available_tools = [
+            name for name in self.tools.tools
+            if not name.startswith("inspect_")
+        ]
+        deterministic_opportunities = derive_evidence_opportunities(
+            state, evidence, available_tools
+        )
+        analysis: EvidenceAnalysis
+        if self.llm and self._model_budget_available():
+            try:
+                model = self.llm.with_structured_output(EvidenceAnalysis, method="function_calling")
+                prompt = json.dumps({
+                    "evidence": self._analysis_input(evidence),
+                    "previous_analysis": state.get("evidence_analyses", [])[-8:],
+                    "available_tools": available_tools,
+                    "deterministic_opportunities": [
+                        item.model_dump(mode="json") for item in deterministic_opportunities
+                    ],
+                    "capabilities": capability_catalog(),
+                    "instruction": (
+                        "Analyze this fresh tool result before choosing a next action. Read the complete "
+                        "safe stdout, stderr, and facts supplied here. Return only concise, evidence-backed "
+                        "fields: useful_content, unresolved_questions, candidate_tools, opportunities, "
+                        "recommended_action, recommended_target, reason, and no_new_information. "
+                        "Each opportunity must state the observed evidence fields, prerequisites met or "
+                        "missing, target, and reason. candidate_tools must use only available_tools. "
+                        "This is an advisory interpretation, not a fixed pipeline: the "
+                        "Supervisor may choose any distinct authorized tool that the accumulated evidence "
+                        "justifies. Never repeat secrets, plaintext passwords, ticket/hash strings, or hidden "
+                        "chain-of-thought; describe protected credential material by type/count/status only."
+                    ),
+                }, ensure_ascii=False, default=str)
+                response = await model.ainvoke([
+                    SystemMessage(content=(
+                        "You are an evidence analyst for an authorized cyber-range QA agent. "
+                        "Do not execute tools and do not produce hidden chain-of-thought. Return one "
+                        "EvidenceAnalysis object with short evidence-backed planning signals."
+                    )),
+                    HumanMessage(content=prompt),
+                ])
+                analysis = response if isinstance(response, EvidenceAnalysis) else EvidenceAnalysis.model_validate(response)
+            except Exception as exc:
+                self.progress("evidence_analysis_error", tool=evidence.source, error=str(exc))
+                analysis = self._fallback_evidence_analysis(state, evidence, available_tools)
+        else:
+            analysis = self._fallback_evidence_analysis(state, evidence, available_tools)
+
+        # The model may return stale/unknown tool names. Keep the analysis
+        # useful but closed over the same reviewed registry the Supervisor sees.
+        analysis.evidence_id = evidence.id
+        analysis.source = evidence.source
+        analysis.target = evidence.target
+        # Deterministic projections are merged with model interpretation. The
+        # model can add a justified alternative, but it cannot erase a useful
+        # service/credential transition simply because no named pipeline was
+        # present in its response.
+        merged_opportunities: dict[tuple[str, str], EvidenceOpportunity] = {}
+        for item in [*deterministic_opportunities, *analysis.opportunities]:
+            try:
+                opportunity = item if isinstance(item, EvidenceOpportunity) else EvidenceOpportunity.model_validate(item)
+            except Exception:
+                continue
+            if opportunity.tool not in available_tools:
+                continue
+            valid_targets = {
+                str(evidence.target),
+                *[str(value) for value in state.get("discovered_targets", [])],
+            }
+            if (
+                opportunity.target not in valid_targets
+                or self._is_runner_target(state, opportunity.target)
+                or not self.tools.target_policy.allows(opportunity.target)
+            ):
+                continue
+            merged_opportunities.setdefault((opportunity.tool, opportunity.target), opportunity)
+        analysis.opportunities = list(merged_opportunities.values())[:24]
+        # Keep duplicate/no-progress memory grounded in the execution ledger,
+        # not in an LLM's subjective ``no_new_information`` label.
+        analysis.no_new_information = not self._evidence_is_novel(
+            state, evidence, cached=False
+        )
+        analysis.candidate_tools = [
+            name for name in dict.fromkeys(
+                [*analysis.candidate_tools, *(item.tool for item in analysis.opportunities)]
+            )
+            if name in available_tools
+        ][:12]
+        analysis.useful_content = [self._redact_analysis_text(item, 1600) for item in analysis.useful_content[:12]]
+        analysis.unresolved_questions = [self._redact_analysis_text(item, 1200) for item in analysis.unresolved_questions[:8]]
+        analysis.reason = self._redact_analysis_text(analysis.reason, 1600)
+        if analysis.recommended_action:
+            analysis.recommended_action = self._redact_analysis_text(analysis.recommended_action, 400)
+        if analysis.recommended_target:
+            analysis.recommended_target = self._redact_analysis_text(analysis.recommended_target, 400)
+        payload = analysis.model_dump(mode="json")
+        self.progress("evidence_analysis", **payload)
+        return payload
 
     @staticmethod
     def _evidence_is_novel(state: QAState, evidence: Evidence, cached: bool) -> bool:
@@ -112,9 +362,9 @@ class Agents:
                     "credentials_validated", "ticket_obtained_or_blocked", "groups", "acl_edges",
                     "delegation", "adcs_findings", "trusts"):
             current = {json.dumps(value, sort_keys=True, default=str)
-                       for value in facts.get(key, [])}
+                       for value in _fact_values(facts.get(key))}
             known = {json.dumps(value, sort_keys=True, default=str)
-                     for old in previous_facts for value in old.get(key, [])}
+                     for old in previous_facts for value in _fact_values(old.get(key))}
             if current - known:
                 return True
         if facts.get("domain_name") and not any(old.get("domain_name") for old in previous_facts):
@@ -129,7 +379,7 @@ class Agents:
         """Map a result to a durable semantic recon check and its category."""
         source = evidence.source.lower()
         facts = evidence.facts if isinstance(evidence.facts, dict) else {}
-        argv = " ".join(str(item) for item in facts.get("argv", []))
+        argv = " ".join(str(item) for item in _fact_values(facts.get("argv")))
         if "nxc_smb" in source:
             profile = next((name for name in ("shares", "users", "groups", "sessions", "pass-pol")
                             if f"--{name}" in argv), "default")
@@ -180,9 +430,10 @@ class Agents:
     def _build_recon_coverage(cls, state: QAState, evidence_items: list[Evidence]) -> dict[str, Any]:
         """Persist target -> semantic check status, not just source names."""
         previous = state.get("recon_coverage", {}) or {}
+        runner_ips = {str(item) for item in state.get("runner_ips", [])}
         coverage: dict[str, Any] = {}
         for target, raw in previous.items():
-            if is_local_target(str(target)):
+            if is_local_target(str(target)) or str(target) in runner_ips:
                 continue
             if isinstance(raw, dict):
                 coverage[target] = {
@@ -197,7 +448,7 @@ class Agents:
         for evidence in [*state.get("evidence", []), *evidence_items]:
             # Local runtime observations are useful context, but are never a
             # network recon check and must not create a host-coverage debt.
-            if is_local_target(evidence.target):
+            if is_local_target(evidence.target) or evidence.target in runner_ips:
                 continue
             key, category = cls._recon_check_key(evidence)
             target = evidence.target
@@ -210,7 +461,7 @@ class Agents:
             check["attempts"] = int(check.get("attempts", 0)) + 1
             if evidence.id not in check["evidence_ids"]:
                 check["evidence_ids"].append(evidence.id)
-            check["last_argv"] = facts_argv = (
+            check["last_argv"] = (
                 evidence.facts.get("argv", []) if isinstance(evidence.facts, dict) else []
             )
             entry["semantic"][category] = {
@@ -227,14 +478,17 @@ class Agents:
         """Build one cumulative view used by every future planning decision."""
         all_evidence = [*state.get("evidence", []), *new_evidence]
         scope_target = str(state.get("target", ""))
+        runner_ips = {str(item) for item in state.get("runner_ips", [])}
         recon_evidence = [
             item for item in all_evidence
             if not is_local_target(item.target)
+            and item.target not in runner_ips
             and (item.target == scope_target or self.tools.target_policy.allows(item.target))
         ]
         old_profiles = {
             target: profile for target, profile in (state.get("target_profiles", {}) or {}).items()
             if not is_local_target(str(target))
+            and str(target) not in runner_ips
             and (str(target) == scope_target or self.tools.target_policy.allows(str(target)))
         }
         old_knowledge = state.get("ad_knowledge", {}) or {}
@@ -243,7 +497,8 @@ class Agents:
         profiles = build_target_profiles(recon_evidence, old_profiles, old_knowledge.get("domain"))
         synthesis = synthesize_evidence(recon_evidence, profiles)
         recon_coverage = self._build_recon_coverage(
-            state, [item for item in recon_evidence if not is_local_target(item.target)]
+            state, [item for item in recon_evidence
+                    if not is_local_target(item.target) and item.target not in runner_ips]
         )
         recon_coverage = {
             target: profile for target, profile in recon_coverage.items()
@@ -254,13 +509,21 @@ class Agents:
         if runtime:
             apply_and_persist_runtime_config(runtime)
         knowledge = dict(old_knowledge)
-        for field in ("users", "spns", "asrep_candidates", "credentials_validated", "groups", "acl_edges",
+        for field in ("users", "spns", "asrep_candidates", "cracked_users", "credentials_validated", "groups", "acl_edges",
                       "delegation", "adcs_findings", "trusts"):
             values = set(knowledge.get(field, []))
             for item in all_evidence:
                 facts = item.facts if isinstance(item.facts, dict) else {}
-                values.update(str(value) for value in facts.get(field, []))
+                values.update(str(value) for value in _fact_values(facts.get(field)))
             knowledge[field] = sorted(values)
+        for item in all_evidence:
+            facts = item.facts if isinstance(item.facts, dict) else {}
+            for field in (
+                "asrep_hash_file", "asrep_hash_count", "hash_cracking_attempted",
+                "hash_cracked", "crack_status", "credential_source",
+            ):
+                if field in facts:
+                    knowledge[field] = facts[field]
         for item in all_evidence:
             facts = item.facts if isinstance(item.facts, dict) else {}
             if facts.get("domain_name") and not knowledge.get("domain"):
@@ -294,6 +557,15 @@ class Agents:
         if knowledge.get("users"):
             known.add("user enumeration")
             known.add("candidate username source")
+        if knowledge.get("asrep_hash_file"):
+            known.add("AS-REP hash material")
+        wordlist_candidates = [
+            os.getenv("CYBERQA_AD_WORDLIST", ""),
+            "/usr/share/wordlists/rockyou.txt",
+            "/usr/share/wordlists/fasttrack.txt",
+        ]
+        if any(value and Path(value).expanduser().is_file() for value in wordlist_candidates):
+            known.add("approved cracking wordlist")
         decision = state.get("last_decision")
         tool_parameters = decision.tool_parameters.model_dump() if decision else {}
         if decision and (tool_parameters.get("users") or tool_parameters.get("users_file")):
@@ -334,7 +606,7 @@ class Agents:
             if e.exit_code not in (None, 0) or e.facts.get("ok") is False
         ]
         fallback = (failures[-1] if failures else raw[-1500:]) or "流程沒有取得新的可用觀測結果。"
-        if not self.llm:
+        if not self.llm or not self._model_budget_available():
             return fallback
         try:
             import asyncio
@@ -383,12 +655,34 @@ class Agents:
                 pending_calls = set()
         return valid
 
+    @staticmethod
+    def _prompt_evidence(state: QAState, max_chars: int | None = None) -> list[dict[str, Any]]:
+        """Build a bounded evidence projection for model context.
+
+        Durable Evidence keeps the redacted bounded stream; prompts receive a
+        smaller newest-first projection plus facts/analysis so one noisy tool
+        cannot consume the whole context window.
+        """
+        budget = max_chars or int(state.get("max_context_chars", 120000) or 120000)
+        selected: list[dict[str, Any]] = []
+        used = 0
+        for evidence in reversed(state.get("evidence", [])[-30:]):
+            item = evidence.model_dump(mode="json")
+            item["stdout"] = str(item.get("stdout") or "")[:10000]
+            item["stderr"] = str(item.get("stderr") or "")[:5000]
+            encoded_size = len(json.dumps(item, ensure_ascii=False, default=str))
+            if selected and used + encoded_size > budget:
+                break
+            selected.append(item)
+            used += encoded_size
+        return list(reversed(selected))
+
     async def _reason(self, role: Role, state: QAState, instruction: str) -> dict[str, Any]:
-        if not self.llm:
+        if not self.llm or not self._model_budget_available():
             return {"action": "observe", "target": "environment", "justification": "Collect missing facts before changing state."}
         prompt = json.dumps({"objective": state.get("objective"), "phase": state.get("phase"),
                              "target": state.get("target", "environment"),
-                             "evidence": [e.model_dump() for e in state.get("evidence", [])[-20:]],
+                             "evidence": self._prompt_evidence(state),
                              "instruction": instruction})
         self.progress("reasoning_start", agent=role.value)
         conversation = self._conversation_context(state.get("messages", []))
@@ -399,13 +693,32 @@ class Agents:
         ])
         return json.loads(response.content)
 
+    @staticmethod
+    def _assessment_context(
+        state: QAState,
+        extra_evidence: list[Evidence] | tuple[Evidence, ...] = (),
+        extra_opportunities: list[dict[str, Any]] | tuple[dict[str, Any], ...] = (),
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        """Refresh assertion thresholds from durable evidence without LLM prose."""
+        assertions = state.get("qa_assertions", [])
+        if not assertions:
+            return [], []
+        evidence = [*state.get("evidence", []), *extra_evidence]
+        opportunities = [*state.get("evidence_opportunities", []), *extra_opportunities]
+        return refresh_assessment(assertions, evidence, opportunities)
+
     async def _structured_supervisor(self, state: QAState) -> Decision:
         """Ask the model for a typed routing decision, never free-form JSON."""
         if not self.llm:
             return Decision(next_agent=Role.VALIDATION, objective=state.get("objective", "QA"),
                             action="observe", target=state.get("target", "environment"),
                             justification="Collect missing facts before changing state.")
+        if not self._model_budget_available():
+            return Decision(next_agent="end", objective="human_help", action="resource_budget",
+                            target=state.get("target", "environment"),
+                            justification="Per-task model-call budget exhausted; preserve evidence and request an explicit budget decision.")
         model = self.llm.with_structured_output(Decision, method="function_calling")
+        qa_assertions, evidence_sufficiency = self._assessment_context(state)
         failures = [
             {
                 "source": evidence.source,
@@ -423,7 +736,13 @@ class Agents:
             "objective": state.get("objective"),
             "target": state.get("target", "environment"),
             "phase": state.get("phase"),
-            "evidence": [e.model_dump(mode="json") for e in state.get("evidence", [])[-20:]],
+            "evidence": self._prompt_evidence(state),
+            "evidence_analyses": state.get("evidence_analyses", [])[-20:],
+            "evidence_opportunities": state.get("evidence_opportunities", [])[-60:],
+            "visibility_mode": state.get("visibility_mode", "black_box"),
+            "specification_available": state.get("specification_available", False),
+            "qa_assertions": qa_assertions[-40:],
+            "evidence_sufficiency": evidence_sufficiency[-40:],
             "evidence_synthesis": state.get("evidence_synthesis", {}),
             "observed_signatures": list(state.get("observation_index", {}).keys())[-50:],
             "available_tools": [
@@ -441,6 +760,8 @@ class Agents:
             "runtime_config": state.get("runtime_config", {}),
             "operator_instruction": state.get("human_instruction", ""),
             "operator_instruction_history": state.get("human_directives", [])[-10:],
+            "human_intent": state.get("human_intent", {}),
+            "task_plan": state.get("task_plan", {}),
             "operator_rejections": [
                 item for item in state.get("human_directives", [])[-10:]
                 if item.get("intent") == "reject_previous"
@@ -451,7 +772,7 @@ class Agents:
             "autonomous_continuation_required": state.get("autonomous_continuation_required", False),
             "approved_tool_parameters": state.get("last_decision").tool_parameters.model_dump(mode="json") if state.get("last_decision") else {},
             "capabilities": capability_catalog(),
-            "instruction": "Read the complete evidence.stdout, evidence.stderr, facts, and output_summary fields; the CLI progress preview is not the evidence. Reason over the complete evidence synthesis, not only the last result. Advance one or more unresolved findings. Cover all discovered hosts/services and cross-forest candidates. The runner_ips list contains Kali/QA-runner addresses only: it is exclusion metadata, never a recon, validation, or testing target. `environment` is execution context, not a cyber-range host. Treat recon_coverage as authoritative: a completed semantic check is not a new task merely because the action wording changed. Never repeat an identical effective argv; a different reviewed argv/profile is allowed only when it has an explicit expected evidence gain. The execution ledger and observation cache are authoritative memory: if the effective command is already present, re-plan to a different unresolved target/service/capability instead of emitting it again. Treat LDAP authentication, DNS context, forest mismatch, permissions, and command syntax as different hypotheses. The latest operator instruction is semantic, high-priority execution guidance, not a single fixed command: extract all requested goals, constraints, exclusions, ordering, target changes, username sources, and requested continuation, then combine them with the autonomous plan. Do not discard later clauses after recognizing one tool name. If the operator rejected the previous proposal, never reproduce that action/target/parameters; choose the next justified autonomous alternative. If `autonomous_continuation_required` is true, the previous stop request had no concrete blocker: choose the next distinct authorized path now and do not return `end/human_help`. If domain credentials are absent and domain/DC plus a candidate username source are known, treat asrep_roasting_assessment as one prioritized evidence path; it is not completion and must return to Supervisor planning afterward. Do not loop over empty-credential SMB/LDAP/NXC probes. If no username source exists, use only explicitly allowed anonymous enumeration or ask Human for CYBERQA_AD_USERS_FILE. For a CIDR, host discovery must begin with nmap -sn or -F; after hosts are found, perform nmap -sC -sV (or an explicitly justified reviewed profile) against each authorized non-local host before declaring the network empty. If discovery returns no hosts, adapt with the other discovery method and inspect routing/DNS instead of stopping. For check_port choose a profile or safe argv deliberately; for NXC choose a profile or safe argv deliberately. `iteration` is telemetry, not a stop condition; keep the Supervisor making decisions until the objective is complete, no authorized unresolved path remains, or the model/tool boundary genuinely needs Human. Return one primary decision plus useful next_options and exact tool_parameters, including argv/users_file when supplied.",
+            "instruction": "Read the complete evidence projection, evidence analyses, evidence_opportunities, qa_assertions, evidence_sufficiency, human_intent, and task_plan. Structured human_intent is authoritative for ordered_steps, forbidden_tools, excluded_targets, and exact step_parameters; do not replace it with a prose interpretation. The current human-intent step must be executed or a concrete authorized blocker must be recorded before moving to autonomous planning. Never choose a forbidden tool or excluded target. After a step completes, continue with the next cursor step and then resume autonomous evidence-driven planning. The latest operator instruction is semantic guidance, not permission to discard later clauses. Treat evidence_opportunities as reviewed hypotheses/candidates, not a mandatory sequence: compare them with all cumulative facts, unresolved questions, target/service context, approvals, risk, and method history, then select the highest-information distinct next action or a justified alternative. Use qa_assertions to decide what QA question remains, and use evidence_sufficiency to select the least-invasive method that reaches the required evidence level. If an assertion is already sufficient, do not escalate it to a deeper attack level; select another unresolved assertion or finish evaluation. Do not wait for a named pipeline to exist. Also reason over cumulative evidence, avoid identical effective argv, respect runner_ips as exclusion metadata only, and keep the Supervisor deciding until the objective is complete or a genuine missing input, approval, or unrecoverable boundary exists. Return exact reviewed tool_parameters, including argv/users_file when supplied.",
         })
         self.progress("reasoning_start", agent=Role.SUPERVISOR.value)
         response = await model.ainvoke([
@@ -459,8 +780,10 @@ class Agents:
                     "You are the workflow supervisor for an authorized cyber-range QA agent. "
                     "Choose dynamically based on the conversation and evidence. Tool failures are "
                     "diagnostic evidence: send them to debugging, do not blindly repeat them. "
-                    "Select an AD capability when applicable and fill prerequisites, expected_evidence, "
-                    "risk, tool_parameters, and next_options. You may propose a multi-step chain; the execution broker "
+                    "Choose the next unresolved QA assertion and the least-invasive reviewed capability "
+                    "that can raise its evidence level; fill prerequisites, expected_evidence, risk, "
+                    "tool_parameters, and next_options. You may propose a multi-step chain only when the "
+                    "assertion requires it; the execution broker "
                     "will enforce scope and approvals. Treat the latest operator instruction as an explicit constraint, "
                     "not optional context. "
                     "Do not execute tools. Return a Decision object."
@@ -501,7 +824,7 @@ class Agents:
             host = str(value)
             if (
                 host == network
-                or is_local_target(host)
+                or self._is_runner_target(state, host)
                 or not self.tools.target_policy.allows(host)
             ):
                 continue
@@ -540,7 +863,7 @@ class Agents:
         """
 
         target = str(state.get("target", ""))
-        if not target or is_local_target(target):
+        if not target or self._is_runner_target(state, target):
             return False
         coverage = state.get("recon_coverage", {}) or {}
         if "/" in target:
@@ -555,7 +878,7 @@ class Agents:
             hosts = {
                 str(value) for value in state.get("discovered_targets", [])
                 if "/" not in str(value)
-                and not is_local_target(str(value))
+                and not self._is_runner_target(state, str(value))
                 and self.tools.target_policy.allows(str(value))
             }
             for host in hosts:
@@ -575,6 +898,49 @@ class Agents:
             if isinstance(item, dict)
         )
 
+    def _pending_evidence_opportunities(self, state: QAState) -> list[dict[str, Any]]:
+        """Return evidence-backed candidates not already attempted for target.
+
+        This prevents a successful recon baseline from becoming an implicit
+        ``END`` when its result opened a different reviewed service or
+        capability path.  It also prevents the opportunity memory itself from
+        becoming a loop: an attempted tool/target pair is consumed, so the
+        Supervisor must choose another candidate or report a real boundary.
+        """
+        pending: list[dict[str, Any]] = []
+        records = state.get("method_history", [])
+        for raw in state.get("evidence_opportunities", [])[-300:]:
+            if hasattr(raw, "model_dump"):
+                opportunity = raw.model_dump(mode="json")
+            elif isinstance(raw, dict):
+                opportunity = raw
+            else:
+                continue
+            tool = str(opportunity.get("tool", "")).strip().lower()
+            target = str(opportunity.get("target", "")).strip()
+            if not tool or not target or tool not in self.tools.tools:
+                continue
+            if self._is_runner_target(state, target) or not self.tools.target_policy.allows(target):
+                continue
+            target_host = self._target_host(target)
+            consumed = False
+            for record in records:
+                if not isinstance(record, dict):
+                    continue
+                record_target = str(record.get("target", "")).strip()
+                if self._target_host(record_target) != target_host:
+                    continue
+                record_text = " ".join(
+                    str(record.get(field, "")).lower()
+                    for field in ("tool", "action")
+                )
+                if tool in record_text:
+                    consumed = True
+                    break
+            if not consumed:
+                pending.append(opportunity)
+        return pending
+
     def _completion_gate_open(self, state: QAState) -> bool:
         """Guard Judge/END without disabling Supervisor planning.
 
@@ -587,6 +953,16 @@ class Agents:
         if state.get("scorecard_authorized"):
             return True
         if not self._remote_recon_complete(state):
+            return False
+        qa_assertions, sufficiencies = self._assessment_context(state)
+        if qa_assertions:
+            # Assertion-driven runs stop when every requested question has
+            # reached its own evidence threshold. This replaces the old
+            # implicit AD completion sequence for new tasks.
+            if not sufficiencies or any(not item.get("sufficient") for item in sufficiencies):
+                return False
+            return True
+        if self._pending_evidence_opportunities(state):
             return False
         context = derive_context(state)
         if not context.domain:
@@ -641,7 +1017,7 @@ class Agents:
             Role.VALIDATION: ("check_port", "check_dns_resolution", "ldap_bind", "smb_negotiate",
                               "http_health_check", "nxc_smb_recon", "nxc_ldap_recon",
                               "impacket_rpc_recon"),
-            Role.TESTING: ("ad_domain_users", "ad_asrep_roasting", "ad_kerberoasting",
+            Role.TESTING: ("ad_domain_users", "ad_asrep_roasting", "ad_hash_cracking", "ad_kerberoasting",
                            "ad_credential_validation", "ad_password_spray", "ad_bloodhound_collection",
                            "nxc_smb_recon", "nxc_ldap_recon", "check_port",
                            "ldap_bind", "smb_negotiate"),
@@ -720,8 +1096,8 @@ class Agents:
         inner = StateGraph(ReactState)
 
         async def reason(s: dict[str, Any]) -> dict[str, Any]:
-            if model is None:
-                return {"messages": [AIMessage(content="No model configured; finish with collected facts.")]}
+            if model is None or not self._model_budget_available():
+                return {"messages": [AIMessage(content="No model configured or model-call budget exhausted; return collected facts to Supervisor.")]}
             self.progress("reasoning_start", agent=role.value)
             response = await model.ainvoke([
                 SystemMessage(content=(SYSTEM + f"\nYou are the {role.value} specialist. "
@@ -736,7 +1112,11 @@ class Agents:
                 HumanMessage(content=json.dumps({
                     "objective": state.get("objective"),
                     "target": state.get("last_decision").target if state.get("last_decision") else "environment",
-                    "evidence": [e.model_dump(mode="json") for e in state.get("evidence", [])[-20:]],
+                    "evidence": self._prompt_evidence(state),
+                    "evidence_analyses": state.get("evidence_analyses", [])[-12:],
+                    "evidence_opportunities": state.get("evidence_opportunities", [])[-36:],
+                    "qa_assertions": state.get("qa_assertions", [])[-24:],
+                    "evidence_sufficiency": state.get("evidence_sufficiency", [])[-24:],
                     "evidence_synthesis": state.get("evidence_synthesis", {}),
                     "target_profiles": state.get("target_profiles", {}),
                     "runtime_config": state.get("runtime_config", {}),
@@ -746,7 +1126,8 @@ class Agents:
                     "operator_instruction_history": state.get("human_directives", [])[-10:],
                     "capabilities": capability_catalog(),
                     "observed_signatures": list(state.get("observation_index", {}).keys())[-50:],
-                    "instruction": instruction or (state.get("last_decision").justification if state.get("last_decision") else "Collect useful facts"),
+                    "instruction": (instruction or (state.get("last_decision").justification if state.get("last_decision") else "Collect useful facts")) +
+                    " After each fresh tool result, use the durable evidence analysis to identify usable content and choose a distinct reviewed tool. Work toward the current assertion's required evidence level with the least-invasive justified method; do not follow a fixed pipeline, escalate a sufficient assertion, or ask Human merely because the previous capability ended.",
                 })),
                 *self._react_context(s.get("messages", [])),
             ])
@@ -897,7 +1278,7 @@ class Agents:
         for name in available:
             try:
                 result = await self.tools.observe(
-                    name, LOCAL_EXECUTION_TARGET, "runner_identity", {}
+                    name, LOCAL_EXECUTION_TARGET, "runner_identity", {}, force_refresh=True
                 )
                 if result.get("evidence"):
                     observed = Evidence.model_validate(result["evidence"])
@@ -988,6 +1369,33 @@ class Agents:
                 "human_directive": True,
                 "needs_human": False,
             }
+        # Structured multi-step guidance is an execution obligation. Do not
+        # ask the model to rediscover the first step from prose on every turn;
+        # advance one intent cursor at a time and return to Supervisor after
+        # each result.
+        try:
+            human_intent = HumanIntent.model_validate(state.get("human_intent", {}))
+        except Exception:
+            human_intent = HumanIntent()
+        if human_intent.ordered_steps and not human_intent.completed:
+            forced = self._intent_decision(state, human_intent)
+            if forced:
+                forced = forced.model_copy(update={
+                    "approval_required": forced.approval_required or self.policy.requires_approval(forced.action),
+                    "plan_id": f"human-intent:{state.get('run_id', 'run')}:{human_intent.current_step}",
+                })
+                self.progress("supervisor_decision", agent=(forced.next_agent.value if isinstance(forced.next_agent, Role) else str(forced.next_agent)),
+                              action=forced.action, target=forced.target, source="structured_human_intent",
+                              intent_step=human_intent.current_step)
+                return {
+                    "iteration": iteration,
+                    "phase": forced.next_agent,
+                    "last_decision": forced,
+                    "pending_action": forced.model_dump(),
+                    "needs_human": False,
+                    "human_directive": True,
+                    "task_plan": self._task_plan_from_intent(human_intent),
+                }
         try:
             result = await self._structured_supervisor(state)
         except Exception as exc:
@@ -1001,6 +1409,41 @@ class Agents:
                         "question": "Supervisor 無法產生下一步；請提供額外語意或輸入 abort。",
                         "reason": decision.justification,
                     }]}
+        # Even when there is no explicit current step, human exclusions are
+        # hard constraints. A model proposal that violates them must return
+        # to Supervisor for an alternative instead of reaching the adapter.
+        try:
+            intent = HumanIntent.model_validate(state.get("human_intent", {}))
+        except Exception:
+            intent = HumanIntent()
+        planned = self._planned_tool_for_action(result)
+        forbidden = {str(item).lower() for item in intent.forbidden_tools}
+        capability_spec = get_capability(result.capability) if result.capability else None
+        capability_tools = {
+            str(item).lower() for item in (capability_spec.allowed_tools if capability_spec else [])
+        }
+        violates_tool = bool(
+            (planned and planned[0].lower() in forbidden)
+            or result.action.lower() in forbidden
+            or (result.capability and result.capability.lower() in forbidden)
+            or capability_tools.intersection(forbidden)
+        )
+        violates_target = self._target_is_excluded(intent, result.target)
+        if violates_tool or violates_target:
+            blocked_tool = (
+                planned[0] if planned else
+                next(iter(capability_tools.intersection(forbidden)), result.capability or result.action)
+            )
+            blocked_reason = (
+                f"Human intent forbids tool {blocked_tool}" if violates_tool
+                else f"Human intent excludes target {result.target}"
+            )
+            result = Decision(
+                next_agent=Role.SUPERVISOR, objective=result.objective or state.get("objective", "QA"),
+                action="replan_after_human_constraint", target=state.get("target", result.target),
+                justification=f"{blocked_reason}; choose a distinct authorized alternative.",
+                next_options=result.next_options,
+            )
         # AD safety/completion guards constrain only unsafe or terminal model
         # proposals. A concrete safe non-terminal decision remains the
         # Supervisor's choice, so adding another execution path does not get
@@ -1014,6 +1457,27 @@ class Agents:
             # capability selection. A human explicit directive is handled
             # above and bypasses this guard intentionally.
             result = network_transition
+        qa_assertions, evidence_sufficiency = self._assessment_context(state)
+        if (
+            qa_assertions
+            and evidence_sufficiency
+            and all(item.get("sufficient") for item in evidence_sufficiency)
+            and result.next_agent not in {Role.JUDGE, Role.REPORTING}
+            and result.action != "resource_budget"
+        ):
+            # Once every requested assertion has reached its threshold, do
+            # not let an available exploit/credential tool turn QA into an
+            # unnecessary attack chain. Route to evidence evaluation.
+            result = Decision(
+                next_agent=Role.JUDGE,
+                objective="evaluate sufficient QA evidence",
+                action="evaluate_ad_evidence",
+                target=result.target or state.get("target", "environment"),
+                justification=(
+                    "All active QA assertions have reached their required evidence levels. "
+                    "Evaluate the evidence and produce the assessment instead of escalating depth."
+                ),
+            )
         terminal_request = (
             result.next_agent == Role.JUDGE
             or (result.next_agent == "end" and result.objective != "human_help")
@@ -1054,7 +1518,11 @@ class Agents:
             )
             if not real_human_boundary and self.llm:
                 continuation_count = state.get("autonomous_replan_count", 0) + 1
-                if continuation_count >= 3:
+                # A model's repeated refusal is not a reason to ask Human
+                # while evidence still contains unconsumed, reviewed paths.
+                # The model must keep deciding among those paths; the normal
+                # per-task model budget remains the resource safety boundary.
+                if continuation_count >= 3 and not self._pending_evidence_opportunities(state):
                     exhausted = result.model_copy(update={
                         "justification": (
                             "The Supervisor declined to select a next path three times without a concrete "
@@ -1123,24 +1591,24 @@ class Agents:
         # returning to the first DC-shaped target.
         uncovered = [
             item for item in state.get("discovered_targets", [])
-            if not is_local_target(str(item))
+            if not self._is_runner_target(state, str(item))
             and self.tools.target_policy.allows(str(item))
             and not self._target_has_completed_recon(state.get("recon_coverage", {}).get(item))
         ]
         if uncovered and result.next_agent == Role.VALIDATION:
             target = uncovered[0]
-        if is_local_target(str(target)):
+        if self._is_runner_target(state, str(target)):
             # A model may mention the runner as context, but never as a
             # remote recon target. Prefer the next authorized host/network.
             target = next(
                 (
                     str(item) for item in uncovered
-                    if not is_local_target(str(item))
+                    if not self._is_runner_target(state, str(item))
                 ),
                 next(
                     (
                         str(item) for item in state.get("discovered_targets", [])
-                        if not is_local_target(str(item))
+                        if not self._is_runner_target(state, str(item))
                         and self.tools.target_policy.allows(str(item))
                     ),
                     state.get("target", LOCAL_EXECUTION_TARGET),
@@ -1371,26 +1839,27 @@ class Agents:
         ))
         target = os.getenv("CYBERQA_AD_DC") or state.get("target", LOCAL_EXECUTION_TARGET)
         prior = state.get("last_decision")
-        if prior and prior.target and not is_local_target(prior.target):
+        if prior and prior.target and not Agents._is_runner_target(state, prior.target):
             target = prior.target
         if "/" in str(target):
             # GetNPUsers needs one DC address, not a CIDR. Prefer the runtime
             # discovered DC, then the first non-local discovered host.
             for candidate, profile in (state.get("target_profiles", {}) or {}).items():
-                if (not is_local_target(str(candidate)) and "/" not in str(candidate)
+                if (not Agents._is_runner_target(state, str(candidate)) and "/" not in str(candidate)
                         and (profile.get("domain") or profile.get("connectivity") == "reachable")):
                     target = str(candidate)
                     break
             else:
                 for candidate in state.get("discovered_targets", []):
-                    if "/" not in str(candidate) and not is_local_target(str(candidate)):
+                    if "/" not in str(candidate) and not Agents._is_runner_target(state, str(candidate)):
                         target = str(candidate)
                         break
-        if is_local_target(str(target)):
+        if Agents._is_runner_target(state, str(target)):
             target = next(
                 (
                     str(candidate) for candidate in state.get("discovered_targets", [])
-                    if "/" not in str(candidate) and not is_local_target(str(candidate))
+                    if "/" not in str(candidate)
+                    and not Agents._is_runner_target(state, str(candidate))
                 ),
                 LOCAL_EXECUTION_TARGET,
             )
@@ -1451,13 +1920,14 @@ class Agents:
             r"(?<![\w.])(?:\d{1,3}\.){3}\d{1,3}(?:/\d{1,2})?(?![\w.])", answer
         )
         for candidate in matches:
-            if not is_local_target(candidate):
+            if not Agents._is_runner_target(state, candidate):
                 return candidate
         prior = state.get("last_decision")
-        if prior and prior.target and prior.target != "environment" and not is_local_target(prior.target):
+        if (prior and prior.target and prior.target != "environment"
+                and not Agents._is_runner_target(state, prior.target)):
             return prior.target
         fallback = state.get("target", LOCAL_EXECUTION_TARGET)
-        return fallback if not is_local_target(str(fallback)) else LOCAL_EXECUTION_TARGET
+        return fallback if not Agents._is_runner_target(state, str(fallback)) else LOCAL_EXECUTION_TARGET
 
     @staticmethod
     def _apply_human_config(answer: str) -> tuple[dict[str, str], str]:
@@ -1470,7 +1940,7 @@ class Agents:
         allowed = {
             "CYBERQA_AD_DOMAIN", "CYBERQA_AD_DC", "CYBERQA_AD_BASE_DN",
             "CYBERQA_AD_USERS_FILE", "CYBERQA_AD_USERNAME", "CYBERQA_AD_PASSWORD",
-            "CYBERQA_AD_COLLECTION", "CYBERQA_ALLOW_ANONYMOUS_NXC",
+            "CYBERQA_AD_COLLECTION", "CYBERQA_AD_WORDLIST", "CYBERQA_ALLOW_ANONYMOUS_NXC",
         }
         safe: dict[str, str] = {}
         for key, value in re.findall(r"\b(CYBERQA_[A-Z0-9_]+)\s*=\s*([^\s,;]+)", answer):
@@ -1501,6 +1971,17 @@ class Agents:
         a later model call cannot discard a direct operator command.
         """
         text = answer.lower().replace("–", "-")
+        intent = parse_human_intent(answer, state)
+        if intent.parsing_errors:
+            # Do not freeze a silently downgraded command. The structured
+            # intent carries the parse error and lets Supervisor choose a
+            # reviewed alternative or record the concrete blocker.
+            return None
+        # A compound, ordered, or negative instruction must never be reduced
+        # to the first tool name. It is stored as HumanIntent and consumed by
+        # the Supervisor's step cursor instead.
+        if intent.has_ordering or len(intent.ordered_steps) != 1 or intent.forbidden_tools:
+            return None
         # Compound guidance belongs to the semantic Supervisor path. Do not
         # freeze only the first tool named in a multi-step instruction.
         if _is_multi_step_instruction(text):
@@ -1513,12 +1994,14 @@ class Agents:
         capability = None
         params: dict[str, Any] = {}
         if "nmap" in text:
-            if "-sn" in text or "host discovery" in text or "主機發現" in text:
-                action, params = "network_host_discovery", {"profile": "host_discovery"}
-            elif re.search(r"(^|\s)-f(\s|$)", text) or "fast scan" in text:
-                action, params = "network_fast_discovery", {"profile": "fast"}
+            parsed = intent.step_parameters.get("check_port", {})
+            if parsed.get("profile") == "host_discovery":
+                action = "network_host_discovery"
+            elif parsed.get("profile") == "fast":
+                action = "network_fast_discovery"
             else:
-                action, params = "service_enumeration", {"profile": "default"}
+                action = "service_enumeration"
+            params = parsed
         elif "nxc" in text or "netexec" in text:
             role = Role.TESTING
             if "ldap" in text:
@@ -1560,6 +2043,211 @@ class Agents:
             tool_parameters=ToolParameters.model_validate(params),
         )
 
+    @staticmethod
+    def _intent_target(state: QAState, intent: HumanIntent) -> str:
+        candidates = [
+            *intent.requested_targets,
+            *[str(item) for item in state.get("discovered_targets", [])],
+            str(state.get("target", LOCAL_EXECUTION_TARGET)),
+        ]
+        for candidate in candidates:
+            if (not Agents._target_is_excluded(intent, candidate)
+                    and not Agents._is_runner_target(state, candidate)):
+                return candidate
+        return LOCAL_EXECUTION_TARGET
+
+    @staticmethod
+    def _is_runner_target(state: QAState, target: str) -> bool:
+        """Treat discovered runner interfaces as execution context only."""
+        if is_local_target(target):
+            return True
+        value = Agents._target_host(target)
+        return value in {str(item) for item in state.get("runner_ips", [])}
+
+    @staticmethod
+    def _target_host(target: str) -> str:
+        value = str(target).strip()
+        if "://" in value:
+            value = value.split("://", 1)[1].split("/", 1)[0]
+        if value.count(":") == 1 and value.rsplit(":", 1)[1].isdigit():
+            return value.rsplit(":", 1)[0]
+        return value
+
+    @staticmethod
+    def _target_is_excluded(intent: HumanIntent, target: str) -> bool:
+        candidate = Agents._target_host(target)
+        for excluded in intent.excluded_targets:
+            excluded_host = Agents._target_host(excluded)
+            if candidate == excluded_host:
+                return True
+            if "/" in excluded_host:
+                try:
+                    if ipaddress.ip_address(candidate) in ipaddress.ip_network(excluded_host, strict=False):
+                        return True
+                except ValueError:
+                    continue
+        return False
+
+    @staticmethod
+    def _intent_ad_users(state: QAState) -> list[str]:
+        """Project candidate usernames from cumulative state for later steps."""
+        knowledge = state.get("ad_knowledge", {}) or {}
+        if hasattr(knowledge, "model_dump"):
+            knowledge = knowledge.model_dump(mode="json")
+        users: list[str] = []
+        for field in ("asrep_candidates", "users"):
+            values = knowledge.get(field, []) if isinstance(knowledge, dict) else []
+            if isinstance(values, list):
+                users.extend(str(value) for value in values if str(value).strip())
+        for item in state.get("evidence", []):
+            facts = getattr(item, "facts", {}) or {}
+            if not isinstance(facts, dict):
+                continue
+            for field in ("asrep_candidates", "users"):
+                values = facts.get(field, [])
+                if isinstance(values, list):
+                    users.extend(str(value) for value in values if str(value).strip())
+        return list(dict.fromkeys(users))[:500]
+
+    @staticmethod
+    def _human_step_matches(tool: str, item: Evidence) -> bool:
+        text = f"{item.source} {item.action}".lower()
+        aliases = {
+            "nxc_ldap_recon": ("nxc_ldap", "ldap_recon"),
+            "nxc_smb_recon": ("nxc_smb", "smb_recon"),
+            "ad_asrep_roasting": ("ad_asrep", "asrep"),
+            "ad_hash_cracking": ("ad_hash", "hash_crack"),
+            "ad_credential_validation": ("credential_validation",),
+            "ad_bloodhound_collection": ("bloodhound",),
+            "smb_negotiate": ("smb",),
+            "ldap_bind": ("ldap",),
+            "check_port": ("check_port", "nmap", "service_enumeration", "network_"),
+            "network_host_discovery": ("host_discovery", "network_host", "nmap", "check_port"),
+            "service_enumeration": ("service_enumeration", "check_port", "nmap"),
+        }
+        return any(alias in text for alias in aliases.get(tool, (tool,)))
+
+    @staticmethod
+    def _intent_decision(state: QAState, intent: HumanIntent) -> Decision | None:
+        if intent.completed or intent.current_step >= len(intent.ordered_steps):
+            return None
+        tool = intent.ordered_steps[intent.current_step]
+        status = (intent.step_statuses[intent.current_step]
+                  if intent.current_step < len(intent.step_statuses) else "pending")
+        # A failed or syntactically blocked step is a durable constraint for
+        # the autonomous Supervisor to reason around. Do not blindly dispatch
+        # the same frozen command again.
+        if status in {"failed", "blocked"}:
+            return None
+        params = dict(intent.step_parameters.get(tool, {}))
+        if intent.parsing_errors and not params.get("argv") and status == "blocked":
+            return None
+        if tool == "ad_asrep_roasting" and not params.get("users") and not params.get("users_file"):
+            users = Agents._intent_ad_users(state)
+            if users:
+                params["users"] = users
+            else:
+                # Never call GetNPUsers with an empty candidate source. The
+                # Supervisor may choose another evidence path or record the
+                # genuine missing prerequisite.
+                return None
+        target = Agents._intent_target(state, intent)
+        if target == LOCAL_EXECUTION_TARGET:
+            return None
+        if tool in {"check_port", "network_host_discovery", "service_enumeration"}:
+            action = "network_host_discovery" if tool == "network_host_discovery" or params.get("profile") == "host_discovery" else (
+                "network_fast_discovery" if params.get("profile") == "fast" else "service_enumeration"
+            )
+            return Decision(
+                next_agent=Role.VALIDATION, objective="Follow structured human intent",
+                action=action, target=target,
+                justification=f"Human intent step {intent.current_step + 1}/{len(intent.ordered_steps)}: {action}.",
+                tool_parameters=ToolParameters.model_validate(params),
+            )
+        if tool in {"nxc_ldap_recon", "nxc_smb_recon"}:
+            return Decision(
+                next_agent=Role.TESTING, objective="Follow structured human intent",
+                action=tool, target=target,
+                justification=f"Human intent step {intent.current_step + 1}/{len(intent.ordered_steps)}: {tool}.",
+                tool_parameters=ToolParameters.model_validate(params),
+            )
+        if tool == "smb_negotiate":
+            return Decision(
+                next_agent=Role.VALIDATION, objective="Follow structured human intent",
+                action="smb_negotiate_probe", target=target,
+                justification=f"Human intent step {intent.current_step + 1}/{len(intent.ordered_steps)}: SMB probe.",
+                tool_parameters=ToolParameters.model_validate(params),
+            )
+        if tool == "ldap_bind":
+            return Decision(
+                next_agent=Role.VALIDATION, objective="Follow structured human intent",
+                action="ldap_bind_probe", target=target,
+                justification=f"Human intent step {intent.current_step + 1}/{len(intent.ordered_steps)}: LDAP probe.",
+                tool_parameters=ToolParameters.model_validate(params),
+            )
+        capability_map = {
+            "ad_asrep_roasting": ("asrep_roasting_assessment", ADRisk.CREDENTIAL_MATERIAL),
+            "ad_hash_cracking": ("hash_cracking_assessment", ADRisk.CREDENTIAL_MATERIAL),
+            "ad_credential_validation": ("credential_validation", ADRisk.AUTHENTICATION_TEST),
+            "ad_bloodhound_collection": ("bloodhound_collection", ADRisk.CREDENTIAL_MATERIAL),
+        }
+        if tool in capability_map:
+            capability, risk = capability_map[tool]
+            return Decision(
+                next_agent=Role.TESTING, objective="Follow structured human intent",
+                action=capability, target=target,
+                justification=f"Human intent step {intent.current_step + 1}/{len(intent.ordered_steps)}: {capability}.",
+                capability=capability, risk=risk, approval_required=True,
+                tool_parameters=ToolParameters.model_validate(params),
+            )
+        return None
+
+    @staticmethod
+    def _task_plan_from_intent(intent: HumanIntent) -> dict[str, Any]:
+        statuses = list(intent.step_statuses)
+        if len(statuses) < len(intent.ordered_steps):
+            statuses.extend("pending" for _ in range(len(intent.ordered_steps) - len(statuses)))
+        return {
+            "source": "human",
+            "raw_instruction": intent.raw_instruction,
+            "parsing_errors": list(intent.parsing_errors),
+            "steps": [
+                {"index": index, "tool": tool, "parameters": intent.step_parameters.get(tool, {}),
+                 "status": ("completed" if index < intent.current_step and statuses[index] == "pending"
+                            else statuses[index])}
+                for index, tool in enumerate(intent.ordered_steps)
+            ],
+            "cursor": intent.current_step,
+            "status": "completed" if intent.completed else "active",
+        }
+
+    @staticmethod
+    def _advance_human_intent(state: QAState, evidence: list[Evidence]) -> tuple[dict[str, Any], dict[str, Any]]:
+        raw = state.get("human_intent") or {}
+        if not raw:
+            return raw, state.get("task_plan", {})
+        intent = HumanIntent.model_validate(raw)
+        if evidence and intent.current_step < len(intent.ordered_steps):
+            statuses = list(intent.step_statuses)
+            if len(statuses) < len(intent.ordered_steps):
+                statuses.extend("pending" for _ in range(len(intent.ordered_steps) - len(statuses)))
+            tool = intent.ordered_steps[intent.current_step]
+            relevant = [item for item in evidence if Agents._human_step_matches(tool, item)]
+            if relevant:
+                failed = any(
+                    item.exit_code not in (None, 0)
+                    and (item.facts or {}).get("expected_result") != "hash_not_found"
+                    for item in relevant
+                )
+                if failed:
+                    statuses[intent.current_step] = "failed"
+                else:
+                    statuses[intent.current_step] = "completed"
+                    intent.current_step += 1
+                    intent.completed = intent.current_step >= len(intent.ordered_steps)
+                intent.step_statuses = statuses
+        return intent.model_dump(mode="json"), Agents._task_plan_from_intent(intent)
+
     async def human_help(self, state: QAState) -> dict[str, Any]:
         """Pause the outer workflow when the supervisor detects no progress."""
         decision = state.get("last_decision")
@@ -1583,12 +2271,16 @@ class Agents:
         answer_text = str(answer).strip()
         guidance = answer_text.lower()
         runtime_config, safe_answer = self._apply_human_config(answer_text)
+        parsed_intent = parse_human_intent(answer_text, state)
         rejected_previous = _is_rejection_instruction(answer_text)
         previous_decision = state.get("last_decision")
         directive_record: dict[str, Any] = {
             "instruction": safe_answer,
             "source": "human",
             "intent": "reject_previous" if rejected_previous else "semantic_guidance",
+            "ordered_steps": parsed_intent.ordered_steps,
+            "forbidden_tools": parsed_intent.forbidden_tools,
+            "excluded_targets": parsed_intent.excluded_targets,
         }
         if rejected_previous and previous_decision and previous_decision.action != "end":
             directive_record.update({
@@ -1616,9 +2308,16 @@ class Agents:
                 "messages": [HumanMessage(content=f"Human guidance for supervisor: {safe_answer}")],
                 "human_instruction": safe_answer,
                 "human_directives": [directive_record],
+                "human_intent": parsed_intent.model_dump(mode="json"),
+                "task_plan": self._task_plan_from_intent(parsed_intent),
                 "errors": [] if not _is_abort_instruction(answer_text) else ["Human aborted after no progress"],
                 "aborted": _is_abort_instruction(answer_text)}
-        human_decision, approved, directive_error = self._human_asrep_decision(state, answer_text)
+        # AS-REP has a special approval path only when it is the sole current
+        # step. In a compound instruction, earlier evidence-producing steps
+        # must run first (for example NXC users -> AS-REP).
+        human_decision, approved, directive_error = (None, False, None)
+        if parsed_intent.ordered_steps == ["ad_asrep_roasting"] and not parsed_intent.has_ordering:
+            human_decision, approved, directive_error = self._human_asrep_decision(state, answer_text)
         if directive_error:
             patch.update({
                 "needs_human": True,
@@ -1673,7 +2372,7 @@ class Agents:
                     "human_directive": True,
                     "needs_human": False,
                     "human_directives": [{
-                        "instruction": safe_answer, "source": "human",
+                        **directive_record,
                         "action": generic_decision.action, "target": generic_decision.target,
                     }],
                 })
@@ -1807,6 +2506,10 @@ class Agents:
                 "profile": params.get("profile", "anonymous"),
                 "argv": params.get("argv", []),
             }
+        if "http_health_check" in text or ("http" in text and "health" in text):
+            return "http_health_check", {}
+        if "impacket_rpc_recon" in text or ("rpc" in text and "recon" in text):
+            return "impacket_rpc_recon", {}
         if "dns" in text and "resolution" in text:
             return "check_dns_resolution", ({"name": params["name"]} if params.get("name") else {})
         return None
@@ -1841,7 +2544,8 @@ class Agents:
     async def specialist(self, role: Role, state: QAState) -> dict[str, Any]:
         decision = state.get("last_decision")
         target, action = (decision.target, decision.action) if decision else ("environment", "observe")
-        evidence = []
+        evidence: list[Evidence] = []
+        evidence_analyses: list[dict[str, Any]] = []
         proposal: dict[str, Any] = {}
         new_observation = False
         inner_needs_human = False
@@ -1942,6 +2646,10 @@ class Agents:
                                 "error_kind": result.get("error_kind"),
                                 "recoverable": result.get("recoverable", False),
                             }
+                        # Cache hits still need a fresh planning projection;
+                        # otherwise a new task receives raw evidence without
+                        # the usable-content/next-tool analysis.
+                        evidence_analyses.append(await self._analyze_evidence(state, observed))
                     if result.get("needs_human") and action == "anonymous_identity_probe":
                         # Independent anonymous paths are allowed to fail
                         # independently. Continue the bounded phase so an LDAP
@@ -1963,9 +2671,9 @@ class Agents:
                                     "ok": False, "recoverable": True,
                                     "error_kind": result.get("error_kind", "tool_failure"),
                                     "parameters": parameters,
-                                    "tool_result": result,
                                 },
                             ))
+                            evidence_analyses.append(await self._analyze_evidence(state, evidence[-1]))
                             new_observation = True
                         repair_context = (
                             f"The planned {planned_tool} call failed but is recoverable. "
@@ -1991,6 +2699,7 @@ class Agents:
                                 facts={"ok": False, "needs_human": True,
                                        "error_kind": result.get("error_kind", "tool_failure")},
                             ))
+                            evidence_analyses.append(await self._analyze_evidence(state, evidence[-1]))
                         inner_human_request = {
                             "kind": "tool_failure", "agent": role.value,
                             "tool": planned_tool, "target": target,
@@ -2010,6 +2719,7 @@ class Agents:
                     evidence.append(Evidence(source=f"tool:{planned_tool}", action=action,
                                              target=target, exit_code=-1, stderr=str(exc),
                                              facts={"ok": False, "needs_human": True}))
+                    evidence_analyses.append(await self._analyze_evidence(state, evidence[-1]))
                     inner_human_request = {
                         "kind": "tool_failure", "agent": role.value,
                         "tool": planned_tool, "target": target, "error": str(exc),
@@ -2095,9 +2805,15 @@ class Agents:
                                 "error_kind": payload.get("error_kind"),
                                 "recoverable": payload.get("recoverable", False),
                             }
+                        evidence_analyses.append(await self._analyze_evidence(state, observed))
 
+                    expected_result = payload.get("expected_result") or (
+                        (observed.facts or {}).get("expected_result") if observed is not None else None
+                    )
                     failed = bool(payload.get("needs_human")) or bool(
-                        observed is not None and observed.exit_code not in (None, 0)
+                        observed is not None
+                        and observed.exit_code not in (None, 0)
+                        and expected_result != "hash_not_found"
                     )
                     recoverable = bool(payload.get("recoverable")) and not bool(payload.get("needs_human"))
                     if failed and recoverable:
@@ -2131,10 +2847,10 @@ class Agents:
                             facts={
                                 "ok": False, "recoverable": True,
                                 "error_kind": payload.get("error_kind", "tool_failure"),
-                                "tool_result": payload,
                             },
                         )
                         evidence.append(synthetic)
+                        evidence_analyses.append(await self._analyze_evidence(state, synthetic))
                         new_observation = new_observation or not payload.get("cached", False)
                         proposal.update({
                             "recoverable_failure": True,
@@ -2164,11 +2880,14 @@ class Agents:
             try:
                 result = await self.tools.observe(tool_name, target, action)
                 if result.get("evidence"):
-                    evidence.append(Evidence.model_validate(result["evidence"]))
+                    observed = Evidence.model_validate(result["evidence"])
+                    evidence.append(observed)
+                    evidence_analyses.append(await self._analyze_evidence(state, observed))
                 elif not result.get("ok", False):
                     evidence.append(Evidence(source=f"tool:{tool_name}", action=action, target=target,
                                              exit_code=-1, stderr=str(result.get("error", "tool failure")),
-                                             facts={"ok": False, "tool_result": result}))
+                                             facts={"ok": False}))
+                    evidence_analyses.append(await self._analyze_evidence(state, evidence[-1]))
                     proposal = {"tool": tool_name, "offline": True, "error": result.get("error"),
                                 "needs_human": True}
                     new_observation = True
@@ -2196,6 +2915,8 @@ class Agents:
         event_type = {Role.VALIDATION: "SERVICE_VALIDATED", Role.TESTING: "ATTACK_PATH_VALIDATED",
                       Role.DEBUGGING: "REPAIR_COMPLETED", Role.JUDGE: "SCENARIO_EVALUATED",
                       Role.REPORTING: "REPORT_UPDATED"}[role]
+        if evidence_analyses:
+            proposal["evidence_analysis_ids"] = [item["evidence_id"] for item in evidence_analyses]
         event = Event(type=event_type, run_id=state["run_id"], emitted_by=role, target=target,
                       evidence_ids=[e.id for e in evidence], payload=proposal)
         try:
@@ -2206,28 +2927,37 @@ class Agents:
         self.progress("agent_done", agent=role.value, evidence_count=len(evidence), target=target)
         discovered_targets = {
             str(item) for item in state.get("discovered_targets", [])
-            if not is_local_target(str(item))
+            if not self._is_runner_target(state, str(item))
         }
         ad_knowledge = dict(state.get("ad_knowledge", {}))
         ad_knowledge.setdefault("coverage", {})
         for observed in evidence:
-            if not is_local_target(observed.target):
+            if not self._is_runner_target(state, observed.target):
                 discovered_targets.add(observed.target)
             facts = observed.facts if isinstance(observed.facts, dict) else {}
             discovered_targets.update(
-                str(host) for host in facts.get("discovered_targets", [])
-                if not is_local_target(str(host)) and self.tools.target_policy.allows(str(host))
+                str(host) for host in _fact_values(facts.get("discovered_targets"))
+                if not self._is_runner_target(state, str(host))
+                and self.tools.target_policy.allows(str(host))
             )
             coverage = set()
-            for service in facts.get("open_ports", []):
+            for service in _fact_values(facts.get("open_ports")):
+                if not isinstance(service, dict):
+                    continue
                 coverage.add(f"{service.get('protocol', 'tcp')}/{service.get('port')}/{service.get('service')}")
             previous_service_coverage = set(ad_knowledge["coverage"].get(observed.target, []))
             ad_knowledge["coverage"][observed.target] = sorted(previous_service_coverage | coverage | {observed.source})
-            for field in ("users", "spns", "asrep_candidates", "credentials_validated", "groups", "acl_edges",
+            for field in ("users", "spns", "asrep_candidates", "cracked_users", "credentials_validated", "groups", "acl_edges",
                           "delegation", "adcs_findings", "trusts"):
                 values = set(ad_knowledge.get(field, []))
-                values.update(str(item) for item in facts.get(field, []))
+                values.update(str(item) for item in _fact_values(facts.get(field)))
                 ad_knowledge[field] = sorted(values)
+            for field in (
+                "asrep_hash_file", "asrep_hash_count", "hash_cracking_attempted",
+                "hash_cracked", "crack_status", "credential_source",
+            ):
+                if field in facts:
+                    ad_knowledge[field] = facts[field]
             if facts.get("domain_name"):
                 ad_knowledge["domain"] = facts["domain_name"]
         projection = self._project_observations(state, evidence)
@@ -2245,6 +2975,14 @@ class Agents:
                 "tool_result": (observed.facts or {}).get("tool_result"),
             })
         method_history = method_history[-200:]
+        new_opportunities = [
+            opportunity
+            for analysis in evidence_analyses
+            for opportunity in analysis.get("opportunities", [])
+        ][-48:]
+        qa_assertions, evidence_sufficiency = self._assessment_context(
+            state, evidence, new_opportunities
+        )
         patch: dict[str, Any] = {
             "evidence": evidence,
             "events": [event],
@@ -2259,11 +2997,19 @@ class Agents:
             "ad_knowledge": ad_knowledge,
             "approved_grant": None,
             **projection,
+            "evidence_analyses": evidence_analyses,
+            "evidence_opportunities": new_opportunities,
+            "qa_assertions": qa_assertions,
+            "evidence_sufficiency": evidence_sufficiency,
             "needs_human": inner_needs_human or bool(proposal.get("needs_human")),
             "human_requests": [inner_human_request] if inner_human_request else [],
             "human_directive": False,
             "judge_authorized": False,
         }
+        if state.get("human_intent"):
+            advanced_intent, task_plan = self._advance_human_intent(state, evidence)
+            patch["human_intent"] = advanced_intent
+            patch["task_plan"] = task_plan
         if role == Role.DEBUGGING and action == "generate_hypotheses":
             patch["hypotheses"] = [Hypothesis(statement=x, likelihood=.5) for x in proposal.get("hypotheses", [])]
         if role == Role.JUDGE and state.get("judge_authorized"):

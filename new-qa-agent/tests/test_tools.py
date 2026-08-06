@@ -1,9 +1,12 @@
 import asyncio
+import os
 
 import pytest
 
+from cyberqa.ad_capability_tools import ADCapabilityTool, _store_asrep_hashes
 from cyberqa.memory import ObservationStore
-from cyberqa.tools import KaliTool, TargetPolicy, build_kali_registry, summarize_output
+from cyberqa.models import Evidence
+from cyberqa.tools import KaliTool, TargetPolicy, ToolRegistry, build_kali_registry, summarize_output
 
 
 class FakeProcess:
@@ -65,6 +68,89 @@ def test_semantic_probe_aliases_share_effective_command_signature(monkeypatch):
     assert semantic == direct
 
 
+def test_observation_namespace_separates_tasks_with_same_effective_command(monkeypatch):
+    monkeypatch.setenv("CYBERQA_OBSERVATION_DB", ":memory:")
+    first = build_kali_registry(allowed_targets=["10.0.0.1"])
+    second = build_kali_registry(allowed_targets=["10.0.0.1"])
+    first.set_cache_namespace("scenario:run-one")
+    second.set_cache_namespace("scenario:run-two")
+
+    assert first.command_signature("check_port", "10.0.0.1", "service_enumeration", {"profile": "default"}) != second.command_signature(
+        "check_port", "10.0.0.1", "service_enumeration", {"profile": "default"}
+    )
+
+
+@pytest.mark.asyncio
+async def test_observation_namespace_prevents_cross_task_cache_hit(tmp_path, monkeypatch):
+    calls = []
+
+    class Probe:
+        name = "probe"
+
+        async def observe(self, target, action, **kwargs):
+            calls.append((target, action))
+            return Evidence(source="probe", action=action, target=target)
+
+    monkeypatch.setenv("CYBERQA_OBSERVATION_DB", str(tmp_path / "observations.sqlite3"))
+    first = ToolRegistry({"probe": Probe()}, TargetPolicy(["10.0.0.1"]))
+    second = ToolRegistry({"probe": Probe()}, TargetPolicy(["10.0.0.1"]))
+    first.set_cache_namespace("scenario:run-one")
+    second.set_cache_namespace("scenario:run-two")
+
+    await first.observe("probe", "10.0.0.1", "probe")
+    await second.observe("probe", "10.0.0.1", "probe")
+
+    assert calls == [("10.0.0.1", "probe"), ("10.0.0.1", "probe")]
+
+
+@pytest.mark.asyncio
+async def test_per_task_tool_budget_is_a_real_boundary(monkeypatch):
+    class Probe:
+        name = "probe"
+
+        async def observe(self, target, action, **kwargs):
+            return Evidence(source="probe", action=action, target=target)
+
+    monkeypatch.setenv("CYBERQA_OBSERVATION_DB", ":memory:")
+    registry = ToolRegistry(
+        tools={"probe": Probe()},
+        target_policy=TargetPolicy(["10.0.0.1"]),
+    )
+    registry.begin_run("budget-test", 1)
+
+    first = await registry.observe("probe", "10.0.0.1", "one")
+    second = await registry.observe("probe", "10.0.0.1", "two")
+
+    assert first["ok"] is True
+    assert second["error_kind"] == "resource_budget"
+    assert second["needs_human"] is True
+
+
+@pytest.mark.asyncio
+async def test_generic_tool_output_is_redacted_before_registry_evidence(monkeypatch):
+    class SecretTool:
+        name = "generic_probe"
+
+        async def observe(self, target, action, **kwargs):
+            return Evidence(
+                source="generic_probe", action=action, target=target,
+                stdout="username=alice password=PlainSecret $krb5asrep$23$alice@corp.local:ticket",
+                facts={"password": "PlainSecret", "safe": "corp.local"},
+            )
+
+    monkeypatch.setenv("CYBERQA_OBSERVATION_DB", ":memory:")
+    registry = ToolRegistry(
+        tools={"generic_probe": SecretTool()},
+        target_policy=TargetPolicy(["10.0.0.1"]),
+    )
+    result = await registry.observe("generic_probe", "10.0.0.1", "probe")
+
+    rendered = str(result)
+    assert "PlainSecret" not in rendered
+    assert "$krb5asrep$" not in rendered
+    assert result["evidence"]["facts"]["password"] == "[REDACTED]"
+
+
 def test_observation_store_can_clear_durable_entries():
     store = ObservationStore(":memory:")
     store.put("one", {"ok": True})
@@ -75,6 +161,66 @@ def test_observation_store_can_clear_durable_entries():
     assert store.get("two") is not None
     assert store.clear() == 1
     assert store.get("two") is None
+
+
+def test_asrep_hashes_are_stored_as_restricted_artifacts_not_facts(tmp_path, monkeypatch):
+    monkeypatch.setenv("CYBERQA_CREDENTIAL_MATERIAL_DIR", str(tmp_path))
+    path, count = _store_asrep_hashes(
+        "$krb5asrep$23$alice@corp.local:opaque-material\n"
+    )
+    assert path is not None
+    assert count == 1
+    assert "opaque-material" in open(path, encoding="utf-8").read()
+
+
+def test_hash_cracking_promotes_only_process_local_credential(monkeypatch, tmp_path):
+    monkeypatch.setenv("CYBERQA_AD_PASSWORD", "")
+    output = tmp_path / "cracked.out"
+    output.write_text("$krb5asrep$23$alice@corp.local:PlainSecret\n", encoding="utf-8")
+    tool = ADCapabilityTool(
+        "ad_hash_cracking", "hash_cracking_assessment", TargetPolicy(["10.0.0.1"])
+    )
+    facts = tool._hash_cracking_facts(
+        ["hashcat", "--outfile", str(output)], 0
+    )
+    assert facts["hash_cracked"] is True
+    assert facts["cracked_users"] == ["alice"]
+    assert "PlainSecret" not in str(facts)
+    assert os.getenv("CYBERQA_AD_PASSWORD") == "PlainSecret"
+
+
+def test_hashcat_no_match_is_evidence_not_human_blocker(monkeypatch):
+    class NoMatchTool:
+        name = "ad_hash_cracking"
+
+        def command_identity(self, target, parameters):
+            return {"target": target, "parameters": parameters}
+
+        async def observe(self, target, action, **kwargs):
+            return Evidence(
+                source="ad-capability:ad_hash_cracking", action=action, target=target,
+                exit_code=1, facts={
+                    "hash_cracking_attempted": True,
+                    "hash_cracked": False,
+                    "crack_status": "not_found",
+                },
+            )
+
+    registry = ToolRegistry(
+        tools={"ad_hash_cracking": NoMatchTool()},
+        target_policy=TargetPolicy(["10.0.0.1"]),
+    )
+    result = asyncio.run(registry.observe(
+        "ad_hash_cracking", "10.0.0.1", "hash_cracking_assessment",
+        parameters={"hash_file": "a", "wordlist": "b"},
+        authorization={
+            "target": "10.0.0.1", "allowed_tools": ["ad_hash_cracking"],
+            "tool_parameters": {"hash_file": "a", "wordlist": "b"},
+        },
+    ))
+    assert result["ok"] is True
+    assert result["expected_result"] == "hash_not_found"
+    assert result.get("needs_human") is not True
 
 
 def test_nmap_and_nxc_accept_reviewed_dynamic_argv_fragments():

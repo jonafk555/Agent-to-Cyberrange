@@ -31,6 +31,10 @@ class ADContext:
     identity_complete: bool
     asrep_attempted: bool
     asrep_succeeded: bool
+    asrep_hash_file: str | None
+    hash_cracking_attempted: bool
+    hash_cracked: bool
+    wordlist: str | None
     domain_users_attempted: bool
     spns: tuple[str, ...]
     kerberoast_attempted: bool
@@ -73,16 +77,24 @@ def _error_kind(item: Any) -> str | None:
 
 def _target(state: dict[str, Any], domain: str | None) -> str:
     profiles = state.get("target_profiles", {}) or {}
+    runner_ips = {str(item) for item in state.get("runner_ips", [])}
+
+    def is_runner_target(value: object) -> bool:
+        target = str(value)
+        host = target.rsplit(":", 1)[0] if target.count(":") == 1 and target.rsplit(":", 1)[1].isdigit() else target
+        return target in runner_ips or host in runner_ips
+
     for target, profile in profiles.items():
-        if (not is_local_target(str(target)) and domain
+        if (not is_local_target(str(target)) and not is_runner_target(target) and domain
                 and profile.get("domain") == domain
                 and profile.get("connectivity") == "reachable"):
             return target
     for target in state.get("discovered_targets", []):
-        if "/" not in str(target) and not is_local_target(str(target)):
+        if ("/" not in str(target) and not is_local_target(str(target))
+                and not is_runner_target(target)):
             return str(target)
     fallback = state.get("target", "environment")
-    return fallback if not is_local_target(str(fallback)) else "environment"
+    return fallback if not is_local_target(str(fallback)) and not is_runner_target(fallback) else "environment"
 
 
 def _valid_users_file(value: object) -> str | None:
@@ -94,6 +106,20 @@ def _valid_users_file(value: object) -> str | None:
     if not candidate.is_file():
         return None
     return str(candidate)
+
+
+def _wordlist_path() -> str | None:
+    candidates = [
+        os.getenv("CYBERQA_AD_WORDLIST", ""),
+        "/usr/share/wordlists/rockyou.txt",
+        "/usr/share/wordlists/fasttrack.txt",
+    ]
+    for value in candidates:
+        if value:
+            candidate = Path(value).expanduser()
+            if candidate.is_file():
+                return str(candidate)
+    return None
 
 
 def derive_context(state: dict[str, Any]) -> ADContext:
@@ -137,6 +163,13 @@ def derive_context(state: dict[str, Any]) -> ADContext:
     asrep_attempted = bool(asrep_items or actual_asrep_records or _attempted(state, "ad-capability:ad_asrep"))
     if asrep_approval_rejections and not asrep_items:
         asrep_attempted = False
+    asrep_hash_file = knowledge.get("asrep_hash_file")
+    if not isinstance(asrep_hash_file, str) or not Path(asrep_hash_file).expanduser().is_file():
+        asrep_hash_file = None
+    hash_cracking_attempted = bool(knowledge.get("hash_cracking_attempted")) or _attempted(
+        state, "hash_cracking", "ad_hash_cracking"
+    )
+    hash_cracked = bool(knowledge.get("hash_cracked"))
     return ADContext(
         domain=domain,
         target=_target(state, domain),
@@ -151,6 +184,10 @@ def derive_context(state: dict[str, Any]) -> ADContext:
         identity_complete=identity_complete,
         asrep_attempted=asrep_attempted,
         asrep_succeeded=_successful(asrep_items),
+        asrep_hash_file=asrep_hash_file,
+        hash_cracking_attempted=hash_cracking_attempted,
+        hash_cracked=hash_cracked,
+        wordlist=_wordlist_path(),
         domain_users_attempted=_attempted(state, "ad_domain_users"),
         spns=tuple(sorted({str(value) for value in knowledge.get("spns", [])})),
         kerberoast_attempted=_attempted(state, "kerberoast"),
@@ -176,6 +213,32 @@ def recommend(state: dict[str, Any]) -> Decision | None:
         return None
 
     if not context.has_credentials and not context.credentials_validated:
+        if context.asrep_hash_file and not context.hash_cracking_attempted:
+            if not context.wordlist:
+                return Decision(
+                    next_agent="end", objective="human_help", action="provide_cracking_wordlist",
+                    target=context.target,
+                    justification=(
+                        "AS-REP hash material was recovered, but no approved local wordlist is available. "
+                        "Set CYBERQA_AD_WORDLIST before cracking; do not place the hash or password in chat."
+                    ),
+                )
+            return Decision(
+                next_agent=Role.TESTING,
+                objective="assess recovered AS-REP credential material",
+                action="hash_cracking_assessment",
+                target=context.target,
+                justification=(
+                    "AS-REP hash material was recovered. Run the reviewed, approval-gated local cracking "
+                    "assessment, then validate any recovered credential before authenticated reconnaissance."
+                ),
+                capability="hash_cracking_assessment",
+                expected_evidence=["crack_status", "cracked_account_or_not_found"],
+                tool_parameters=ToolParameters(
+                    hash_file=context.asrep_hash_file,
+                    wordlist=context.wordlist,
+                ),
+            )
         if context.username_source and not context.asrep_attempted:
             params = {"users": list(context.users[:500])} if context.users else {}
             configured_file = context.username_file

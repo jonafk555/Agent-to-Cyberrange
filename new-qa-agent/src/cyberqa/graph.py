@@ -15,7 +15,7 @@ def _memory_saver() -> MemorySaver:
     allowed = [
         ("cyberqa.models", name) for name in (
             "ADKnowledge", "ADRisk", "ApprovalRequest", "AttackPath", "CapabilitySpec",
-            "Decision", "Evidence", "Event", "Host", "Hypothesis", "Role", "Scorecard", "ToolParameters",
+            "Decision", "Evidence", "EvidenceAnalysis", "EvidenceLevel", "EvidenceSufficiency", "Event", "Host", "HumanIntent", "Hypothesis", "QAAssertion", "Role", "Scorecard", "ToolParameters", "VisibilityMode",
             "Service", "ServiceProtocol",
         )
     ]

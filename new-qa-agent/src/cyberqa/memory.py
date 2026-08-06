@@ -41,9 +41,11 @@ class ObservationStore:
         self.connection.commit()
 
     @staticmethod
-    def signature(tool: str, target: str, action: str, parameters: Any = None) -> str:
-        payload = json.dumps({"tool": tool, "target": target, "action": action,
-                              "parameters": parameters or {}}, sort_keys=True, default=str)
+    def signature(tool: str, target: str, action: str, parameters: Any = None,
+                  namespace: str = "") -> str:
+        payload = json.dumps({"namespace": namespace, "tool": tool, "target": target,
+                              "action": action, "parameters": parameters or {}},
+                             sort_keys=True, default=str)
         return hashlib.sha256(payload.encode()).hexdigest()[:20]
 
     def get(self, signature: str) -> dict[str, Any] | None:

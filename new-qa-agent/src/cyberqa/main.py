@@ -16,6 +16,13 @@ from dotenv import dotenv_values, load_dotenv
 from .graph import build_graph
 from .llm import build_llm
 from .nodes import Agents
+from .intent import parse_human_intent
+from .qa_assessment import (
+    build_bootstrap_assertions,
+    load_specification_assertions,
+    parse_visibility_mode,
+    refresh_assessment,
+)
 from .tools import build_kali_registry, is_local_target, summarize_output
 
 
@@ -32,7 +39,9 @@ def write_initial_recon_report(values: dict, scenario_id: str) -> str:
     report_dir = Path(os.getenv("CYBERQA_REPORT_DIR", "reports"))
     report_dir.mkdir(parents=True, exist_ok=True)
     path = report_dir / f"{scenario_id}-initial-recon.md"
-    evidence = [item for item in values.get("evidence", []) if getattr(item, "action", "") == "initial_recon"]
+    evidence = [item for item in values.get("evidence", []) if getattr(item, "action", "") in {
+        "initial_recon", "runner_identity"
+    }]
     lines = [f"# Cyber Range QA Runner Bootstrap — {scenario_id}", "",
              f"Generated: {datetime.now(timezone.utc).isoformat()}",
              f"Target: `{values.get('target', 'not specified')}`", "",
@@ -58,6 +67,15 @@ def write_initial_recon_report(values: dict, scenario_id: str) -> str:
                   json.dumps(values.get("target_profiles", {}), indent=2, ensure_ascii=False, default=str),
                   "```", "", "## Evidence synthesis", "", "```json",
                   json.dumps(values.get("evidence_synthesis", {}), indent=2, ensure_ascii=False, default=str),
+                  "```", "", "## QA visibility and assertions", "", "```json",
+                  json.dumps({
+                      "visibility_mode": values.get("visibility_mode"),
+                      "specification_available": values.get("specification_available", False),
+                      "assertions": values.get("qa_assertions", []),
+                      "evidence_sufficiency": values.get("evidence_sufficiency", []),
+                  }, indent=2, ensure_ascii=False, default=str),
+                  "```", "", "## Post-tool evidence analyses", "", "```json",
+                  json.dumps(values.get("evidence_analyses", []), indent=2, ensure_ascii=False, default=str),
                   "```", ""])
     for item in evidence:
         lines.extend([
@@ -83,7 +101,7 @@ def write_initial_recon_report(values: dict, scenario_id: str) -> str:
         ])
     path.write_text("\n".join(lines), encoding="utf-8")
     return str(path)
-from .models import ADKnowledge
+from .models import ADKnowledge, VisibilityMode
 
 
 def interrupt_payload(value) -> dict:
@@ -137,6 +155,23 @@ def print_progress(event: str, data: dict) -> None:
     elif event == "tool_cached":
         print(f"[Tool] 快取命中：{data['tool']} target={data['target']} "
               f"signature={data['signature']}", flush=True)
+    elif event == "evidence_analysis":
+        print("[Evidence] 指令結果分析：", flush=True)
+        useful = data.get("useful_content", []) or []
+        unresolved = data.get("unresolved_questions", []) or []
+        candidates = data.get("candidate_tools", []) or []
+        for item in useful:
+            print(f"  可用內容：{item}", flush=True)
+        for item in unresolved:
+            print(f"  尚未解決：{item}", flush=True)
+        if data.get("no_new_information"):
+            print("  新資訊判定：沒有超出既有 evidence 的新內容，應改選不同路徑。", flush=True)
+        print(f"  可考慮工具：{', '.join(candidates) or '目前沒有新的已核准工具'}", flush=True)
+        if data.get("recommended_action"):
+            target = data.get("recommended_target") or "未指定"
+            print(f"  Agent 建議：action={data['recommended_action']} target={target}", flush=True)
+        if data.get("reason"):
+            print(f"  判斷理由：{data['reason']}", flush=True)
     elif event == "target_discovered":
         print(f"[Target] 發現並加入授權清單：{data['target']}", flush=True)
     elif event == "agent_done":
@@ -157,6 +192,15 @@ def parse_args() -> argparse.Namespace:
         default=int(os.getenv("CYBERQA_MAX_ITERATIONS", "8")),
         help="legacy telemetry hint; it does not stop autonomous Supervisor routing",
     )
+    parser.add_argument("--max-model-calls", type=int,
+                        default=int(os.getenv("CYBERQA_MAX_MODEL_CALLS", "120")),
+                        help="Per-task model-call budget; Human is requested only at a real budget boundary")
+    parser.add_argument("--max-tool-calls", type=int,
+                        default=int(os.getenv("CYBERQA_MAX_TOOL_CALLS", "240")),
+                        help="Per-task tool-call budget")
+    parser.add_argument("--max-context-chars", type=int,
+                        default=int(os.getenv("CYBERQA_MAX_CONTEXT_CHARS", "120000")),
+                        help="Maximum serialized evidence context sent to one model call")
     parser.add_argument("--allowed-targets", default=None,
                         help="Comma-separated allowlist; defaults to CYBERQA_ALLOWED_TARGETS")
     parser.add_argument("--once", action="store_true",
@@ -166,6 +210,43 @@ def parse_args() -> argparse.Namespace:
         help="Clear the durable effective-command observation cache before this run",
     )
     return parser.parse_args()
+
+
+def graph_recursion_limit(args: argparse.Namespace) -> int:
+    """Set a graph safety ceiling from resource budgets, not task iterations."""
+    configured = os.getenv("CYBERQA_GRAPH_RECURSION_LIMIT", "").strip()
+    if configured:
+        try:
+            value = int(configured)
+            if value > 0:
+                return value
+        except ValueError:
+            pass
+    model_calls = max(0, int(getattr(args, "max_model_calls", 0)))
+    tool_calls = max(0, int(getattr(args, "max_tool_calls", 0)))
+    # A graph superstep is not the same thing as an iteration or a tool call:
+    # Supervisor, specialist, evidence analysis, approval, and recovery can
+    # each consume separate steps. Leave headroom while retaining a finite
+    # outer guard; the actual model/tool budgets remain the primary limits.
+    return max(128, model_calls + tool_calls + 64)
+
+
+def build_task_assertions(
+    objective: str,
+    target: str,
+    visibility: VisibilityMode,
+    specification_reference: str | None = None,
+) -> list[dict]:
+    """Materialize objective/spec assertions before the graph starts."""
+    bootstrap = build_bootstrap_assertions(objective, target, visibility)
+    specified = load_specification_assertions(
+        specification_reference, target, visibility
+    )
+    by_id = {item.id: item for item in bootstrap}
+    # An explicit specification replaces same-id objective bootstrap records,
+    # while retaining the environment baseline as a minimum control question.
+    by_id.update({item.id: item for item in specified})
+    return [item.model_dump(mode="json") for item in by_id.values()]
 
 
 async def run(args: argparse.Namespace | None = None) -> None:
@@ -188,8 +269,8 @@ async def run(args: argparse.Namespace | None = None) -> None:
     if args.clear_observation_cache:
         removed = registry.observations.clear()
         print(f"[Cache] cleared observations={removed}", flush=True)
-    app = build_graph(Agents(llm=build_llm(), tools=registry,
-                             on_progress=print_progress))
+    agents = Agents(llm=build_llm(), tools=registry, on_progress=print_progress)
+    app = build_graph(agents)
     async def stream_graph(input_state, task_config):
         """Stream graph updates while the LLM remains the decision-maker."""
         interrupt_value = None
@@ -235,11 +316,43 @@ async def run(args: argparse.Namespace | None = None) -> None:
         return snapshot.values, interrupt_value
 
     async def execute_task(objective: str, target: str, scenario_id: str):
-        task_config = {"configurable": {"thread_id": str(uuid4())}}
+        task_config = {
+            "configurable": {"thread_id": str(uuid4())},
+            "recursion_limit": graph_recursion_limit(args),
+        }
         runtime_config, safe_objective = Agents._apply_human_config(objective)
         task_objective = safe_objective or objective
-        initial = {"run_id": str(uuid4()), "scenario_id": scenario_id, "objective": task_objective,
+        run_id = str(uuid4())
+        registry.set_cache_namespace(f"{scenario_id}:{run_id}")
+        registry.begin_run(run_id, args.max_tool_calls)
+        agents.begin_run(run_id, args.max_model_calls)
+        parsed_intent = parse_human_intent(task_objective, {"target": target})
+        specification_path = os.getenv("CYBERQA_SPEC_PATH", "")
+        specification_available = bool(
+            specification_path and Path(specification_path).expanduser().is_file()
+        )
+        visibility = parse_visibility_mode(
+            os.getenv("CYBERQA_VISIBILITY_MODE"), specification_available
+        )
+        task_assertions = build_task_assertions(
+            task_objective, target, visibility, specification_path or None
+        )
+        _, initial_sufficiency = refresh_assessment(task_assertions, [], [])
+        initial = {"run_id": run_id, "scenario_id": scenario_id, "objective": task_objective,
                    "target": target, "iteration": 0, "max_iterations": args.max_iterations,
+                   "visibility_mode": visibility.value,
+                   "specification_available": specification_available,
+                   "specification_reference": specification_path or None,
+                   "environment_model": {
+                       "visibility": visibility.value,
+                       "expected_source": "specification" if specification_available else None,
+                       "actual": {},
+                   },
+                   "qa_assertions": task_assertions,
+                   "evidence_sufficiency": initial_sufficiency,
+                   "model_calls": 0, "tool_calls": 0,
+                   "max_model_calls": args.max_model_calls, "max_tool_calls": args.max_tool_calls,
+                   "max_context_chars": args.max_context_chars,
                    "hosts": {}, "evidence": [], "events": [], "approvals": [], "action_history": [],
                    "replan_count": 0,
                    "autonomous_replan_count": 0, "autonomous_continuation_required": False,
@@ -254,7 +367,11 @@ async def run(args: argparse.Namespace | None = None) -> None:
                    "runner_ips": [],
                    "discovered_targets": [target], "recon_coverage": {},
                    "ad_knowledge": ADKnowledge().model_dump(), "capability_history": [],
-                   "target_profiles": {}, "evidence_synthesis": {}, "runtime_config": runtime_config,
+                   "target_profiles": {}, "evidence_synthesis": {}, "evidence_analyses": [],
+                   "evidence_opportunities": [],
+                   "human_intent": parsed_intent.model_dump(mode="json"),
+                   "task_plan": Agents._task_plan_from_intent(parsed_intent),
+                   "runtime_config": runtime_config,
                    "human_instruction": task_objective,
                    "human_directives": [{
                        "instruction": task_objective, "source": "human",
@@ -285,6 +402,7 @@ async def run(args: argparse.Namespace | None = None) -> None:
             try:
                 if request.get("synthetic"):
                     runtime_config, safe_answer = Agents._apply_human_config(answer)
+                    parsed_intent = parse_human_intent(safe_answer, {"target": target})
                     result, interrupt_value = await stream_graph({
                         "needs_human": False,
                         "human_directive": False,
@@ -293,6 +411,8 @@ async def run(args: argparse.Namespace | None = None) -> None:
                             "instruction": safe_answer, "source": "human",
                             "intent": "semantic_guidance",
                         }],
+                        "human_intent": parsed_intent.model_dump(mode="json"),
+                        "task_plan": Agents._task_plan_from_intent(parsed_intent),
                         "runtime_config": runtime_config,
                         "no_progress_count": 0,
                         "replan_count": 0,
