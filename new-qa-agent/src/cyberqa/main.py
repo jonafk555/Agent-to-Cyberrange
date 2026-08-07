@@ -172,6 +172,20 @@ def print_progress(event: str, data: dict) -> None:
             print(f"  Agent 建議：action={data['recommended_action']} target={target}", flush=True)
         if data.get("reason"):
             print(f"  判斷理由：{data['reason']}", flush=True)
+    elif event == "usable_content":
+        # Compact one-line echo per tool result. The full useful_content is
+        # already rendered by the ``evidence_analysis`` handler above, so here we
+        # only surface a terse summary (count + source/target + next action).
+        items = data.get("usable_content", []) or []
+        head = items[0] if items else "無新的結構化內容"
+        suffix = f"（共 {len(items)} 條）" if len(items) > 1 else ""
+        note = "｜無新資訊" if data.get("no_new_information") else ""
+        action = data.get("recommended_action")
+        action_note = f"｜建議 action={action}" if action else ""
+        print(
+            f"[可用內容] {data.get('source')}@{data.get('target')}：{head}{suffix}{note}{action_note}",
+            flush=True,
+        )
     elif event == "target_discovered":
         print(f"[Target] 發現並加入授權清單：{data['target']}", flush=True)
     elif event == "agent_done":

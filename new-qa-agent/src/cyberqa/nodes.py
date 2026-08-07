@@ -29,19 +29,20 @@ from .qa_assessment import refresh_assessment
 from .state import QAState
 from .tools import LOCAL_EXECUTION_TARGET, ToolRegistry, is_local_target
 from .intent import parse_human_intent
+from .knowledge import build_planner_context
 
 
-AD_QA_PLAYBOOK = """For an AD range, derive the QA assertions from the operator objective and any
-available specification. Do not assume every range requires the same domain-controller inventory or a
-complete attack chain. Start with the least-invasive evidence that can answer the current assertion:
-domain, DNS, LDAP, Kerberos, SMB, SPNs, delegation, ACL, AD CS, trust, endpoint, or attack-path facts
-are separate questions, not a mandatory sequence. Stop escalation when the assertion's required evidence
-level is met. Use controlled exploit or end-to-end validation only when the assertion explicitly requires
-it. Never invent credentials or claim exploitability; label facts as proven, blocked, unknown, or
-insufficient. Prefer a different target/service or diagnostic probe over repeating a cached command.
+AD_QA_REFERENCE = """Optional Active Directory reference (background material, NOT a mandatory sequence
+and NOT the driving order): when an assertion happens to concern AD, these are separate questions you may
+consult — domain, DNS, LDAP, Kerberos, SMB, SPNs, delegation, ACL, AD CS, trust, endpoint, or attack-path
+facts. Start with the least-invasive evidence that answers the current assertion and stop escalation when
+its required evidence level is met. Use controlled exploit or end-to-end validation only when the assertion
+explicitly requires it. Never invent credentials or claim exploitability; label facts as proven, blocked,
+unknown, or insufficient. Prefer a different target/service or diagnostic probe over repeating a cached
+command. Ignore any item here that the live evidence does not call for.
 """
 
-SYSTEM = AD_QA_PLAYBOOK + """You are a cyber-range QA specialist operating only on authorized targets. Use OODA:
+_BUILTIN_OODA_GUIDANCE = """You are a cyber-range QA specialist operating only on authorized targets. Use OODA:
 observe facts, orient against the objective and prior evidence, decide one justified action, and act
 through the supplied fact-only tools. Inspect every tool result before selecting the next tool and expose
 the usable content, unresolved questions, and candidate reviewed tools in a compact evidence analysis.
@@ -57,6 +58,52 @@ credential-validation tools when their prerequisites are met; this is one possib
 workflow definition. Do not assume a fixed next step, and never treat a hash as a password. If the
 current assertion is already sufficiently evidenced at C2 or C3, do not escalate to C4/C5 merely because
 an attack tool is available."""
+
+# Diff A: the scenario/system prompt is externalized to templates/scenario.md so a
+# new range or domain can be onboarded by editing that file instead of this module.
+# CYBERQA_SCENARIO_PATH overrides the location; if the file is missing, empty, or
+# unreadable we fall back to the built-in string so existing behavior is preserved.
+#
+# Diff E: the OODA autonomy guidance is the invariant base of every built-in
+# prompt, so "reason forward from evidence, no fixed next step" is guaranteed by
+# construction rather than by a prose plea. The AD-specific playbook is no longer
+# a mandatory prefix that competes with that autonomy; it is appended only when an
+# AD scenario is actually indicated (CYBERQA_AD_DOMAIN / CYBERQA_AD_BASE_DN), and
+# even then it is framed as optional reference placed AFTER the autonomy base so
+# the autonomy framing dominates. Non-AD ranges get a clean task-agnostic base.
+def _ad_reference_indicated() -> bool:
+    return bool(
+        os.environ.get("CYBERQA_AD_DOMAIN")
+        or os.environ.get("CYBERQA_AD_BASE_DN")
+    )
+
+
+def _builtin_system() -> str:
+    if _ad_reference_indicated():
+        return _BUILTIN_OODA_GUIDANCE + "\n\n" + AD_QA_REFERENCE
+    return _BUILTIN_OODA_GUIDANCE
+
+
+_BUILTIN_SYSTEM = _builtin_system()
+
+
+def load_scenario_prompt() -> str:
+    candidates: list[Path] = []
+    override = os.environ.get("CYBERQA_SCENARIO_PATH")
+    if override:
+        candidates.append(Path(override))
+    candidates.append(Path(__file__).resolve().parents[2] / "templates" / "scenario.md")
+    for path in candidates:
+        try:
+            text = path.read_text(encoding="utf-8").strip()
+        except (OSError, ValueError):
+            continue
+        if text:
+            return text
+    return _BUILTIN_SYSTEM
+
+
+SYSTEM = load_scenario_prompt()
 
 
 def _is_abort_instruction(text: str) -> bool:
@@ -345,6 +392,18 @@ class Agents:
             analysis.recommended_target = self._redact_analysis_text(analysis.recommended_target, 400)
         payload = analysis.model_dump(mode="json")
         self.progress("evidence_analysis", **payload)
+        # Concise per-result echo so the operator sees the usable content of each
+        # tool result in the stream without expanding the full analysis payload.
+        # This is advisory display only; it does not alter the analysis or state.
+        self.progress(
+            "usable_content",
+            evidence_id=evidence.id,
+            source=evidence.source,
+            target=evidence.target,
+            no_new_information=analysis.no_new_information,
+            usable_content=analysis.useful_content[:6],
+            recommended_action=analysis.recommended_action,
+        )
         return payload
 
     @staticmethod
@@ -474,6 +533,32 @@ class Agents:
             }
         return coverage
 
+    def _derive_discovered_targets(self, state: QAState, all_evidence: list[Evidence]) -> list[str]:
+        """Diff F: single source of truth for discovered_targets.
+
+        Previously two nodes each grew their own ``discovered_targets`` set from
+        prior state, letting the value drift depending on which node last ran.
+        The projection now derives it once from the cumulative evidence ledger so
+        every planning decision reads the same set. Prior state is included so a
+        host that was discovered in an earlier turn is never silently dropped.
+        """
+        discovered: set[str] = {
+            str(item) for item in state.get("discovered_targets", [])
+            if not self._is_runner_target(state, str(item))
+        }
+        for observed in all_evidence:
+            if not self._is_runner_target(state, observed.target):
+                discovered.add(str(observed.target))
+            facts = observed.facts if isinstance(observed.facts, dict) else {}
+            for host in _fact_values(facts.get("discovered_targets")):
+                host_str = str(host)
+                if (
+                    not self._is_runner_target(state, host_str)
+                    and self.tools.target_policy.allows(host_str)
+                ):
+                    discovered.add(host_str)
+        return sorted(discovered)
+
     def _project_observations(self, state: QAState, new_evidence: list[Evidence]) -> dict[str, Any]:
         """Build one cumulative view used by every future planning decision."""
         all_evidence = [*state.get("evidence", []), *new_evidence]
@@ -544,7 +629,8 @@ class Agents:
             knowledge["domain"] = knowledge["domains"][0]
         return {"target_profiles": profiles, "evidence_synthesis": synthesis,
                 "runtime_config": runtime, "ad_knowledge": knowledge,
-                "recon_coverage": recon_coverage}
+                "recon_coverage": recon_coverage,
+                "discovered_targets": self._derive_discovered_targets(state, all_evidence)}
 
     @staticmethod
     def _known_prerequisites(state: QAState) -> set[str]:
@@ -624,19 +710,55 @@ class Agents:
             return fallback
 
     @staticmethod
-    def _conversation_context(messages: list[Any]) -> list[Any]:
+    def _conversation_context(messages: list[Any], window: int = 20) -> list[Any]:
         """Keep only messages valid as outer conversational context.
 
         Tool messages belong to the ReAct subgraph that created them. Passing
         an orphan ToolMessage into a new OpenAI request causes a 400 error.
         Tool results remain available to the current inner loop and are also
         projected into the durable evidence list.
+
+        Diff D: instead of silently truncating to the last ``window`` messages,
+        fold the overflow into a rolling summary so long-horizon runs keep the
+        gist of earlier turns without unbounded context growth. The summary is
+        deterministic (no model call), so it is cheap and testable.
         """
-        return [
-            message for message in messages[-20:]
+        eligible = [
+            message for message in messages
             if not isinstance(message, ToolMessage)
             and not getattr(message, "tool_calls", None)
         ]
+        if len(eligible) <= window:
+            return eligible
+
+        overflow, recent = eligible[:-window], eligible[-window:]
+        summary = Agents._summarize_history(overflow)
+        return [SystemMessage(content=summary), *recent] if summary else recent
+
+    @staticmethod
+    def _summarize_history(messages: list[Any]) -> str:
+        """Compress older conversation turns into a compact rolling summary.
+
+        Deterministic: counts messages by role and keeps a short tail of each
+        older message so key facts survive compaction without replaying the
+        full transcript.
+        """
+        if not messages:
+            return ""
+        by_role: dict[str, int] = {}
+        snippets: list[str] = []
+        for message in messages:
+            role = type(message).__name__.replace("Message", "").lower() or "msg"
+            by_role[role] = by_role.get(role, 0) + 1
+            content = getattr(message, "content", "")
+            if isinstance(content, str) and content.strip():
+                snippets.append(f"[{role}] {content.strip()[:200]}")
+        counts = ", ".join(f"{n} {role}" for role, n in sorted(by_role.items()))
+        lines = [
+            f"## Rolling summary of {len(messages)} earlier compacted messages ({counts})",
+            *snippets[-8:],
+        ]
+        return "\n".join(lines)
 
     @staticmethod
     def _react_context(messages: list[Any]) -> list[Any]:
@@ -780,14 +902,26 @@ class Agents:
                     "You are the workflow supervisor for an authorized cyber-range QA agent. "
                     "Choose dynamically based on the conversation and evidence. Tool failures are "
                     "diagnostic evidence: send them to debugging, do not blindly repeat them. "
-                    "Choose the next unresolved QA assertion and the least-invasive reviewed capability "
-                    "that can raise its evidence level; fill prerequisites, expected_evidence, risk, "
-                    "tool_parameters, and next_options. You may propose a multi-step chain only when the "
-                    "assertion requires it; the execution broker "
-                    "will enforce scope and approvals. Treat the latest operator instruction as an explicit constraint, "
-                    "not optional context. "
+                    "First read the pending leads (evidence_opportunities) and the discovered facts, "
+                    "then pursue the highest-value attack lead that the latest results opened, extending "
+                    "autonomously from what the evidence actually revealed (e.g. a discovered SPN invites "
+                    "Kerberoasting, an anonymous LDAP bind invites user enumeration, a new host invites "
+                    "service enumeration). Reason forward from results to the next reviewed capability; "
+                    "do not restart from a fixed checklist each turn. QA assertions are scoring criteria, "
+                    "not your driving order. Choose the least-invasive reviewed capability that extends the "
+                    "chosen lead and fill prerequisites, expected_evidence, risk, tool_parameters, and "
+                    "next_options. You may propose a multi-step chain when the lead requires it; the "
+                    "execution broker will enforce scope and approvals. Only choose next_agent='end' or "
+                    "'human_help' when NO pending lead and NO reviewed capability can further extend the "
+                    "current evidence — human help is a last resort for when the agent has genuinely no "
+                    "path, not a substitute for autonomous reasoning. "
+                    "Treat the latest operator instruction as an explicit constraint, not optional context. "
                     "Do not execute tools. Return a Decision object."
             )),
+            # Diff B/C: give the strategic brain a compact cross-turn knowledge
+            # digest plus non-prescriptive reasoning leads, so it orients from
+            # accumulated facts and hints rather than a fixed pipeline.
+            SystemMessage(content=build_planner_context(state)),
             *self._conversation_context(state.get("messages", [])),
             HumanMessage(content=prompt),
         ])
@@ -1309,14 +1443,9 @@ class Agents:
             await self.events.publish(event)
         except Exception:
             pass
+        # Diff F: discovered_targets is derived once inside the projection from the
+        # cumulative evidence ledger; this node no longer maintains its own set.
         projection = self._project_observations(state, evidence)
-        discovered = {
-            str(item) for item in state.get("discovered_targets", [])
-            if not is_local_target(str(item))
-        }
-        for item in evidence:
-            if not is_local_target(item.target):
-                discovered.add(item.target)
         method_history = list(state.get("method_history", []))
         for observed in evidence:
             method_history.append({
@@ -1331,7 +1460,7 @@ class Agents:
                 "tool_result": (observed.facts or {}).get("tool_result"),
             })
         return {"evidence": evidence, "events": [event], "baseline_complete": True,
-                "observation_index": observation_index, "discovered_targets": sorted(discovered),
+                "observation_index": observation_index,
                 "runner_ips": sorted(runner_ips),
                 "method_history": method_history[-200:],
                 **projection,
@@ -2925,21 +3054,12 @@ class Agents:
             self.progress("event_error", event_type=event.type, error=str(exc))
             proposal.setdefault("event_error", str(exc))
         self.progress("agent_done", agent=role.value, evidence_count=len(evidence), target=target)
-        discovered_targets = {
-            str(item) for item in state.get("discovered_targets", [])
-            if not self._is_runner_target(state, str(item))
-        }
+        # Diff F: discovered_targets is derived once inside the projection from the
+        # cumulative evidence ledger; this node no longer maintains its own set.
         ad_knowledge = dict(state.get("ad_knowledge", {}))
         ad_knowledge.setdefault("coverage", {})
         for observed in evidence:
-            if not self._is_runner_target(state, observed.target):
-                discovered_targets.add(observed.target)
             facts = observed.facts if isinstance(observed.facts, dict) else {}
-            discovered_targets.update(
-                str(host) for host in _fact_values(facts.get("discovered_targets"))
-                if not self._is_runner_target(state, str(host))
-                and self.tools.target_policy.allows(str(host))
-            )
             coverage = set()
             for service in _fact_values(facts.get("open_ports")):
                 if not isinstance(service, dict):
