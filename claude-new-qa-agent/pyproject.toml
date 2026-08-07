@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cyber-range-qa"
+version = "0.1.0"
+description = "Autonomous, evidence-driven cyber range QA platform built on LangGraph"
+requires-python = ">=3.11"
+dependencies = [
+  "langgraph>=0.2.0",
+  "langchain-core>=0.3.0",
+  "langchain-openai>=0.2.0",
+  "pydantic>=2.7.0",
+  "pydantic-settings>=2.4.0",
+  "python-dotenv>=1.0.0",
+  "redis>=5.0.0",
+  "neo4j>=5.24.0",
+  "aio-pika>=9.4.0",
+  "impacket>=0.12.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "pytest-asyncio>=0.24.0", "ruff>=0.6.0", "mypy>=1.11.0"]
+
+[project.scripts]
+cyberqa = "cyberqa.main:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+asyncio_mode = "auto"
