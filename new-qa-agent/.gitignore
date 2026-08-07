@@ -2,6 +2,8 @@
 .env.*
 !.env.example
 reports/
+runs/
+build/
 __pycache__/
 *.py[cod]
 .pytest_cache/

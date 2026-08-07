@@ -1,2 +1,5 @@
 [console_scripts]
-cyberqa = cyberqa.main:main
+cyberqa = cyberqa.cli.cochise:main
+cyberqa-analyze-graphs = cyberqa.cli.analyze_json_graphs:main
+cyberqa-analyze-logs = cyberqa.cli.analyze_json_logs:main
+cyberqa-replay = cyberqa.cli.cochise_replay:main

@@ -1,135 +1,111 @@
-# Implementation notes
+# Cochise core plus Cyber Range QA extensions
 
-## Dynamic control loop
+The execution semantics are Cochise. Cyber Range QA is an optional
+observational layer around that loop, not a competing planner or permission
+system.
 
-The compiled graph is intentionally small because the behavior is not encoded in edge order:
+## Control loop
 
-```text
-                 +------------------+
-                 |    supervisor    |  (only controller)
-                 +---------+--------+
-                           |
-        +------------------+------------------+
-        |                  |                  |
-   validation         testing/debugging   judge/reporting
-        |                  |                  |
-        +------------------+------------------+
-                           |
-                    approval (policy)
-                           |
-                       supervisor
-```
+~~~text
+Red-team scenario + optional range reference
+                    ↓
+Planner creates or compacts the attack plan
+                    ↓
+Planner calls perform_task or asks the human
+                    ↓
+Fresh Executor reasons about one task
+                    ↓
+Executor calls execute_command over persistent SSH
+                    ↓
+Real output becomes the next tool message
+                    ↓
+Knowledge merges credentials, entities, and findings
+                    ↓
+Planner selects the next task
+~~~
 
-The supervisor receives current evidence, unresolved goals, prior action signatures, hypotheses, repair history, and the scenario objective. It returns exactly one `Decision`. A specialist can collect facts and emit a proposal, but cannot choose the next node. The `route` function only interprets the supervisor's decision.
+The Planner owns long-lived history and knowledge. Every task receives a fresh
+Executor, so the Executor can focus on the current hypothesis while still
+seeing the accumulated findings. This is the mechanism that lets the agent
+change direction after a failed command or a newly discovered credential.
 
-## Assertion and evidence sufficiency control
+## Cochise contracts
 
-The Supervisor is not driven by a fixed attack chain. A task contains `QAAssertion` records with a visibility mode and required evidence threshold. `EvidenceSufficiency` compares the assertion against durable evidence and exposes the least-invasive remaining methods:
+Planner tools:
 
-```text
-QA objective/specification
-        ↓
-QAAssertion (what must be answered, target, required C-level)
-        ↓
-Evidence + EvidenceOpportunity memory
-        ↓
-EvidenceSufficiency (current level, missing facts, next methods)
-        ↓
-Supervisor selects one distinct authorized Decision
-        ↓
-Tool Gateway / approval / audit
-```
+- perform_task: assign one concrete red-team task to a fresh Executor;
+- ask_human: pause when a required artifact is missing, an approach is
+  exhausted, or the next decision needs operator input;
+- add/update compromised account;
+- add/update entity information.
 
-The levels are C0 Unknown, C1 Inferred, C2 Enumerated, C3 Functionally Verified, C4 Exploitability Verified, and C5 End-to-End Verified. The completion gate uses these thresholds for new tasks: an assertion that only needs configuration evidence can finish at C2, while an explicitly requested end-to-end attack-path assertion remains open until C5. This prevents an available credential-material or exploit tool from becoming an automatic escalation.
+Executor tools:
 
-## AD decision contract
+- execute_command: arbitrary command execution on the configured SSH target,
+  annotated with MITRE technique/procedure;
+- ask_human;
+- the four knowledge update functions.
 
-AD method selection has a deterministic prerequisite/completion guard between the model and the broker. The model remains the Supervisor and may choose any concrete safe non-terminal path; the guard only prevents unsafe prerequisites, premature terminal transitions, and repeated no-op planning:
+The LLM receives tool results as tool messages and continues the
+observe-act loop. Prompt text is guidance; the structured tool mapping and
+program control loop are the runtime contract.
 
-```text
-domain/DC + username source + no credential
-    -> Supervisor analyzes each result and ranks available capabilities
-    -> AS-REP, local hash cracking, credential validation, or another justified path
-       (only when its evidence and prerequisites support it)
-    -> remaining bounded identity/recon evidence
-    -> Supervisor chooses the next unresolved path
-    -> judge/report only after the completion gate
-domain/DC + no credential + no username source
-    -> one bounded anonymous LDAP/SMB/NXC-LDAP identity phase
-    -> username source found: AS-REP
-    -> no username source: human help, no guessed accounts or empty-credential loop
-validated credential
-    -> user/SPN enumeration
-    -> Kerberoast only when SPNs exist
-    -> bounded relationship collection
-    -> judge/report
-```
+## Knowledge
 
-Each capability is mapped to one primary reviewed adapter. An approval grant freezes the target, action, capability, parameters, and allowed adapter set for one specialist dispatch. The grant is consumed when that dispatch returns. A cached observation is evidence that the method was already attempted; it is not permission to silently retry it.
+Knowledge is the original Cochise in-memory model. It keeps compromised
+accounts with username, password or hash, context, and a dirty flag. It also
+keeps entity information and merges dirty findings back into the persistent
+Planner. The run JSON log and final report therefore contain sensitive
+engagement material; protect the run directory and do not use this mode
+against an unauthorized system.
 
-`method_history` records the effective tool, target, outcome, argv, and evidence id. The supervisor receives this ledger and the deterministic guard rejects an immediately repeated decision. Failure categories remain distinct: authentication/bind failure, missing username source, invalid arguments, connectivity failure, and tool/runtime failure each produce a different operator-facing next step.
+## Red-team scenario
 
-Each fresh tool result also passes through a post-tool evidence analysis. The analysis is intentionally compact and safe: it records usable content, unresolved questions, candidate reviewed tools, and an evidence-backed suggested next action. It is shown to the operator and stored in `evidence_analyses` for the Supervisor, but remains advisory so the Supervisor can reason across capabilities instead of following a hard-coded pipeline. Cache hits reuse prior evidence without another analysis/model call.
+src/cyberqa/templates/scenario.md contains the AD-oriented operating rules
+ported from Cochise: password spraying, AS-REP roasting, Kerberos and NTLM
+paths, credential/hash handling, attacker VM tooling, artifact recovery, and
+bounded retry guidance. The target network is not hardcoded. Target host,
+account, and any range-specific assumptions come from the environment and
+optional operator context.
 
-In production, bind `Agents._reason` to a structured-output model (`with_structured_output(Decision, method="function_calling")` for the supervisor and role-specific proposal models for specialists). The fallback is intentionally conservative and only observes.
+## QA extension
 
-## Validation contract
+src/cyberqa/qa_extensions.py can load arbitrary JSON/YAML range data. It
+extracts common declarative assertion lists and presents the remaining
+environment metadata to the scenario as reference context. It deliberately
+does not:
 
-Validation is a three-part assertion for every service:
+- create a fixed tool registry;
+- expand the authorized target;
+- turn commands in a document into executable actions;
+- stop the Planner when an assertion is incomplete;
+- redact the Cochise knowledge model.
 
-```json
-{"running": true, "reachable": true, "functional": true}
-```
+At the end of a run it writes qa-assessment.md. The assessment is a
+post-run triage appendix with observed/unverified labels; it is not a
+replacement for raw command evidence or the red-team report.
 
-The service is valid only when all three facts are supported by evidence. Examples: LDAP must complete a bind/search; Kerberos must obtain/validate a ticket; SMB must negotiate and list an authorized share; WinRM must authenticate and execute a harmless command; databases must establish a protocol-level connection; HTTP must return an expected health or challenge marker.
+## Artifacts and replay
 
-## Attack-path contract
+The CLI creates a unique run directory before connecting to the target:
 
-Testing emits an `AttackPath` with `expected_steps`, `observed_steps`, `result`, and `evidence_ids`. It may add `alternatives`; the judge compares path length, prerequisites, and expected flag reachability. A path that is technically exploitable but materially exceeds the intended complexity is `degraded` rather than silently passing.
+~~~text
+<runs-root>/<scenario>_<UTC timestamp>_<short id>/
+├── logs/run-<timestamp>.json
+├── run-meta.json
+├── report.md
+└── qa-assessment.md
+~~~
 
-## Debugging contract
+The JSON file is the Cochise event stream and is compatible with the replay
+and analysis commands. report.md includes the scenario, the final planner
+output, and the full knowledge rendering. The optional QA appendix is kept
+separate so it cannot overwrite red-team findings.
 
-The debugging agent keeps hypotheses as first-class state. A repair is not successful because a command returned zero: it must produce `REPAIR_COMPLETED`, then validation must re-establish the affected functional assertion. The recommended event progression is:
+## Human-in-the-loop
 
-```text
-LDAP_FAILED -> HYPOTHESIS_GENERATED -> EVIDENCE_COLLECTED
--> HYPOTHESIS_VERIFIED -> REPAIR_COMPLETED -> SERVICE_VALIDATED
-```
-
-## Event envelope and RabbitMQ
-
-All events use `Event`: `id`, `type`, `run_id`, `emitted_by`, `timestamp`, `target`, `evidence_ids`, `payload`. Publish to topic exchange `cyberqa.events` with routing keys such as `LDAP_FAILED`, `DNS_FAILED`, `KERBEROS_FAILED`, `FLAG_RETRIEVED`, `ATTACK_PATH_VALIDATED`, `SCENARIO_FAILED`, `REPAIR_COMPLETED`, and `APPROVAL_REQUIRED`. Consumers update projections (Redis), the Neo4j graph, dashboards, and immutable audit storage.
-
-## Example traces
-
-### Attack-path validation
-
-```text
-supervisor: missing evidence for intended Kerberoast path -> testing/request_service_tickets
-testing: expected=[enumerate_spn, request_tgs, crack_or_validate] observed=[enumerate_spn, request_tgs, validate]
-testing: ATTACK_PATH_VALIDATED result=passed evidence=[nmap/ldap/impacket]
-supervisor: compare path complexity -> judge
-judge: solvable=true difficulty=appropriate score=86
-```
-
-### Debugging and repair
-
-```text
-supervisor: LDAP functional assertion failed -> debugging/generate_hypotheses
-debugging: DNS forwarder, time skew, firewall hypotheses
-debugging: evidence ranks DNS forwarder first -> debugging/correct_dns
-debugging: REPAIR_COMPLETED (autonomous action)
-supervisor: revalidate LDAP bind/search -> validation
-validation: SERVICE_VALIDATED functional=true
-```
-
-### Approval workflow
-
-```text
-supervisor: AS-REP or another credential-material capability is selected; policy=approval_required
-approval: APPROVAL_REQUIRED request_id=... status=pending
-human: approve/reject outside the specialist loop
-resume: dispatch the frozen approved decision once; tools verify target, capability, allowed adapter, and exact parameters
-```
-
-To suspend/resume with LangGraph's production checkpointer, compile with a checkpointer and use `interrupt()` in `approval`; the skeleton keeps approval as an explicit node so deployments can select their approval transport (UI, ticketing, or signed API) without changing specialist logic.
+The human interaction implementation is used by both Planner and Executor.
+The Executor detects missing artifact messages from command output and asks
+for a path or guidance. After bounded recovery attempts it asks the human
+again instead of silently inventing a file or assuming that a failed method
+worked. Reply stop, quit, exit, abort, or cancel to end the run.

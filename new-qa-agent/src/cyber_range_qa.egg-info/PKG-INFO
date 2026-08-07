@@ -1,18 +1,18 @@
 Metadata-Version: 2.4
 Name: cyber-range-qa
-Version: 0.1.0
-Summary: Autonomous, evidence-driven cyber range QA platform built on LangGraph
-Requires-Python: >=3.11
-Requires-Dist: langgraph>=0.2.0
-Requires-Dist: langchain-core>=0.3.0
-Requires-Dist: langchain-openai>=0.2.0
-Requires-Dist: pydantic>=2.7.0
-Requires-Dist: pydantic-settings>=2.4.0
-Requires-Dist: python-dotenv>=1.0.0
-Requires-Dist: redis>=5.0.0
-Requires-Dist: neo4j>=5.24.0
-Requires-Dist: aio-pika>=9.4.0
-Requires-Dist: impacket>=0.12.0
+Version: 0.2.0
+Summary: Cochise-compatible autonomous red-team agent with optional Cyber Range QA extensions
+Requires-Python: >=3.12
+Requires-Dist: asyncssh>=2.22.0
+Requires-Dist: jinja2>=3.1.0
+Requires-Dist: litellm>=1.60.0
+Requires-Dist: matplotlib>=3.10.8
+Requires-Dist: numpydoc>=1.10.0
+Requires-Dist: python-dateutil>=2.9.0.post0
+Requires-Dist: python-dotenv>=1.2.2
+Requires-Dist: pyyaml>=6.0
+Requires-Dist: rich>=14.3.3
+Requires-Dist: structlog>=25.5.0
 Provides-Extra: dev
 Requires-Dist: pytest>=8.0; extra == "dev"
 Requires-Dist: pytest-asyncio>=0.24.0; extra == "dev"

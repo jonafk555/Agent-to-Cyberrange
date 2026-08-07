@@ -1,113 +1,182 @@
-"""Diff B: a small shared knowledge component.
+# IDEA: the whole knowledge structure is ugly as hell
+# IDEA: use JSON instead of table for transporting knowledge information?
+# IDEA: maybe also add memory for failed attempts
+class Knowledge:
+    def __init__(self, logger):
+        self.compromised_accounts = {}
+        self.entity_information = {}
+        self.counter = 1
+        self.logger = logger
 
-cochise accumulates facts in a cross-turn Knowledge Base so the strategic brain
-reasons over what is already known instead of re-deriving it each turn. Our graph
-state already carries discovered_targets / recon_coverage / evidence_analyses, but
-they are scattered; this module gives the Supervisor one compact, deterministic
-view (a digest) plus the non-prescriptive reasoning leads loaded from templates.
+    def _numeric_key(self, key) -> int | None:
+        """Return the integer value of a key, or None if it is not numeric.
 
-Pure/deterministic: no I/O beyond reading the static leads file once, so it stays
-safe to call on every supervisor turn without polluting context.
-"""
+        The id/index of every entry is supposed to be numeric. The LLM
+        occasionally passes a non-numeric identifier (e.g. a username or entity
+        name) as the key, so we cannot blindly cast keys to int.
+        """
+        try:
+            return int(str(key).strip())
+        except (TypeError, ValueError):
+            return None
 
-from __future__ import annotations
+    def merge(self, other_knowledge):
+        """Merge another Knowledge instance into this one, combining compromised accounts and entity information.
 
-from pathlib import Path
-from typing import Any
+        Parameters
+        ----------
+        other_knowledge : Knowledge
+            Another Knowledge instance whose information should be merged into this one.
+        """
+
+        if not other_knowledge:
+            return
+
+        for key, value in other_knowledge.compromised_accounts.items():
+            if value['dirty']:
+                numeric_key = self._numeric_key(key)
+                if numeric_key is not None and numeric_key >= self.counter:
+                    self.counter = numeric_key + 1
+                self.compromised_accounts[key] = value
+                self.compromised_accounts[key]['dirty'] = False
+
+        for key, value in other_knowledge.entity_information.items():
+            if value['dirty']:
+                numeric_key = self._numeric_key(key)
+                if numeric_key is not None and numeric_key >= self.counter:
+                    self.counter = numeric_key + 1
+                self.entity_information[key] = value
+                self.entity_information[key]['dirty'] = False
+
+    async def add_compromised_account(self, username:str, password:str, context:str):
+        """Save information on identified/compromised account, esp. if you a password or hash has been identified.
+
+        Parameters
+        ----------
+        username : str
+            the username of the identified or compromised account.
+        password : str
+            the account's password or password hash.
+        context : str
+            additional context information on the compromised account.
+        """
+        self.compromised_accounts[self.counter] = {
+                'username': username,
+                'password': password,
+                'context': context,
+                'dirty': True
+        }
+        self.counter += 1
+        self.logger.console.log(f"[red]Knowledge[/red]: Added compromised account {username} with context: {context}")
+        return f"noted compromised account {username} with context: {context}"
+
+    def _resolve_key(self, store: dict, key, identity_field: str, identity_value: str) -> int:
+        """Resolve the integer key of the entry that should be updated.
+
+        Keys are always integers. If ``key`` is numeric and already identifies
+        an existing entry it is used as-is. Otherwise the LLM most likely passed
+        a non-numeric identifier (e.g. the username/entity name) instead of the
+        numeric id from the overview table, so we try to locate the matching
+        entry by its identity field. If nothing matches, a fresh numeric id is
+        allocated so we never store an entry under a non-numeric key.
+        """
+        numeric_key = self._numeric_key(key)
+        if numeric_key is not None and numeric_key in store:
+            return numeric_key
+
+        for existing_key, value in store.items():
+            if value.get(identity_field) == identity_value:
+                return existing_key
+
+        new_key = self.counter
+        self.counter += 1
+        return new_key
+
+    async def update_compromised_account(self, key:int, username:str, password:str, context:str):
+        """Update saved information of a compromised account identified by its numeric id, esp. if you a password or hash has been identified.
+
+        Parameters
+        ----------
+        key : int
+            the numeric account id as given in the overview table
+        username : str
+            the username of the identified or compromised account.
+        password : str
+            the account's password or password hash.
+        context : str
+            additional information/context on the compromised account.
+        """
+        key = self._resolve_key(self.compromised_accounts, key, 'username', username)
+        self.compromised_accounts[key] = {
+                'username': username,
+                'password': password,
+                'context': context,
+                'dirty': True
+        }
+        self.logger.console.log(f"[red]Knowledge[/red]: Updated compromised account {username} with context: {context}")
+        return f"updated account {username} with context: {context}"
 
 
-def load_leads() -> str:
-    """Load the non-prescriptive AD reasoning leads (see leads.md).
+    async def add_entity_information(self, entity:str, information:str):
+        """Note information for an entity (e.g., system or user or service or vulnerability or lead) that might be relevant for a future attack.
 
-    Falls back to an empty string when the file is missing so callers can treat
-    the leads as an optional hint rather than a hard dependency.
-    """
-    path = Path(__file__).resolve().parents[2] / "templates" / "leads.md"
-    try:
-        return path.read_text(encoding="utf-8").strip()
-    except (OSError, ValueError):
-        return ""
+        Parameters
+        ----------
+        entity : str
+            The respective entity, e.g., an user or system or service.
+        information : str
+            The information about the respective entity.
+        """
+        self.entity_information[self.counter]={
+            'entity': entity,
+            'information': information,
+            'dirty': True
+        }
+        self.counter += 1
+        self.logger.console.log(f"[red]Knowledge[/red]: Added information for entity {entity}: {information}")
+        return f"noted information for entity {entity}: {information}"
 
+    async def update_entity_information(self, key: int, entity:str, information:str):
+        """Update information for an entity (e.g., system or user or service or vulnerability or lead) that might be relevant for a future attack.
 
-def build_knowledge_digest(state: dict[str, Any]) -> str:
-    """Summarize accumulated cross-turn facts into a compact digest.
-
-    Deterministic ordering (sorted) so the same knowledge yields the same text,
-    keeping the digest stable across turns and avoiding spurious context churn.
-    """
-    discovered = state.get("discovered_targets") or []
-    coverage = state.get("recon_coverage") or {}
-    analyses = state.get("evidence_analyses") or []
-    open_q = state.get("unresolved_questions") or []
-
-    lines: list[str] = ["## Knowledge base (accumulated facts)"]
-
-    hosts = sorted({str(t) for t in discovered})
-    lines.append(f"Discovered hosts ({len(hosts)}): " + (", ".join(hosts) if hosts else "none yet"))
-
-    if coverage:
-        covered = sorted(f"{k}={v}" for k, v in coverage.items())
-        lines.append("Recon coverage: " + ", ".join(covered))
-    else:
-        lines.append("Recon coverage: none recorded")
-
-    lines.append(f"Evidence analyses recorded: {len(analyses)}")
-
-    if open_q:
-        pending = sorted({str(q) for q in open_q})
-        lines.append("Unresolved questions:")
-        lines.extend(f"  - {q}" for q in pending)
-    else:
-        lines.append("Unresolved questions: none")
-
-    return "\n".join(lines)
+        Parameters
+        ----------
+        key: int
+            the numeric entity id as given in the overview table
+        entity : str
+            The respective entity, e.g., an user or system or service.
+        information : str
+            The information about the respective entity.
+        """
+        key = self._resolve_key(self.entity_information, key, 'entity', entity)
+        self.entity_information[key]={
+            'entity': entity,
+            'information': information,
+            'dirty': True
+        }
+        self.logger.console.log(f"[red]Knowledge[/red]: Updated information for entity {entity}: {information}")
+        return f"noted information for entity {entity}: {information}"
 
 
-def build_knowledge_gaps(state: dict[str, Any]) -> str:
-    """Diff C: make the planner knowledge-gap driven.
+    def get_compromised_accounts_markdown_table(self) -> str:
+        result = "| Id | Username | Password | Context |\n|-----|----------|----------|---------|\n"
+        for key, account in self.compromised_accounts.items():
+            result += f"| {key} | {account['username']} | {account['password']} | {account['context']} |\n"
+        return result
+    def get_entity_information_markdown_table(self) -> str:
+        result = "| Id | Entity | Information |\n|---|----------|---------|\n"
+        for key, entity in self.entity_information.items():
+            result += f"| {key} | {entity['entity']} | {entity['information']} |\n"
+        return result
 
-    Rather than marching a fixed pipeline, surface the open questions the QA
-    still needs answered, ranked so the highest-value gap is first: assertions
-    that are not yet sufficiently evidenced, then explicitly unresolved
-    questions. The planner is asked to pick the next action that closes the
-    most valuable gap; this is guidance, not a mandatory order.
-    """
-    assertions = state.get("qa_assertions") or []
-    sufficiency = state.get("evidence_sufficiency") or {}
-    open_q = state.get("unresolved_questions") or []
-
-    gaps: list[str] = []
-    for assertion in assertions:
-        key = assertion.get("id") if isinstance(assertion, dict) else str(assertion)
-        label = assertion.get("statement", key) if isinstance(assertion, dict) else str(assertion)
-        level = sufficiency.get(key)
-        if level in (None, "insufficient", "partial", False):
-            gaps.append(f"unmet assertion: {label}")
-
-    gaps.extend(f"open question: {q}" for q in sorted({str(q) for q in open_q}))
-
-    lines = ["## Knowledge gaps (drive the next action from these)"]
-    if gaps:
-        lines.extend(f"  {i+1}. {g}" for i, g in enumerate(gaps))
-        lines.append(
-            "Choose the least-invasive reviewed capability that closes the "
-            "highest-value gap above. If every gap is already sufficiently "
-            "evidenced, finish evaluation instead of escalating."
-        )
-    else:
-        lines.append("  none open — objective may be complete; prefer 'end'.")
-    return "\n".join(lines)
-
-
-def build_planner_context(state: dict[str, Any]) -> str:
-    """Combine the accumulated knowledge digest, open gaps, and reasoning leads.
-
-    This is what the Supervisor sees so it orients from known facts, is driven
-    by outstanding knowledge gaps, and uses hints rather than a fixed pipeline.
-    Leads are appended only when available.
-    """
-    parts = [build_knowledge_digest(state), build_knowledge_gaps(state)]
-    leads = load_leads()
-    if leads:
-        parts.append(leads)
-    return "\n\n".join(parts)
+    def get_knowledge(self) -> str:
+        result = ''
+        if len(self.compromised_accounts) > 0:
+            result += "## Compromised Accounts\n\n"
+            result += self.get_compromised_accounts_markdown_table()
+            result += '\n\n'
+        if len(self.entity_information) > 0:
+            result += "## Entity Information\n\n"
+            result += self.get_entity_information_markdown_table()
+            result += "\n\n"
+        return result

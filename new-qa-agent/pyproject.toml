@@ -4,34 +4,45 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cyber-range-qa"
-version = "0.1.0"
-description = "Autonomous, evidence-driven cyber range QA platform built on LangGraph"
-requires-python = ">=3.11"
+version = "0.2.0"
+description = "Cochise-compatible autonomous red-team agent with optional Cyber Range QA extensions"
+requires-python = ">=3.12"
 dependencies = [
-  "langgraph>=0.2.0",
-  "langchain-core>=0.3.0",
-  "langchain-openai>=0.2.0",
-  "pydantic>=2.7.0",
-  "pydantic-settings>=2.4.0",
-  "python-dotenv>=1.0.0",
-  "redis>=5.0.0",
-  "neo4j>=5.24.0",
-  "aio-pika>=9.4.0",
-  "impacket>=0.12.0",
+  "asyncssh>=2.22.0",
+  "jinja2>=3.1.0",
+  "litellm>=1.60.0",
+  "matplotlib>=3.10.8",
+  "numpydoc>=1.10.0",
+  "python-dateutil>=2.9.0.post0",
+  "python-dotenv>=1.2.2",
+  "pyyaml>=6.0",
+  "rich>=14.3.3",
+  "structlog>=25.5.0",
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0", "pytest-asyncio>=0.24.0", "ruff>=0.6.0", "mypy>=1.11.0"]
+dev = [
+  "pytest>=8.0",
+  "pytest-asyncio>=0.24.0",
+  "ruff>=0.6.0",
+  "mypy>=1.11.0",
+]
 
 [project.scripts]
-cyberqa = "cyberqa.main:main"
+cyberqa = "cyberqa.cli.cochise:main"
+cyberqa-replay = "cyberqa.cli.cochise_replay:main"
+cyberqa-analyze-logs = "cyberqa.cli.analyze_json_logs:main"
+cyberqa-analyze-graphs = "cyberqa.cli.analyze_json_graphs:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+cyberqa = ["templates/*.md", "templates/*.jinja2"]
+
 [tool.ruff]
 line-length = 100
-target-version = "py311"
+target-version = "py312"
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]

@@ -1,114 +1,157 @@
-# Cyber Range QA
+# Cyber Range QA — Cochise core
 
-An implementation-ready foundation for an autonomous cyber-range QA platform using LangGraph. It is designed for authorized lab/range environments and separates **facts**, **reasoning**, **state**, and **control**:
+This project is Cochise's autonomous red-team loop plus optional Cyber Range
+QA helpers. It is intended for an explicitly authorized, isolated lab. The
+planner is allowed to choose the next red-team task, the executor is allowed
+to choose and run the next command through SSH, and every result is fed back
+into the next planning decision.
 
-```text
-Supervisor -> Specialist ReAct reason -> ToolNode -> tool result -> reason -> done
-     ^                                                          |
-     +---------------- shared evidence/events ------------------+
-                              |
-                         interrupt() -> Human -> Command(resume=...)
-```
+~~~text
+scenario + optional range reference
+              ↓
+Planner creates/evolves an attack plan
+              ↓
+Executor proposes a hypothesis and calls execute_command
+              ↓
+SSH attacker VM returns real output
+              ↓
+Knowledge stores findings and discovered credentials
+              ↓
+Planner selects the next task or asks the human
+~~~
 
-The supervisor is the only workflow controller. Each specialist binds an allow-listed set of LangChain tools and runs a ReAct loop (`reason -> ToolNode -> reason`) until it has enough facts. Specialists never route to another specialist. Tool wrappers are intentionally fact-only and can be replaced with real SSH/WinRM/PowerShell/Nmap/etc. adapters. Recoverable command failures first return complete evidence to the same Agent, which has a bounded opportunity to correct parameters, choose another reviewed adapter, or pivot to a justified AD path. Only a non-recoverable failure, exhausted repair budget, destructive action, or repeated no-progress path pauses with `interrupt()`; the CLI resumes the checkpoint using `Command(resume=...)`.
+There is no LangChain/LangGraph layer and no fixed QA graph. LiteLLM is the
+provider adapter, so the same agent can use OpenAI, Claude, Gemini, Ollama, or
+another OpenAI-compatible local model.
 
-## Run
+## Run on Kali
 
-```bash
-python -m venv .venv && source .venv/bin/activate
-pip install -e '.[dev]'
-export OPENAI_API_KEY=...
-python examples/trace.py
-pytest
-```
-
-Copy `.env.example` to `.env` to configure the run without placing settings in the command line:
-
-```bash
+~~~bash
+cd /path/to/new-qa-agent
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -e '.[dev]'
 cp .env.example .env
-# edit .env, then run:
+~~~
+
+Set the LLM and the SSH target in .env:
+
+~~~dotenv
+LLM_PROVIDER=openai
+LLM_MODEL=gpt-4o
+OPENAI_API_KEY=...
+
+TARGET_HOST=192.168.56.100
+TARGET_USERNAME=root
+TARGET_PASSWORD=kali
+~~~
+
+The target is the authorized range host reached by the persistent SSH
+connection. The agent does not assume that every range has the same host,
+domain, file layout, or specification.
+
+~~~bash
 python -m cyberqa.main
-```
+~~~
 
-Command-line arguments override `.env`. Keep real API keys and lab credentials in `.env` only for local testing; `.env` is git-ignored. The optional AD variables are configuration references for credential-aware adapters and are not written into reconnaissance reports.
+Each invocation creates a new directory:
 
-The LLM is created in `src/cyberqa/llm.py` and injected into `Agents` from `main.py`:
+~~~text
+runs/<scenario>_<UTC timestamp>_<id>/
+├── logs/run-<timestamp>.json
+├── run-meta.json
+├── report.md
+└── qa-assessment.md       # only when --spec is supplied
+~~~
 
-```bash
-export CYBERQA_LLM_PROVIDER=openai
-export CYBERQA_LLM_MODEL=gpt-4.1-mini
-export OPENAI_API_KEY=sk-...
-python -m cyberqa.main
-```
+The JSON log contains the raw Cochise event stream: configuration, planner and
+executor history, tool calls, tool results, knowledge updates, and completion
+events. Knowledge intentionally retains the credentials that the agent records
+through add_compromised_account, so protect the run directory.
 
-To let the ReAct agents call Kali Linux tools, explicitly authorize the lab targets:
+## Providers
 
-```bash
-export CYBERQA_ALLOWED_TARGETS="10.10.10.0/24"
-python -m cyberqa.main --target 10.10.10.0/24 \
-  --scenario-id ad-lab-01 \
-  --objective "Validate LDAP and test the authorized attack path" \
-  --max-iterations 12
-```
+OpenAI:
 
-The CLI uses LangGraph streaming while the LLM remains the decision-maker. It reports reasoning status, selected tools, command execution, results, and graph state updates without exposing private chain-of-thought. It stays in interactive mode after the task finishes: type a new objective at `你：` to continue the same conversation/checkpoint session; type `exit` or `quit` to leave. Add `--once` for a single non-interactive run.
+~~~dotenv
+LLM_PROVIDER=openai
+LLM_MODEL=gpt-4o
+OPENAI_API_KEY=...
+~~~
 
-`--max-iterations` is retained as a progress/telemetry hint for compatibility; it is not the autonomous stop switch. Repeated effective commands are blocked by the durable observation ledger and sent back to Supervisor for replanning.
+Claude:
 
-The observation cache stores the effective reviewed command identity (adapter, target, action/argv, profile, and non-secret parameters) together with its evidence/result and failure classification; it does not store the LLM's private reasoning. It is saved in SQLite at `CYBERQA_OBSERVATION_DB` (default `.cyberqa/observations.sqlite3`) and survives process restarts. Use `--clear-observation-cache` to clear it before a run, `CYBERQA_OBSERVATION_DB=:memory:` for a temporary empty cache, or `CYBERQA_OBSERVATION_TTL_SECONDS` to expire entries lazily. `force_refresh=True` is available to an explicit API/operator call, but is not model-visible.
+~~~dotenv
+LLM_PROVIDER=claude
+LLM_MODEL=claude-sonnet-4-5
+ANTHROPIC_API_KEY=...
+~~~
 
-After each fresh tool result, the Agent creates a safe post-tool evidence analysis containing usable content, unresolved questions, candidate reviewed tools, and a suggested next action. It is printed immediately and stored in `evidence_analyses` for the Supervisor. This is advisory planning memory, not a fixed pipeline; cache hits reuse prior evidence without another analysis/model call.
+Gemini:
 
-QA planning is assertion-driven as well as evidence-driven. Each task bootstraps one or more `QAAssertion` records from the objective and records the visibility mode (`white_box`, `gray_box`, or `black_box`). `EvidenceSufficiency` evaluates the strongest observed level from C0 Unknown, C1 Inferred, C2 Enumerated, C3 Functionally Verified, C4 Exploitability Verified, and C5 End-to-End Verified. The Supervisor chooses the least-invasive reviewed method needed by the unresolved assertion; it does not escalate an assertion to hash cracking or exploitation after its required threshold is already met. For example, AS-REP configuration evidence can complete at C2, while an explicitly requested end-to-end attack path requires C5.
+~~~dotenv
+LLM_PROVIDER=gemini
+LLM_MODEL=gemini-2.5-flash
+GEMINI_API_KEY=...
+~~~
 
-Human responses are first-class semantic execution input. Compound guidance is passed to the structured Supervisor as a high-priority intent containing all requested goals, constraints, exclusions, ordering, and continuation—not reduced to the first named tool. Explicit capability approvals still become frozen reviewed decisions; `CYBERQA_AD_*` settings and username-file paths supplied in natural language are applied to the current process, while password values are redacted from the conversation and reports. A short negative response rejects the previous proposal and sends the Agent to an alternate autonomous path; only an explicit stop/abort ends the task.
+Ollama:
 
-Every new session begins with a runner-identity bootstrap. It runs only `inspect_interfaces` locally to record Kali's IP addresses as `runner_ips`; it does not inspect Kali's OS, routes, DNS, ports, users, or privileges. Those addresses are exclusion metadata, not cyber-range targets. The Supervisor then starts remote network reconnaissance with `nmap -sn` for a CIDR (or `nmap -F` for one host). If ICMP discovery yields no hosts, it adapts once to `-F`; discovered non-runner hosts in the authorized network then receive the reviewed `nmap -sC -sV` service baseline. Kali, loopback, the runner's interface addresses, and out-of-scope addresses are excluded from reconnaissance and validation. Account-dependent LDAP/NXC/Impacket probes are deferred until the evidence and credential context justify them. After each remote result, the Supervisor continues with the next authorized host/service or the next evidence-driven AD path; Human is used only when autonomous alternatives are genuinely exhausted, an approval is required, or the operator explicitly stops. The result is written to `reports/<scenario-id>-initial-recon.md` with the runner IPs recorded separately from QA evidence.
+~~~dotenv
+LLM_PROVIDER=local
+LLM_MODEL=llama3.1
+LOCAL_LLM_BACKEND=ollama
+LLM_BASE_URL=http://127.0.0.1:11434
+~~~
 
-`build_kali_registry()` provides reviewed adapters for `nmap`, `nxc` (SMB/LDAP recon), Impacket, `dig`, `curl`, `ldapsearch`, `smbclient`, `ip`, `cat`, `nft`, and `timedatectl`. Local `inspect_*` adapters are blocked at the tool boundary except `inspect_interfaces` during `runner_identity`; Kali's OS, routes, DNS, ports, users, and privileges are not QA evidence. Nmap profiles include `host_discovery` (`-sn`), `fast` (`-F`), and `default` (`-sC -sV`); the default profile is only used on an individual discovered host, never as the first CIDR probe. LDAP and SMB expose reviewed repair profiles such as LDAP `rootdse`/`subtree`/`starttls_rootdse`/`gssapi_rootdse` and SMB `anonymous`/`smb2`/`smb3`/`port445`; the Agent may also choose validated read-only argv fragments. The adapter validates those fragments and always injects the authorized target/module itself. A non-zero LDAP, SMB, NXC, or Nmap result is stored with full stdout/stderr, `error_kind`, and `recoverable` metadata. The inner ReAct loop then inspects every result in a multi-tool batch, avoids the same effective command, and gets at most three recovery failures before Human-in-the-loop. Commands run with `create_subprocess_exec` (no shell), a timeout, and the target policy. A CIDR entry such as `10.0.0.0/24` authorizes every address in that network, except loopback and the scanner's local interface addresses. After an Nmap result, discovered IPv4 addresses inside the authorized CIDR are added to the runtime policy and reported as `[Target]`; this lets the ReAct agent continue with the discovered hosts. Evidence retains the complete redacted stdout/stderr and adds line counts plus a useful-output summary; the CLI displays only that summary. The observation store is SQLite at `CYBERQA_OBSERVATION_DB` (default `.cyberqa/observations.sqlite3`) and records the effective argv, target, parameters, result, and failure across process restarts. Identical effective argv is cached and the initial baseline is bounded; deferred AD probes are selected only after evidence synthesis. `force_refresh=True` remains an explicit API/operator option and is not exposed to the model-visible tool schema. Install the corresponding Kali packages first, such as `nmap`, `netexec`, `impacket-scripts`, `dnsutils`, `curl`, `ldap-utils`, and `smbclient`.
+For LM Studio, vLLM, or another OpenAI-compatible endpoint, set
+LOCAL_LLM_BACKEND=openai-compatible, LLM_MODEL, and LLM_BASE_URL.
 
-After reconnaissance, non-secret values such as the discovered AD domain, base DN, DC, DNS servers, and networks are written to `CYBERQA_DISCOVERED_ENV` (default `.cyberqa/discovered.env`) and loaded on the next process start. Existing secrets are never inferred or written. Target profiles preserve domain/forest relationships: an LDAP authentication or forest-context error is not automatically labelled as a network outage, and a different domain/forest is retained as a cross-forest candidate for later trust analysis.
+## Optional Cyber Range QA context
 
-The AD strategy layer is evidence-driven rather than prompt-only. It treats a domain/DC, username source, credential validation, LDAP bind, SPNs, and relationship collection as separate facts. After each tool result, the post-tool evidence analysis exposes what became usable and which reviewed capabilities are candidates; the Supervisor may choose AS-REP, local hash cracking, credential validation, authenticated enumeration, relationship collection, or another justified path instead of following a fixed pipeline. The deterministic AD layer only supplies prerequisite/completion guards; a concrete safe non-terminal Supervisor decision remains in control. With no username source it runs one bounded anonymous identity phase and then asks for a source if no users are found. With a validated credential it can enumerate users/SPNs, select Kerberoast when SPNs exist, collect relationships, and evaluate the evidence according to the accumulated findings. Judge/END is admitted only by the completion gate after remote baseline and required bounded AD evidence are present. Failed methods are recorded in `method_history` and are not retried under a new action description.
-If the model emits `end/human_help` without a concrete approval, missing-input, tool, or scope blocker, the Supervisor automatically asks itself to re-plan and continue. After three consecutive refusals to select a path, Human is surfaced as a genuine planning-boundary fallback.
+--spec path/to/range.yaml accepts any JSON/YAML environment reference. The
+loader recognizes common declarative assertion keys such as assertions,
+checks, tests, and requirements, but the file is never converted into
+commands and never becomes a tool allowlist. It is added as informational
+context for the Cochise scenario. After the run, qa-assessment.md provides a
+conservative post-run triage appendix; it does not gate exploitation or claim
+that keyword overlap proves a pass.
 
-When no domain credential is configured, the planner first performs a bounded anonymous identity probe across LDAP, SMB, and NXC LDAP. It then aggregates the results: if usernames are found, it prioritizes `asrep_roasting_assessment`; AS-REP does not require a domain credential. A username source can also be `CYBERQA_AD_USERS_FILE` (one username per line). Anonymous NXC is disabled by default and is enabled only by the bounded identity phase or `CYBERQA_ALLOW_ANONYMOUS_NXC=1`. AS-REP assessment remains behind the credential-material approval gate. If anonymous paths produce no usernames, the Agent asks for a username source instead of repeating recon.
+WIN-2024-010-AKAIRYU_spec.yaml is only a sample fixture. No range-specific
+schema is required.
 
-When AS-REP produces ticket material, the adapter writes only a mode-600 local hash artifact under `CYBERQA_CREDENTIAL_MATERIAL_DIR` (default `.cyberqa/credential-material`) and records its reference/count, never the hash contents. If `CYBERQA_AD_WORDLIST` or the standard Kali wordlist is available, the Supervisor can select the approval-gated `hash_cracking_assessment`; a recovered password remains process-local, then must pass `credential_validation` before `enumerate_domain_users`, SPN/Kerberoast selection, relationship collection, or other authenticated AD QA. A failed crack does not become a credential and does not cause an automatic retry loop.
+If a requested scenario/spec file is unavailable, the agent pauses and asks the
+operator for a path, permission to continue, or stop. The executor also asks
+the human when command output shows that a required artifact is missing or when
+it has exhausted recovery attempts.
 
-Without `OPENAI_API_KEY`, the graph uses a safe observe-only fallback. The API key is read from the environment and is never placed in graph state or tool evidence.
+## Architecture
 
-External services are optional for the dry-run example. Set `REDIS_URL`, `NEO4J_URI`, `NEO4J_USER`, `NEO4J_PASSWORD`, and `RABBITMQ_URL` to enable production adapters. `CYBERQA_LLM_MODEL` defaults to `gpt-4.1-mini`.
+- src/cyberqa/planner.py: persistent plan, task selection, re-planning, and
+  cross-task knowledge merge.
+- src/cyberqa/executor.py: short-lived task executor with unrestricted
+  Cochise-style execute_command, knowledge tools, and human recovery.
+- src/cyberqa/ssh_connection.py: persistent SSH connection to the target.
+- src/cyberqa/knowledge.py: in-memory red-team knowledge including plaintext
+  account/password/hash material recorded by the model.
+- src/cyberqa/common.py: provider-neutral LiteLLM calls and tool schemas.
+- src/cyberqa/qa_extensions.py: optional, non-gating range specification and
+  QA appendix support.
+- src/cyberqa/templates/scenario.md: red-team AD scenario and operating
+  rules, including credential attacks, Kerberos/AD paths, and artifact
+  recovery guidance.
 
-## Package map
+The original QA-only allowlist, fixed tool registry, approval broker,
+assertion gate, and graph orchestration modules were removed from the
+execution path. All external actions now follow the Cochise tool-calling
+loop.
 
-- `models.py`: Pydantic domain contracts, evidence, attack paths, approvals, events.
-- `state.py`: LangGraph state and shared-memory projections.
-- `nodes.py`: supervisor and specialist nodes; decision dispatch, approval consumption, and evidence projection.
-- `ad_strategy.py`: deterministic AD prerequisite/transition guard between LLM planning and tool execution.
-- `qa_assessment.py`: visibility mode, QA assertions, evidence levels, and evidence-sufficiency evaluation.
-- `graph.py`: compiled StateGraph topology and conditional routing.
-- `tools.py`: fact-only command/tool adapter contracts and safe dry-run adapters.
-- `events.py`: RabbitMQ event bus with in-process fallback.
-- `memory.py`: Redis checkpoint/working-memory and Neo4j-compatible knowledge graph repository.
-- `approval.py`: policy engine, exact decision fingerprints, and interrupt-compatible approval gate.
-- `examples/trace.py`: dynamic validation, attack-path, debugging, and approval traces.
+## Replay and analysis
 
-## Graph topology
+~~~bash
+cyberqa-replay runs/<run>/logs/run-<timestamp>.json
+cyberqa-analyze-logs index-rounds runs/<run>/logs/run-<timestamp>.json
+cyberqa-analyze-graphs runs/<run>/logs/run-<timestamp>.json
+~~~
 
-`START -> runner_identity -> supervisor -> {validation | testing | debugging | judge | reporting | approval | human_help | END}`. `runner_identity` only records Kali IPs for target exclusion. Validation, testing, and debugging contain nested `reason -> tools -> reason` ReAct subgraphs. Every specialist returns to `supervisor`; no specialist can select a different specialist. The supervisor chooses the next specialist from current remote evidence, unresolved goals, failures, and repair history. The durable observation ledger records effective tool/target/argv identities; a repeated identity sends control back to Supervisor for replanning, while `--max-iterations` is telemetry only. Human input is reserved for an explicit stop, an approval boundary, or a genuinely exhausted autonomous path. `MemorySaver` is the default checkpoint backend; production deployments can inject a durable checkpointer.
-
-## Neo4j graph schema
-
-Nodes: `Host`, `Service`, `User`, `Credential`, `Vulnerability`, `AttackPath`, `Flag`.
-Relationships: `(:Host)-[:EXPOSES]->(:Service)`, `(:User)-[:CAN_AUTHENTICATE_WITH]->(:Credential)`, `(:Host)-[:TRUSTS|REACHES]->(:Host)`, `(:AttackPath)-[:STARTS_AT|USES|REQUIRES|ENDS_AT]->(any)`, `(:Host)-[:HAS_VULNERABILITY]->(:Vulnerability)`.
-
-Upserts are idempotent and are emitted from observations/events, not from agent prose. See `KnowledgeGraphRepository.upsert_observation`.
-
-## Approval policy
-
-Service restart, firewall/DNS/route corrections, package installation, and time synchronization are autonomous. Domain/forest/ADCS rebuilds, GPO replacement, credential reset, user deletion, and other destructive mutations emit an approval request and suspend at the approval node. An approval resumes the frozen decision once; sensitive tools additionally require the matching capability and exact tool parameters. The approval record includes the exact action, scope, reason, expected impact, rollback, and evidence.
-
-## Security posture
-
-This package is an orchestration skeleton for controlled cyber ranges. Keep credentials in a secret manager, restrict tool identities, require allow-listed targets, log immutable evidence, and run destructive actions only behind the approval gate.
+Use the raw log and report only inside the authorized engagement boundary.
